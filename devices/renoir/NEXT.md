@@ -23,7 +23,7 @@ ath11k; UART HCI) as a project of its own.
 
 ## Session 1 (end of 2026-10-28 morning)
 
-Read first: `WORKFLOW.md` (Mac + VM, USB re-plug, run loop), `PORTING.md` (done/not done with log
+Read first: `HANDOFF.md`, `WORKFLOW.md` (Mac + VM, USB re-plug, run loop), `PORTING.md` (done/not done with log
 lines), `TOUCH.md` (all touch facts), `git log renoir`.
 
 ## Done, on the real phone
