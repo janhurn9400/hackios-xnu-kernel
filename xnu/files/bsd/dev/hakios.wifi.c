@@ -4357,6 +4357,7 @@ renoir_pcie_survey(uint32_t how)
  *      (qcom,phy-sequence), and waits for the PHY to say it is ready; the pipe clock then from the PHY
  *   5  ... the controller as root port, PERST# released, the link trained (LTSSM), and the radio's
  *      configuration space read through the iATU: 17cb:1103 is a QCA6490
+ *   6  ... BAR0 placed and MHI's registers read (renoir_bar())
  * Everything is taken back down at the end, in reverse, but for the supplies (see renoir_pcie_down()).
  * pcie_pause=MS (default 2200): a pause after each announcement, for the loader's notes if a write ends
  * the kernel (the hypervisor may keep some of this for itself).
@@ -4555,6 +4556,63 @@ renoir_pcie_down(unsigned level)
 	    rd(renoir_gcc_vote + 8));
 }
 
+/*
+ * pcie=6: the radio's registers. BAR0's size is asked the usual way (all ones written, read back), it is
+ * put at the start of the controller's memory window (0x60300000 + 0x3d00000, dt "ranges") aligned to
+ * its size, the root port forwards that window, iATU region 1 passes it through 1:1 as memory, and the
+ * radio's memory decoding is turned on. Then MHI's registers at BAR0 + 0 and its boot interface (BHI)
+ * are read: they say which stage of its start the chip waits in (the execution environment, "EE": the
+ * boot ROM's "PBL" when it wants the firmware's first part, amss20.bin's SBL, through BHI). Read only.
+ */
+#define RENOIR_PCIE_MEM         0x60300000u
+#define RENOIR_PCIE_MEM_SIZE    0x03d00000u
+
+static void
+renoir_bar(vm_offset_t dbi, vm_offset_t iatu, vm_offset_t conf)
+{
+	uint32_t size, base, bhi;
+	vm_offset_t mhi;
+
+	renoir_say("6: BAR0's size asked (all ones written to it)");
+	wr(conf + 0x10, 0xffffffff);
+	size = ~(rd(conf + 0x10) & ~0xfu) + 1;
+	printf("wifi: pcie: BAR0 is %#x bytes (BAR1 %#x)\n", size, rd(conf + 0x14));
+	if (size == 0 || size > RENOIR_PCIE_MEM_SIZE / 2) {
+		printf("wifi: pcie: no room for that in the window\n");
+		return;
+	}
+	base = (RENOIR_PCIE_MEM + size - 1) & ~(size - 1);
+	renoir_say("6: BAR0 placed, the root port's window and iATU region 1 (memory, 1:1) set, memory decoding on");
+	wr(conf + 0x10, base);
+	wr(conf + 0x14, 0);
+	wr(dbi + 0x20, ((RENOIR_PCIE_MEM + RENOIR_PCIE_MEM_SIZE - 1) & 0xfff00000) | RENOIR_PCIE_MEM >> 16);
+	wr(iatu + 0x200 + 0x08, RENOIR_PCIE_MEM);
+	wr(iatu + 0x200 + 0x0c, 0);
+	wr(iatu + 0x200 + 0x10, RENOIR_PCIE_MEM + RENOIR_PCIE_MEM_SIZE - 1);
+	wr(iatu + 0x200 + 0x14, RENOIR_PCIE_MEM);
+	wr(iatu + 0x200 + 0x18, 0);
+	wr(iatu + 0x200 + 0x00, 0);                     /* memory */
+	wr(iatu + 0x200 + 0x04, 1u << 31);
+	(void)renoir_wait(iatu + 0x200 + 0x04, 1u << 31, 1u << 31, 10);
+	wr(conf + 4, rd(conf + 4) | 0x6);               /* memory, bus master (nothing is given it to master yet) */
+	printf("wifi: pcie: BAR0 at %#x; the radio's command %#x, root port window %#x\n", rd(conf + 0x10), rd(conf + 4),
+	    rd(dbi + 0x20));
+	renoir_say("6: MHI's registers read at BAR0");
+	mhi = ml_io_map(base, 0x1000);
+	printf("wifi: pcie: MHI: length %#x, version %#x, config %#x, channel doorbells at %#x, event doorbells at %#x\n",
+	    rd(mhi + 0x00), rd(mhi + 0x08), rd(mhi + 0x10), rd(mhi + 0x18), rd(mhi + 0x20));
+	printf("wifi: pcie: MHI: BHI at %#x, BHIe at %#x, control %#x, status %#x (state %u%s), error %#x\n", rd(mhi + 0x28),
+	    rd(mhi + 0x2c), rd(mhi + 0x38), rd(mhi + 0x48), (rd(mhi + 0x48) >> 8) & 0xff,
+	    (rd(mhi + 0x48) & 4) ? ", SYSERR" : "", rd(mhi + 0x50));
+	bhi = rd(mhi + 0x28);
+	if (bhi != 0 && bhi < 0xf00) {
+		printf("wifi: pcie: BHI: version %#x %#x, execution environment %#x (0 PBL, 1 SBL, 2 AMSS), status %#x, "
+		    "serial %#x, hardware id %#x\n", rd(mhi + bhi + 0x00), rd(mhi + bhi + 0x04), rd(mhi + bhi + 0x28),
+		    rd(mhi + bhi + 0x2c), rd(mhi + bhi + 0x40), rd(mhi + bhi + 0x48));
+	}
+	wr(conf + 4, rd(conf + 4) & ~0x6u);
+}
+
 static void
 renoir_pcie_link(unsigned level)
 {
@@ -4682,6 +4740,9 @@ renoir_pcie_link(unsigned level)
 	conf = ml_io_map(RENOIR_PCIE_CONF, 0x1000);
 	printf("wifi: pcie: 01:00.0: id %#x (17cb:1103 is a QCA6490), command %#x, class %#x, BAR0 %#x\n", rd(conf),
 	    rd(conf + 4), rd(conf + 8), rd(conf + 0x10));
+	if (level >= 6 && rd(conf) == 0x110317cb) {
+		renoir_bar(dbi, iatu, conf);
+	}
 	renoir_pin(94, 0, 1, 2, 0);
 	sleep_ms(1);
 down:
