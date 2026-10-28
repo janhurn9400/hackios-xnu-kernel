@@ -11,13 +11,20 @@ cd "$(dirname "$0")/../.."
 
 adb get-state >/dev/null
 
-pullglob() { # DIR  'adb shell ls' glob...   (missing matches are told, not fatal)
+# The adb shell may not read /vendor/firmware (MagicOS: "Permission denied"), so the files are copied
+# as root (Magisk's su) to a scratch directory on the phone, pulled from there, and the copy removed.
+TMP=/data/local/tmp/hakios-fw
+pullglob() { # DIR  'ls' glob...   (missing matches are told, not fatal)
 	local dir=$1; shift
 	mkdir -p "$dir"
 	local files
-	files=$(adb shell "ls $* 2>/dev/null" | tr -d '\r')
+	files=$(adb shell "su -c 'ls $* 2>/dev/null'" | tr -d '\r')
 	[ -n "$files" ] || { echo "pull-firmware.sh: $dir: nothing matched: $*"; return 0; }
-	for f in $files; do adb pull "$f" "$dir/" >/dev/null 2>&1 || echo "pull-firmware.sh: $f: pull failed"; done
+	for f in $files; do
+		adb shell "su -c 'mkdir -p $TMP && cp $f $TMP/ && chmod 644 $TMP/${f##*/}'" &&
+			adb pull "$TMP/${f##*/}" "$dir/" >/dev/null 2>&1 || echo "pull-firmware.sh: $f: pull failed"
+	done
+	adb shell "su -c 'rm -rf $TMP'"
 	echo "pull-firmware.sh: $dir: $(ls -1 "$dir" | wc -l | tr -d ' ') files"
 }
 
@@ -25,8 +32,11 @@ pullglob() { # DIR  'adb shell ls' glob...   (missing matches are told, not fata
 # differ (a650/a660-class). Glob both the gmu/sqe and the zap (signed) blobs.
 pullglob fw-gpu '/vendor/firmware/a6*_gmu.bin' '/vendor/firmware/a6*_sqe.fw' '/vendor/firmware/a6*_zap.*'
 
-# Wi-Fi — redwood: wpss.{mdt,b02..b07}. renoir likely WCN6750-class; glob the wpss image set.
-pullglob fw-wifi '/vendor/firmware_mnt/image/wpss.*'
+# Wi-Fi — redwood: wpss.{mdt,b02..b07} (WCN6750, inside the SoC). renoir has none: its radio is a
+# QCA6490 on PCIe (amss20.bin, m3.bin, board data bdwlan.*, regdb.bin), which upstream's driver
+# does not know.
+pullglob fw-wifi '/vendor/firmware_mnt/image/amss*.bin' '/vendor/firmware_mnt/image/m3*.bin' \
+	'/vendor/firmware_mnt/image/bdwlan.*' '/vendor/firmware_mnt/image/regdb*.bin'
 
 # Audio DSP — battery and charging ride through the ADSP. redwood: adsp.{mdt,b02..b36}.
 pullglob fw-audio '/vendor/firmware_mnt/image/adsp.*'

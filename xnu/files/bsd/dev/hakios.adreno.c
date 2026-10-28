@@ -108,6 +108,54 @@ extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 static uint32_t last_step, skip_steps, pause_ms = 2200, fine, watch_seconds = 20;
 static uint32_t step;                   /* the one being performed */
 static uint32_t speed_bin;              /* which of the GPUs of this kind the fuses say this is (step 2) */
+
+/*
+ * What differs between the phones' GPUs (boot-arg board=renoir; redwood otherwise). Both are of
+ * Linux's "A660 family", with the same firmware files, register blocks at the same addresses,
+ * the same clock controller layout (gpucc-sc7280.c and renoir's gpucc-shima.c agree on every
+ * offset used here), the same clock gating, bus and protection tables in Qualcomm's own driver
+ * (kgsl adreno-gpulist.h: adreno_gpu_core_a642l, adreno_gpu_core_a642). What differs is below;
+ * see devices/renoir/GPU.md.
+ */
+struct gpu_board {
+	const char *name;
+	uint64_t chip_id;                       /* dt: qcom,chipid */
+	uint32_t gmu_chip;                      /* the chip ID the way the GMU's firmware wants it (a6xx_gmu_fw_start) */
+	uint32_t speed_bin_fuse, gaming_bin_fuse;       /* dt: gpu_speed_bin, gpu_gaming_bin in qfprom */
+	uint32_t khz[3], level[3];              /* three of dt: qcom,gpu-pwrlevels, the fastest the one asked for */
+	uint32_t gmem;                          /* kgsl: gmem_size */
+	uint32_t prim_fifo_threshold;           /* kgsl: prim_fifo_threshold (PC_DBG_ECO_CNTL) */
+	uint32_t highest_bank_bit;              /* for UBWC: dt qcom,highest-bank-bit */
+	uint32_t gcc_debug_gpucc;               /* the GCC debug mux's input from the GPU's clock controller (debugcc-*.c) */
+};
+
+static const struct gpu_board redwood = {
+	.name = "redwood (Adreno 642L)", .chip_id = 0x06030500, .gmu_chip = 0x06035000,
+	.speed_bin_fuse = 0x1e9, .gaming_bin_fuse = 0x1f5,
+	.khz = { 315000, 450000, 550000 }, .level = { 64, 128, 192 },
+	.gmem = 512 * 1024, .prim_fifo_threshold = 0x00200000, .highest_bank_bit = 14, .gcc_debug_gpucc = 0x146,
+};
+
+/*
+ * renoir: an Adreno 642 ("Adreno642v1", compatible qcom,adreno-gpu-a642). Its GMU firmware wants
+ * the chip ID's patch nibble "target version" in bits 31:28 (kgsl a6xx_gmu.c: "For A642 GPU, GMU
+ * firmware expects chipid as per below format"): 0x06060010 -> 0x16060000. Mesa takes the chip
+ * for an FD660 (GPUId(660) matches any patch).
+ *
+ * Its speeds depend on the speed bin in the fuses (dt qcom,gpu-pwrlevel-bins): bins 0 and 158 go to
+ * 747 MHz, 105 (the phone this was made on) to 490, 79 to 365. Asked for 540 MHz, a bin-105 GPU
+ * never got its power: the GMU powered the core and hung before saying so. 285/443/490 suit every
+ * bin but 79, which gets 365 at most (step_core_power()).
+ */
+static const struct gpu_board renoir = {
+	.name = "renoir (Adreno 642)", .chip_id = 0x06060010, .gmu_chip = 0x16060000,
+	.speed_bin_fuse = 0x1e1, .gaming_bin_fuse = 0x1ed,
+	.khz = { 285000, 443000, 490000 }, .level = { 64, 128, 144 },  /* bin 105's top three of four, see below */
+	.gmem = 1536 * 1024, .prim_fifo_threshold = 0x00300000, .highest_bank_bit = 15,
+	.gcc_debug_gpucc = 0x13c,               /* debugcc-shima.c; everything else of the counter as on redwood */
+};
+
+static const struct gpu_board *board = &redwood;
 static uint32_t newest_step;            /* the highest one asked for: the one that has not been seen to work */
 static char last_write[96] = "nothing written";
 static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
@@ -412,8 +460,8 @@ step_outside(void)
  */
 static struct block qfprom = { "qfprom", 0x00780000, 0x7000 };
 #define QFPROM_CORRECTED        0x4000
-#define QFPROM_GPU_SPEED_BIN    0x1e9
-#define QFPROM_GPU_GAMING_BIN   0x1f5
+#define QFPROM_GPU_SPEED_BIN    (board->speed_bin_fuse)
+#define QFPROM_GPU_GAMING_BIN   (board->gaming_bin_fuse)
 
 static uint32_t
 get8(struct block *b, const char *name, uint32_t offset)
@@ -441,9 +489,9 @@ step_fuses(void)
 	bin = bin >> 5 & 0xff;
 	speed_bin = bin;
 	gaming = get8(&qfprom, "gaming bin", QFPROM_CORRECTED + QFPROM_GPU_GAMING_BIN) >> 5 & 1;
-	/* dt: qcom,gpu-models: 0xac and 0xbe are sold as Adreno 643, anything else is the 642L */
-	printf("adreno: %u: speed bin %u: an Adreno %s; gaming bin %u\n", step, bin, bin == 0xac || bin == 0xbe ? "643" : "642L",
-	    gaming);
+	/* dt: qcom,gpu-models: on redwood 0xac and 0xbe are sold as Adreno 643, anything else is the 642L */
+	printf("adreno: %u: speed bin %u: an Adreno %s; gaming bin %u\n", step, bin,
+	    board != &redwood ? board->name : bin == 0xac || bin == 0xbe ? "643" : "642L", gaming);
 
 	announce("read the same fuses where the phone's device tree has them (0x780000)");
 	bin = get8(&qfprom, "raw speed bin, low", QFPROM_GPU_SPEED_BIN);
@@ -696,7 +744,7 @@ step_clocks(void)
  * clk-debug.c (mainline Linux has no counterpart).
  */
 #define GCC_DEBUG_MUX           0x62000         /* [9:0] which clock goes to the counter */
-#define GCC_DEBUG_MUX_GPUCC     0x146           /* ... the debug output of the GPU's clock controller */
+#define GCC_DEBUG_MUX_GPUCC     (board->gcc_debug_gpucc)        /* ... the debug output of the GPU's clock controller */
 #define GCC_DEBUG_DIV           0x62004         /* [3:0] divider - 1; both controllers divide by 2 */
 #define GCC_DEBUG_CBCR          0x62008
 #define GCC_XO_DIV4_CBCR        0x6200c         /* the counter's time base: the crystal / 4, 4.8 MHz */
@@ -1875,7 +1923,7 @@ step_gmu_firmware(void)
 #define GMU_RSCC_CONTROL_REQ    GMU_WORD(0x9307)
 #define GMU_AO_AHB_FENCE_CTRL   GMU_WORD(0x9310)
 #define GMU_AHB_FENCE_RANGE_0   GMU_WORD(0x9311)
-#define GMU_CHIP                0x06035000      /* dt qcom,chipid 0x06030500 the way the firmware wants it */
+#define GMU_CHIP                (board->gmu_chip)       /* dt qcom,chipid the way the firmware wants it */
 #define GMU_STARTED_MASK        0x1ff           /* of fw_init_result, for firmware newer than core 0x20010004 */
 #define GMU_STARTED             0x100
 #define GMU_FAILED              0xe00
@@ -2282,9 +2330,10 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 static bool
 step_core_power(void)
 {
-	static const struct {
+	struct {
 		uint32_t khz, level;
-	} speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
+	} speeds[] = { { 0, 0 }, { board->khz[0], board->level[0] }, { board->khz[1], board->level[1] },
+		{ board->khz[2], board->level[2] } };
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
 	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 3, HFI_NO_INDEX }, granted = 0, speed = 0;
@@ -2300,6 +2349,11 @@ step_core_power(void)
 		return false;
 	}
 	perf.gpu_levels = sizeof(speeds) / sizeof(speeds[0]);
+	if (board == &renoir && speed_bin == 79) {
+		/* dt qcom,gpu-pwrlevels-2: 365 and 285 MHz only */
+		speeds[2].khz = speeds[3].khz = 365000;
+		speeds[2].level = speeds[3].level = 80;
+	}
 	for (unsigned i = 0; i < perf.gpu_levels; i++) {
 		perf.gpu[i].khz = speeds[i].khz;
 		perf.gpu[i].acd = 0xffffffff;           /* no adaptive clocking */
@@ -2728,17 +2782,20 @@ step_core_start(void)
 	put(&gpu, "cp_roq_thresholds_1", CP_ROQ_THRESHOLDS_1, 0x8040362c);
 	put(&gpu, "cp_lpac_prog_fifo_size", CP_LPAC_PROG_FIFO_SIZE, 0x20);
 	put(&gpu, "cp_mem_pool_size", CP_MEM_POOL_SIZE, 128);
-	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, 0x00200200);
+	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, board->prim_fifo_threshold | 0x200);
 	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
 	/*
 	 * How textures in the GPU's own tiled and compressed layouts are laid out in memory (Linux's
-	 * a6xx_calc_ubwc_config, a6xx_set_ubwc_config for this GPU: highest bank bit 14, and the
-	 * rest as below); Mesa is told the same (hakios_gpu_parameter()).
+	 * a6xx_calc_ubwc_config, a6xx_set_ubwc_config for this GPU: the highest bank bit -- 14 on
+	 * redwood, 15 on renoir -- less 13 in each, and the rest as below); Mesa is told the same
+	 * (hakios_gpu_parameter()).
 	 */
-	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | 1u << 1);
-	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), 1u << 1);
-	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | 1u << 1);
-	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), 1u << 21);
+	uint32_t hbb_lo = board->highest_bank_bit - 13;
+
+	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | hbb_lo << 1);
+	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), hbb_lo << 1);
+	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | hbb_lo << 1);
+	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), hbb_lo << 21);
 	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), 1);
 	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
 	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x1fffff);
@@ -3165,7 +3222,6 @@ hakios_adreno_quiesce(void)
  * far it has got (a "fence": a submission's number, written by the core when it is through
  * with it). The caller holds one lock around all of these.
  */
-#define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
@@ -3263,10 +3319,10 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 0;
 		return true;
 	case 0x02:                              /* GMEM_SIZE */
-		*value = 512 * 1024;
+		*value = board->gmem;
 		return true;
 	case 0x03:                              /* CHIP_ID, with the speed bin above it */
-		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
+		*value = board->chip_id | (uint64_t)speed_bin << 32;
 		return true;
 	case 0x04:                              /* MAX_FREQ */
 		*value = core_khz * 1000ull;
@@ -3278,7 +3334,7 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 1;
 		return true;
 	case 0x10:                              /* HIGHEST_BANK_BIT */
-		*value = 14;
+		*value = board->highest_bank_bit;
 		return true;
 	case 0x12:                              /* UBWC_SWIZZLE */
 		*value = 6;
@@ -3755,7 +3811,11 @@ hakios_adreno_init(void)
 	};
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
+	char board_name[16] = "";
 
+	if (PE_parse_boot_argn("board", board_name, sizeof(board_name)) && strcmp(board_name, "renoir") == 0) {
+		board = &renoir;
+	}
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
 	}

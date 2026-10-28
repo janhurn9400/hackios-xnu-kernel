@@ -1623,8 +1623,9 @@ hakios_goodix_init(void)
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
-	/* boot-arg touch_board=renoir: the Xiaomi Mi 11 Lite 5G; the POCO X5 Pro (redwood) otherwise */
-	if (PE_parse_boot_argn("touch_board", board_name, sizeof(board_name)) && strcmp(board_name, "renoir") == 0) {
+	/* boot-arg board=renoir (or touch_board=renoir): the Xiaomi Mi 11 Lite 5G; the POCO X5 Pro (redwood) otherwise */
+	if ((PE_parse_boot_argn("board", board_name, sizeof(board_name)) ||
+	    PE_parse_boot_argn("touch_board", board_name, sizeof(board_name))) && strcmp(board_name, "renoir") == 0) {
 		board = &renoir;
 	}
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
