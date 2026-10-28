@@ -1,8 +1,7 @@
 # renoir sound: what is known (2026-10-28, session 3) and what the port needs
 
-Status: **not started in code.** The ADSP runs with its audio services up (`ADSP.md`, APR "THE AUDIO
-SERVICES ARE UP"), so the DSP side is there. What differs from redwood is the amplifiers and the
-interface that feeds them.
+Status (2026-10-28, 20:17): **the first tone plays** (`sound=3`, both TFA9873s, TERT_MI2S at 96 kHz).
+iOS's sound (`sound=4`) is not there yet. The ADSP runs with its audio services up (`ADSP.md`).
 
 ## redwood (what `hakios.sound.c` / `hakios.speaker.c` do)
 
@@ -99,3 +98,29 @@ unmute. `tfa_dev_stop()`: mute, powerdown. Still to read in detail: `tfaRunSpeak
 4. `hakios.sound.c`: a renoir board profile (`board=renoir`): the MI2S port instead of TDM 0, its
    pins and clock; the rest (SMMU stream, ADM/ASM, `sound=1..4`) as for redwood.
 5. Mind USB: once the DSP runs, USB goes away (`ADSP.md`), so test with the logs kept by the loader.
+
+## The first tone (session 4, 2026-10-28 20:17)
+
+Code: `hakios.speaker.c` (renoir section, "renoir's amplifiers, NXP TFA9873") and `hakios.sound.c`
+(`RENOIR_PORT` and friends). With `board=renoir`:
+
+- **Amplifiers** (no file needed: the container's settings are in the code): `prepare` = I2C reset,
+  keys unlocked, revision 0x0b73's settings, FSSYNCEN 0, AUDFS/FRACTDEL restored, the container's 30
+  device bitfields (RCV/SPK slots) and profile `stereo`, keys locked -- powered down; `start` =
+  MANSCONF 1, PWDN 0, wait for CLKS (0x10 bit 6), then AMPE 1; `stop` = AMPE 0, PWDN 1. Every bitfield
+  is read back; a mismatch or a fault flag powers both down. The TFA9873 has no volume of its own:
+  `sound_below` takes the samples down in 6 dB steps (default 240 -> -50 dBFS; 144 -> -38 dBFS).
+- **Port**: AFE 0x1004, `AFE_PARAM_ID_I2S_CONFIG` (24 bits, data line 1, stereo, word select ours,
+  96 kHz), clock 0x104 at 6.144 MHz attribute 1; pins 120/122/121 function 1, 124 function 3, 8 mA.
+  ADM path and ASM stream at 96 kHz (the 1 kHz table, each sample twice).
+- **SMMU**: renoir's audio stream is **0x2001** (dt `qcom,msm-audio-ion`), not redwood's 0x1801; with
+  0x1801 the match register would not take the write (the hypervisor refuses foreign streams).
+
+Runs (iOS from `system-fw.apfs` + `root-gl.apfs`, `bootcpu=7 cpus=8 ... board=renoir adsp=1`):
+- `sound=1`: LEVEL DONE -- both TFA9873s report clocks stable on the bit clock, no fault (amplifiers off).
+- `sound=3 sound_below=144`: **heard** (the user, at the earpiece); LEVEL DONE, no SMMU fault, no
+  amplifier fault. The log lines survive only in the loader's per-second notes (`oem log` after the
+  next start; USB is gone during a DSP run), so parts are missing.
+
+Next: `sound=4` (iOS writes 48 kHz: run the port at 48 kHz or resample), a level for the TFA9873s
+(TDMSPKG 0x5f[9:6] / AMPGAIN 0x52 are candidates), and the amplifiers' temperature/battery monitor.

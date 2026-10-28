@@ -647,6 +647,29 @@ static void
 power_down_now(const char *why)
 {
 	broken = true;
+	if (renoir) {
+		/* the TFA9873s: 0x00 bit 0 power-down set, bit 3 the amplifier's enable cleared */
+		say("speaker: %s: BOTH AMPLIFIERS ARE POWERED DOWN AT ONCE (0x00: power-down set, amplifier off)\n", why);
+		for (unsigned i = 0; i < 2; i++) {
+			struct amplifier *a = &amplifiers[i];
+			uint16_t value = 0, after = 0;
+
+			if (!a->prepared && !a->started) {
+				continue;
+			}
+			if (!register_read(a->address, 0x00, &value)) {
+				value = 0;
+			}
+			value = (uint16_t)((value | 1u) & ~(1u << 3));
+			if (!register_write(a->address, 0x00, value) || !register_read(a->address, 0x00, &after)) {
+				say("speaker: the amplifier %s: 0x00 <- %#06x NOT ACKNOWLEDGED\n", a->where, value);
+			} else {
+				say("speaker: the amplifier %s: 0x00 <- %#06x, reads %#06x\n", a->where, value, after);
+			}
+			a->started = false;
+		}
+		return;
+	}
 	say("speaker: %s: BOTH AMPLIFIERS ARE POWERED DOWN AT ONCE (0x04: amplifier power-down and power-down set)\n", why);
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
@@ -749,9 +772,365 @@ faulty(struct amplifier *a, uint16_t *status)
 	return (*status & SYSST_FAULTS) != 0;
 }
 
+/* ---- renoir's amplifiers, NXP TFA9873, as Goodix's (formerly NXP's) driver runs them ----------------- */
+
+/*
+ * renoir (board=renoir): two TFA9873 (revision 0x0b73) on the same kind of bus, 0x34 "RCV" (the
+ * earpiece speaker, at the top) and 0x35 "SPK" (the speaker at the bottom), fed by TERT_MI2S at
+ * 96 kHz, two 32-bit slots. The TFA9873 has no DSP of its own ("probus" in the driver): what it
+ * needs is register settings, no firmware. The order, from github.com/Goodix-vas/tfa98xx
+ * (tfa_dsp.c: tfaRunStartup(), tfa_dev_set_state(), tfa_dev_start(), tfa_dev_stop(); tfa_init.c:
+ * tfa9873_specific()):
+ *   prepare: I2C reset (0x00 bit 1); keys 1 and 2 unlocked (0x0f <- 0x5a6b, 0xa0 <- 0xfb ^ 0x5a,
+ *            0xa1 <- 0x5a); the settings for revision 0x0b73; FS synchronisation off; the sample
+ *            rate and fractional delay as they were before; then the container's device and
+ *            "stereo" profile bitfields (Xiaomi's /vendor/firmware/tfa98xx.cnt, decoded by
+ *            devices/renoir/tools/tfa-container.py); keys locked. Powered down.
+ *   start:   "I2C configured" (0x01 bit 2) and power-down off; the clocks stable (0x10 bit 6) --
+ *            only while the bit clock runs; then the amplifier on (0x00 bit 3, AMPE: the TFA9873
+ *            has no DSP mute, the driver's mute does nothing for it).
+ *   stop:    the amplifier off, power-down on.
+ * Bitfields are register << 8 | position << 4 | (length - 1), as the container has them. The
+ * status (0x10): bit 0 POR, 1 boost's current OK, 2 temperature OK, 3 the amplifier's
+ * over-current, 4 voltage OK, 6 clocks stable, 8 lost clock; 0x13 bit 8 over-voltage OK. The
+ * TFA9873 has no volume of its own: sound.c makes the samples quieter instead.
+ */
+#define TFA_SYS0                0x00            /* 0 PWDN, 1 I2CR, 3 AMPE, 4 DCA */
+#define TFA_SYS0_PWDN           (1u << 0)
+#define TFA_SYS0_I2CR           (1u << 1)
+#define TFA_SYS0_AMPE           (1u << 3)
+#define TFA_BF_PWDN             0x0000
+#define TFA_BF_AMPE             0x0030
+#define TFA_BF_MANSCONF         0x0120
+#define TFA_BF_AUDFS            0x0203
+#define TFA_BF_FRACTDEL         0x0255
+#define TFA_BF_FSSYNCEN         0x0480
+#define TFA_STATUS0             0x10
+#define TFA_STATUS0_CLKS        (1u << 6)
+#define TFA_STATUS0_GOOD        (1u << 1 | 1u << 2 | 1u << 4)   /* boost current, temperature, voltage: 1 is good */
+#define TFA_STATUS0_BAD         (1u << 3 | 1u << 8)             /* the amplifier's over-current, lost clock */
+#define TFA_STATUS1             0x11            /* 6 PLLS, 13 SWS, 14 AMPS */
+#define TFA_STATUS3             0x13            /* 8 OVDS (1 is good), 9 CLIPS */
+#define TFA_STATUS3_OVDS        (1u << 8)
+#define TFA_STATE               0x14            /* [6:3] the device manager's state */
+#define TFA_KEYS                0x0f
+#define TFA_KEY1                0xa0
+#define TFA_KEY2                0xa1
+#define TFA_KEY_XOR             0xfb
+#define TFA_CLKS_TRIES          50              /* the driver's loop: 50 looks; 2 ms apart here */
+
+/* tfa9873_specific(), revision 0x0b73 ("version 20") */
+static const uint16_t tfa_rev_b0[][2] = {
+	{ 0x02, 0x0628 }, { 0x61, 0x0183 }, { 0x63, 0x005a }, { 0x6f, 0x0082 }, { 0x70, 0xa3eb },
+	{ 0x71, 0x107e }, { 0x73, 0x0187 }, { 0x83, 0x071c }, { 0x85, 0x0380 }, { 0xd5, 0x004d },
+};
+
+/* tfa98xx.cnt (3828 bytes, "9873N1B", sha256 5be2bd90...e071d09e): the device lists, then profile "stereo"; field, value */
+#define TFA_SLOT_FIELDS         4               /* the four that differ: 0x26 [3:0] [7:4] [15:12], 0x27 [3:0] */
+static const uint16_t tfa_device_bits[][2] = {
+	{ 0x20c3, 0x0002 }, { 0x2144, 0x001f }, { 0x2224, 0x001f }, { 0x2013, 0x0001 }, { 0x2330, 0x0001 },
+	{ 0x2340, 0x0000 }, { 0x2603, 0xffff }, { 0x2643, 0xffff }, { 0x26c3, 0xffff }, { 0x2703, 0xffff },
+	{ 0x6802, 0x0003 }, { 0x0401, 0x0001 }, { 0x6831, 0x0001 }, { 0x6851, 0x0002 }, { 0x0203, 0x0009 },
+	{ 0x74e0, 0x0000 }, { 0x6f50, 0x0000 }, { 0x8510, 0x0000 }, { 0x54a1, 0x0003 }, { 0x7371, 0x0003 },
+	{ 0xf910, 0x0001 }, { 0x0240, 0x0000 }, { 0x5f63, 0x0006 }, { 0x7444, 0x000a }, { 0x7584, 0x000d },
+	{ 0x7695, 0x002e }, { 0x7003, 0x0009 }, { 0x70f0, 0x0000 }, { 0x0255, 0x0000 }, { 0x71c1, 0x0001 },
+	/* profile "stereo": 96 kHz, the boost on, low-power modes off */
+	{ 0x0203, 0x0009 }, { 0x0040, 0x0001 }, { 0x64e1, 0x0000 }, { 0x62e1, 0x0000 },
+};
+/* the slot fields (0xffff above): RCV (0x34) the left slot, SPK (0x35) the right */
+static const uint16_t tfa_slots_rcv[TFA_SLOT_FIELDS] = { 0, 1, 0, 1 };
+static const uint16_t tfa_slots_spk[TFA_SLOT_FIELDS] = { 1, 0, 1, 0 };
+
+static bool
+tfa_field_get(struct amplifier *a, uint16_t field, uint16_t *value)
+{
+	uint16_t reg;
+	unsigned pos = (field >> 4) & 0xf, length = (field & 0xf) + 1;
+
+	if (!get(a, (uint8_t)(field >> 8), &reg)) {
+		return false;
+	}
+	*value = (uint16_t)((reg >> pos) & ((1u << length) - 1));
+	return true;
+}
+
+/* One bitfield written (the rest of its register as it reads) and read back; false, and both powered down, if it did not stick. */
+static bool
+tfa_field(struct amplifier *a, uint16_t field, uint16_t value)
+{
+	uint8_t reg = (uint8_t)(field >> 8);
+	unsigned pos = (field >> 4) & 0xf, length = (field & 0xf) + 1;
+	uint16_t mask = (uint16_t)(((1u << length) - 1) << pos), before = 0, wanted, after = 0;
+
+	if (broken) {
+		return false;
+	}
+	if (!get(a, reg, &before)) {
+		power_down_now("a register could not be read");
+		return false;
+	}
+	wanted = (uint16_t)((before & ~mask) | ((value << pos) & mask));
+	if (!register_write(a->address, reg, wanted) || !register_read(a->address, reg, &after)) {
+		say("speaker: the amplifier %s: %#04x <- %#06x NOT ACKNOWLEDGED\n", a->where, reg, wanted);
+		power_down_now("a write was not acknowledged");
+		return false;
+	}
+	say("speaker: the amplifier %s: %#04x [%u:%u] <- %#x: %#06x -> %#06x%s\n", a->where, reg, pos + length - 1, pos, value,
+	    before, after, (after & mask) == (wanted & mask) ? "" : ": NOT AS WRITTEN");
+	if ((after & mask) != (wanted & mask)) {
+		power_down_now("a bitfield did not read back as written");
+		return false;
+	}
+	return true;
+}
+
+/* A register written as a whole, not read back (keys, which read back as something else). */
+static bool
+tfa_poke(struct amplifier *a, uint8_t reg, uint16_t value)
+{
+	if (broken) {
+		return false;
+	}
+	if (!register_write(a->address, reg, value)) {
+		say("speaker: the amplifier %s: %#04x <- %#06x NOT ACKNOWLEDGED\n", a->where, reg, value);
+		power_down_now("a write was not acknowledged");
+		return false;
+	}
+	return true;
+}
+
+static bool
+tfa_keys(struct amplifier *a, bool unlock)
+{
+	uint16_t value = 0, key2 = 0;
+
+	/* (tfa98xx_key1() and tfa98xx_key2(): key 2 is 0xa1's low byte, MTPK) */
+	if (!tfa_poke(a, TFA_KEYS, 0x5a6b) || !get(a, TFA_KEY_XOR, &value) ||
+	    !tfa_poke(a, TFA_KEY1, unlock ? (uint16_t)(value ^ 0x005a) : 0) ||
+	    !tfa_poke(a, TFA_KEYS, 0x5a6b) || !get(a, TFA_KEY2, &key2) ||
+	    !tfa_poke(a, TFA_KEY2, (uint16_t)((key2 & 0xff00) | (unlock ? 0x5a : 0)))) {
+		return false;
+	}
+	say("speaker: the amplifier %s: keys 1 and 2 %s (0xfb reads %#06x)\n", a->where, unlock ? "unlocked" : "locked", value);
+	return true;
+}
+
+/* What the amplifier says of itself; whether it reports a fault. */
+static bool
+tfa_faulty(struct amplifier *a, const char *when, bool tell)
+{
+	uint16_t s0 = 0, s1 = 0, s3 = 0, state = 0, sys0 = 0, sys1 = 0;
+
+	if (!get(a, TFA_STATUS0, &s0) || !get(a, TFA_STATUS1, &s1) || !get(a, TFA_STATUS3, &s3) || !get(a, TFA_STATE, &state) ||
+	    !get(a, TFA_SYS0, &sys0) || !get(a, 0x01, &sys1)) {
+		return true;
+	}
+	if (tell) {
+		say("speaker: the amplifier %s %s: control %#06x %#06x, status %#06x %#06x %#06x, state %u (clocks %s, PLL %s, "
+		    "amplifier %s)\n", a->where, when, sys0, sys1, s0, s1, s3, (state >> 3) & 0xf,
+		    (s0 & TFA_STATUS0_CLKS) ? "stable" : "NOT STABLE", (s1 & (1u << 6)) ? "locked" : "not locked",
+		    (s1 & (1u << 14)) ? "on" : "off");
+	}
+	return (s0 & TFA_STATUS0_GOOD) != TFA_STATUS0_GOOD || (s0 & TFA_STATUS0_BAD) != 0 || (s3 & TFA_STATUS3_OVDS) == 0;
+}
+
+static bool
+tfa_prepare(void)
+{
+	broken = false;
+	say("speaker: the TFA9873s are prepared as Goodix's driver prepares them (tfaRunStartup); the pins as found:\n");
+	show_pins();
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+		const uint16_t *slots = a->address == 0x34 ? tfa_slots_rcv : tfa_slots_spk;
+		uint16_t rev = 0, audfs = 0, fractdel = 0;
+		unsigned slot = 0;
+
+		a->started = false;
+		if (!get(a, 0x03, &rev)) {
+			say("speaker: nobody at I2C address %#x: not powered, held in reset, or not there\n", a->address);
+			power_down_now("an amplifier does not answer");
+			return false;
+		}
+		say("speaker: the amplifier %s: revision %#06x\n", a->where, rev);
+		if (rev != 0x0b73) {
+			say("speaker: the amplifier %s: NOT THE TFA9873 B0 (0x0b73) these settings are for: left alone\n", a->where);
+			return false;
+		}
+		a->prepared = true;
+		(void)tfa_faulty(a, "as found", true);
+		if (!tfa_field_get(a, TFA_BF_AUDFS, &audfs) || !tfa_field_get(a, TFA_BF_FRACTDEL, &fractdel)) {
+			power_down_now("0x02 could not be read");
+			return false;
+		}
+		say("speaker: the amplifier %s: I2C reset (0x00 <- 0x0002)\n", a->where);
+		if (!tfa_poke(a, TFA_SYS0, TFA_SYS0_I2CR)) {
+			return false;
+		}
+		wait_ms(2);
+		if (!tfa_keys(a, true)) {
+			return false;
+		}
+		for (unsigned r = 0; r < sizeof(tfa_rev_b0) / sizeof(tfa_rev_b0[0]); r++) {
+			if (!put(a, (uint8_t)tfa_rev_b0[r][0], tfa_rev_b0[r][1])) {
+				return false;
+			}
+		}
+		if (!tfa_field(a, TFA_BF_FSSYNCEN, 0) || !tfa_field(a, TFA_BF_AUDFS, audfs) || !tfa_field(a, TFA_BF_FRACTDEL, fractdel)) {
+			return false;
+		}
+		say("speaker: the amplifier %s: the container's settings for %s, then profile \"stereo\"\n", a->where,
+		    a->address == 0x34 ? "RCV" : "SPK");
+		for (unsigned r = 0; r < sizeof(tfa_device_bits) / sizeof(tfa_device_bits[0]); r++) {
+			uint16_t value = tfa_device_bits[r][1];
+
+			if (value == 0xffff) {
+				value = slots[slot++];
+			}
+			if (!tfa_field(a, tfa_device_bits[r][0], value)) {
+				return false;
+			}
+		}
+		if (!tfa_keys(a, false)) {
+			return false;
+		}
+		if (tfa_faulty(a, "configured", true)) {
+			say("speaker: the amplifier %s: (a fault flag while powered down: looked at again once it runs)\n", a->where);
+		}
+	}
+	say("speaker: BOTH TFA9873s ARE CONFIGURED as the container's \"stereo\" profile has them: powered down, the amplifier off\n");
+	return true;
+}
+
+/* Powered up to the bit clock (the driver's initCF state), and with `amplifier' its amplifier on. */
+static bool
+tfa_start(bool amplifier)
+{
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+		uint16_t s0 = 0;
+		unsigned tries;
+
+		if (broken || !a->prepared) {
+			return false;
+		}
+		say("speaker: the amplifier %s: configured, power-down off\n", a->where);
+		a->started = true;
+		if (!tfa_field(a, TFA_BF_MANSCONF, 1) || !tfa_field(a, TFA_BF_PWDN, 0)) {
+			return false;
+		}
+		for (tries = 0; tries < TFA_CLKS_TRIES; tries++) {
+			if (!get(a, TFA_STATUS0, &s0)) {
+				power_down_now("the status could not be read");
+				return false;
+			}
+			if (s0 & TFA_STATUS0_CLKS) {
+				break;
+			}
+			wait_ms(2);
+		}
+		say("speaker: the amplifier %s: status %#06x: its clocks %s\n", a->where, s0, tries < TFA_CLKS_TRIES ?
+		    "ARE STABLE on the bit clock" : "ARE NOT STABLE: no bit clock?");
+		if (tries == TFA_CLKS_TRIES) {
+			(void)tfa_faulty(a, "without clocks", true);
+			power_down_now("an amplifier's clocks are not stable");
+			return false;
+		}
+		wait_ms(5);
+		(void)get(a, TFA_STATUS0, &s0);         /* (the sticky flags of before, cleared by reading) */
+		if (tfa_faulty(a, "powered up", true)) {
+			power_down_now("an amplifier reports a fault");
+			return false;
+		}
+		if (!amplifier) {
+			continue;
+		}
+		say("speaker: the amplifier %s: the amplifier on (AMPE)\n", a->where);
+		if (!tfa_field(a, TFA_BF_AMPE, 1)) {
+			return false;
+		}
+		wait_ms(10);
+		if (tfa_faulty(a, "with its amplifier on", true)) {
+			power_down_now("an amplifier reports a fault");
+			return false;
+		}
+		say("speaker: THE AMPLIFIER %s RUNS\n", a->where);
+	}
+	return true;
+}
+
+static void
+tfa_stop(void)
+{
+	if (broken) {
+		return;                 /* (already powered down) */
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+
+		if (!a->started) {
+			continue;
+		}
+		say("speaker: the amplifier %s is stopped as Goodix's driver stops it\n", a->where);
+		(void)tfa_faulty(a, "before the stop", true);
+		if (!tfa_field(a, TFA_BF_AMPE, 0)) {
+			return;
+		}
+		wait_ms(5);
+		if (!tfa_field(a, TFA_BF_PWDN, 1)) {
+			return;
+		}
+		a->started = false;
+		say("speaker: THE AMPLIFIER %s IS POWERED DOWN\n", a->where);
+	}
+}
+
+static bool
+tfa_healthy(void)
+{
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+
+		if (broken) {
+			return false;
+		}
+		if (a->started && tfa_faulty(a, "while it plays", false)) {
+			(void)tfa_faulty(a, "while it plays", true);
+			power_down_now("an amplifier reports a fault");
+			return false;
+		}
+	}
+	return true;
+}
+
+/* renoir: powered up to the bit clock and back down, the amplifiers off: whether they take the clock (sound=1) */
+bool
+hakios_speaker_clock_test(void)
+{
+	bool ok;
+
+	if (!renoir) {
+		return true;
+	}
+	if (tlmm == 0) {
+		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
+	}
+	ok = tfa_prepare() && tfa_start(false);
+	say("speaker: %s\n", ok ? "BOTH TFA9873s TAKE THE BIT CLOCK (their amplifiers stayed off)" : "THE TFA9873s DO NOT RUN ON "
+	    "THE BIT CLOCK");
+	tfa_stop();
+	return ok;
+}
+
 bool
 hakios_speaker_prepare(const uint8_t *acf, uint64_t size)
 {
+	if (renoir) {
+		if (tlmm == 0) {
+			tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
+		}
+		return tfa_prepare();
+	}
 	if (tlmm == 0) {
 		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}
@@ -842,6 +1221,9 @@ hakios_speaker_prepare(const uint8_t *acf, uint64_t size)
 bool
 hakios_speaker_start(void)
 {
+	if (renoir) {
+		return tfa_start(true);
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint16_t status = 0, interrupts = 0;
@@ -915,6 +1297,11 @@ hakios_speaker_volume(uint32_t below, uint32_t step_ms)
 {
 	uint16_t status;
 
+	if (renoir) {
+		(void)below;
+		(void)step_ms;
+		return tfa_healthy();    /* (no volume of its own: sound.c makes the samples quieter) */
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint32_t target = a->volume_at + below;
@@ -968,6 +1355,9 @@ hakios_speaker_volume(uint32_t below, uint32_t step_ms)
 bool
 hakios_speaker_healthy(void)
 {
+	if (renoir) {
+		return tfa_healthy();
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint16_t status;
@@ -1014,6 +1404,9 @@ hakios_speaker_monitor(bool tell)
 {
 	uint32_t wanted = 0;
 
+	if (renoir) {
+		return 0;               /* (the TFA9873s' temperature and battery: not read yet) */
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint16_t vbat = 0, temp = 0, pvdd = 0, isn = 0, vsn = 0;
@@ -1055,6 +1448,10 @@ hakios_speaker_monitor(bool tell)
 void
 hakios_speaker_stop(void)
 {
+	if (renoir) {
+		tfa_stop();
+		return;
+	}
 	if (broken) {
 		return;                 /* (already powered down) */
 	}
@@ -1261,9 +1658,6 @@ hakios_speaker_init(void)
 {
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("speaker_probe", &probe_level, sizeof(probe_level)) || probe_level == 0) {
-		return;
-	}
 	{
 		char board[16] = "";
 
@@ -1271,7 +1665,12 @@ hakios_speaker_init(void)
 			renoir = true;
 			pin_sda = 36;
 			pin_scl = 37;
+			amplifiers[0].where = "0x35 (SPK, the bottom speaker)";
+			amplifiers[1].where = "0x34 (RCV, the earpiece)";
 		}
+	}
+	if (!PE_parse_boot_argn("speaker_probe", &probe_level, sizeof(probe_level)) || probe_level == 0) {
+		return;
 	}
 	if (kernel_thread_start(probe_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

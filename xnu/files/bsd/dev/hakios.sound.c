@@ -62,6 +62,11 @@
  *     (topology 0x10312), two channels, 24 bits, 48 kHz; the stream: ASM session 1, stream 1,
  *     opened for writing linear PCM of 16 bits, no processing (0x10c68), routed to that path
  *
+ * renoir (board=renoir): its TFA9873s sit on TERT_MI2S instead, AFE port 0x1004 at 96 kHz (see
+ * RENOIR_PORT below and devices/renoir/SOUND.md); sound=1 also powers them up to the bit clock
+ * with their amplifiers off (hakios_speaker_clock_test()), sound=3 plays the tone sound_below
+ * made quieter in 6 dB steps, for want of a volume in the amplifiers; sound=4 is not there yet.
+ *
  * What is started is stopped, and what is written is put back, when the time is over -- or, if
  * the DSP is to be shut down earlier (the run's end), before that (hakios_sound_dsp_down()).
  * The amplifiers are powered down on a panic's way out (hakios_sound_quiesce()).
@@ -209,17 +214,26 @@ static struct block tlmm = { "pin controller", 0x0f100000, 0x100000 };
 #define CFG_8MA                 (3u << 6)
 #define CFG_OUTPUT              (1u << 9)
 
-static const struct {
+struct sound_pin {
 	unsigned pin;
 	const char *name;
 	uint32_t cfg, io;               /* Android's active state */
-} tdm_pins[] = {
+};
+static const struct sound_pin redwood_pins[] = {
 	{ 97, "gpio97 (bit clock)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
 	{ 100, "gpio100 (frame sync)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
 	{ 98, "gpio98 (data in)", CFG_MI2S0 | CFG_8MA, 0 },
 	{ 99, "gpio99 (data out)", CFG_MI2S0 | CFG_8MA, 0 },
 };
-#define TDM_PINS                (sizeof(tdm_pins) / sizeof(tdm_pins[0]))
+/* renoir: TERT_MI2S (pinctrl-shima.c: mi2s2_sck, _ws, _data0 function 1, mi2s2_data1 function 3; 8 mA, no pull) */
+static const struct sound_pin renoir_pins[] = {
+	{ 120, "gpio120 (bit clock)", 1u << 2 | CFG_8MA | CFG_OUTPUT, 2 },
+	{ 122, "gpio122 (word select)", 1u << 2 | CFG_8MA | CFG_OUTPUT, 2 },
+	{ 121, "gpio121 (data 0, in)", 1u << 2 | CFG_8MA, 0 },
+	{ 124, "gpio124 (data 1, out)", 3u << 2 | CFG_8MA, 0 },
+};
+#define TDM_PINS                4
+static const struct sound_pin *tdm_pins = redwood_pins;
 static uint32_t found_cfg[TDM_PINS], found_io[TDM_PINS];
 static bool pins_taken;
 
@@ -346,6 +360,28 @@ command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const
 #define SLOT_BITS               32
 #define PORT_BITS               32              /* the mixer path's S32_LE */
 
+/*
+ * renoir (board=renoir, devices/renoir/SOUND.md): its two TFA9873s on TERT_MI2S, which the SoC
+ * drives: AFE port 0x1004 (TERTIARY_MI2S_RX), I2S on data line 1 (rx-lines 0x2), stereo, word
+ * select ours; S24_LE at 96 kHz (mixer_paths_overlay_static.xml), so 32-bit slots and a bit clock
+ * of 96000 x 2 x 32 = 6.144 MHz (clock 0x104, TER_MI2S_IBIT, attribute 1 "couple no": lahaina.c's
+ * mi2s_clk). No group.
+ */
+#define RENOIR_PORT             0x1004
+#define RENOIR_RATE             96000
+#define RENOIR_BITS             24
+#define CLOCK_TER_MI2S_IBIT     0x104
+#define CLOCK_COUPLE_NO         1
+#define AFE_PARAM_ID_I2S_CONFIG 0x0001020du
+#define I2S_SD1                 2
+#define I2S_STEREO              1
+#define I2S_WS_INTERNAL         1
+
+static bool renoir;
+static uint16_t port = PORT;
+static uint32_t rate = RATE;
+static unsigned tone_shift;             /* renoir: the samples made quieter, 6 dB a step (its amplifiers have no volume) */
+
 struct afe_param {
 	uint32_t module, param;
 	uint16_t size, reserved;
@@ -374,6 +410,13 @@ struct afe_tdm {
 	uint32_t version, channels, rate, bits;
 	uint16_t data_format, sync_mode, sync_source, slots, data_out, invert_sync, data_delay, slot_bits;
 	uint32_t slot_mask;
+} __attribute__((packed));
+
+struct afe_i2s {
+	uint32_t version;
+	uint16_t bits, channel_mode, mono_stereo, ws_source;
+	uint32_t rate;
+	uint16_t data_format, reserved;
 } __attribute__((packed));
 
 struct afe_slot_mapping {
@@ -408,7 +451,7 @@ afe_port_param(const char *what, uint32_t module, uint32_t param, const void *da
 	struct afe_param *p = (struct afe_param *)(packet + 16);
 
 	bzero(packet, sizeof(packet));
-	*(uint16_t *)packet = PORT;
+	*(uint16_t *)packet = port;
 	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
 	p->module = module;
 	p->param = param;
@@ -424,6 +467,13 @@ afe_clock(bool on)
 {
 	struct afe_clock_set clock = { 1, CLOCK_PRI_TDM_IBIT, RATE * SLOT_BITS * SLOTS, CLOCK_INVERT_COUPLE_NO, 0, on };
 
+	if (renoir) {
+		clock.id = CLOCK_TER_MI2S_IBIT;
+		clock.hz = RENOIR_RATE * 32 * 2;
+		clock.attribute = CLOCK_COUPLE_NO;
+		return afe_service_param(on ? "the TERT_MI2S bit clock (0x104) at 6.144 MHz, on" : "the TERT_MI2S bit clock, off",
+		           AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
+	}
 	return afe_service_param(on ? "the TDM bit clock (0x200) at 3.072 MHz, on" : "the TDM bit clock, off", AFE_MODULE_CLOCK_SET,
 	           AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
 }
@@ -445,6 +495,21 @@ afe_on(void)
 		                            .offsets = { 0, 4, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
 	uint16_t start[2] = { PORT, 0 };
 
+	if (renoir) {
+		struct afe_i2s i2s = { .version = 1, .bits = RENOIR_BITS, .channel_mode = I2S_SD1, .mono_stereo = I2S_STEREO,
+			               .ws_source = I2S_WS_INTERNAL, .rate = RENOIR_RATE, .data_format = 0 };
+
+		start[0] = port;
+		announce("the DSP is asked for TERT_MI2S's bit clock, the port and its start (AFE)");
+		clock_on = afe_clock(true);
+		if (!clock_on || !afe_port_param("the port 0x1004: I2S, data line 1, stereo, 24 bits at 96 kHz, word select ours",
+		    AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s))) {
+			return false;
+		}
+		port_on = command("the port 0x1004, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0,
+		    NULL);
+		return port_on;
+	}
 	announce("the DSP is asked for the TDM interface's bit clock, the group, the port and its start (AFE)");
 	clock_on = afe_clock(true);
 	if (!clock_on) {
@@ -470,11 +535,11 @@ afe_on(void)
 static void
 afe_off(void)
 {
-	uint16_t stop[2] = { PORT, 0 };
+	uint16_t stop[2] = { port, 0 };
 	struct afe_group_enable disable = { GROUP, 0 };
 
 	if (port_on) {
-		command("the port 0x9000, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
+		command(renoir ? "the port 0x1004, stopped" : "the port 0x9000, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
 		port_on = false;
 	}
 	if (group_on) {
@@ -525,7 +590,10 @@ static struct block apps_smmu_context = { "apps smmu, the audio context", 0, 0x1
 #define PTE_ADDRESS             0x0000fffffffff000ull
 #define AUDIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)       /* as hakios.wifi.c's */
 
-#define AUDIO_STREAM            0x1801
+#define REDWOOD_AUDIO_STREAM    0x1801
+#define RENOIR_AUDIO_STREAM     0x2001          /* renoir's dt: qcom,msm-audio-ion iommus <&apps_smmu 0x2001 0>; the same low bits */
+static uint32_t audio_stream = REDWOOD_AUDIO_STREAM;
+#define AUDIO_STREAM            audio_stream
 #define AUDIO_ADDRESSES         0x10000000ull   /* dt: qcom,iommu-dma-addr-pool of qcom,msm-audio-ion */
 #define AUDIO_STREAM_BITS       (1ull << 32)    /* the stream's low bits (0x1801 & 0xf), where the DSP takes them from */
 
@@ -858,7 +926,7 @@ stream_on(void)
 		uint16_t channels, bits;
 		uint32_t rate;
 		uint8_t map[8];
-	} __attribute__((packed)) open = { 0, ADM_PATH_PLAYBACK, PORT, 0xffff, ADM_TOPOLOGY_NONE, 2, ADM_BITS, RATE,
+	} __attribute__((packed)) open = { 0, ADM_PATH_PLAYBACK, port, 0xffff, ADM_TOPOLOGY_NONE, 2, ADM_BITS, rate,
 		                           { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
 	struct {
 		uint32_t matrix, sessions;
@@ -876,7 +944,7 @@ stream_on(void)
 		uint32_t rate;
 		uint16_t is_signed, reserved;
 		uint8_t map[8];
-	} __attribute__((packed)) format = { 20, 2, 16, RATE, 1, 0, { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
+	} __attribute__((packed)) format = { 20, 2, 16, rate, 1, 0, { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
 	uint32_t run[3] = { 0, 0, 0 };
 	struct hakios_apr_answer answer;
 
@@ -888,7 +956,8 @@ stream_on(void)
 	mapped = true;
 	map_handle = answer.words[0];
 	say("sound: our %u KB at %#llx are the DSP's handle %#x\n", BUFFER_BYTES / 1024, buffer_address, map_handle);
-	if (!command("a device path to the port: playback, no processing, 2 channels of 24 bits at 48 kHz", APR_SVC_ADM, PORT,
+	if (!command(renoir ? "a device path to the port: playback, no processing, 2 channels of 24 bits at 96 kHz" :
+	    "a device path to the port: playback, no processing, 2 channels of 24 bits at 48 kHz", APR_SVC_ADM, port,
 	    ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &answer)) {
 		return false;
 	}
@@ -907,7 +976,8 @@ stream_on(void)
 	stream_open = true;
 	return command("session 1 routed to the device path", APR_SVC_ADM, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route, sizeof(route),
 	           0, NULL) &&
-	       command("the stream's format: 2 channels of 16 bits at 48 kHz, left and right", APR_SVC_ASM, STREAM_PORT,
+	       command(renoir ? "the stream's format: 2 channels of 16 bits at 96 kHz, left and right" :
+	           "the stream's format: 2 channels of 16 bits at 48 kHz, left and right", APR_SVC_ASM, STREAM_PORT,
 	           ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, &format, sizeof(format), 0, NULL) &&
 	       command("the session, run", APR_SVC_ASM, STREAM_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), 0, NULL);
 }
@@ -948,7 +1018,8 @@ period_fill(unsigned period, bool silent)
 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
 
 	for (unsigned frame = 0; frame < PERIOD_FRAMES; frame++) {
-		int16_t sample = silent ? 0 : tone[tone_at++ % 48];
+		/* (at 96 kHz each sample twice: still 1 kHz) */
+		int16_t sample = silent ? 0 : (int16_t)(tone[(tone_at++ / (rate / RATE)) % 48] >> tone_shift);
 
 		samples[2 * frame] = sample;
 		samples[2 * frame + 1] = sample;
@@ -1376,7 +1447,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		    "the port and a stream with a test tone, the amplifiers off" :
 		    "the port, a stream with a test tone, and the amplifiers", seconds);
 	}
-	if (level >= 3) {
+	if (level >= 3 && !renoir) {
 		acf = hakios_adsp_fw_file("aw882xx_acf.bin", &acf_size);
 		if (acf == NULL) {
 			say("sound: no /fw/aw882xx_acf.bin: put the phone's /vendor/etc/aw882xx_acf.bin into fw-audio/ and run SYSTEM=1 "
@@ -1394,17 +1465,25 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		ok = false;
 		hakios_adsp_apr_events(events);
 	}
-	announce("the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
+	announce(renoir ? "the TERT_MI2S pins (GPIO 120, 121, 122, 124) to the interface, as Android's active state has them" :
+	    "the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
 	pins_on();
 	if (!afe_on()) {
 		goto out;
 	}
 	sleep_ms(20);
-	pin_activity(97, "the bit clock (gpio97)", &changes, &ones);
-	pin_activity(100, "the frame sync (gpio100)", &sync_changes, &sync_ones);
-	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE TDM CLOCK AND FRAME SYNC RUN at the pins" :
-	    "THE PINS DO NOT SHOW A RUNNING TDM CLOCK");
+	pin_activity(tdm_pins[0].pin, tdm_pins[0].name, &changes, &ones);
+	pin_activity(tdm_pins[1].pin, tdm_pins[1].name, &sync_changes, &sync_ones);
+	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE BIT CLOCK AND FRAME SYNC RUN at the pins" :
+	    "THE PINS DO NOT SHOW A RUNNING BIT CLOCK");
 	if (level == 1) {
+		if (renoir) {
+			/* whether the amplifiers take that clock: powered up to it, their amplifier stages off, then down again */
+			announce("the TFA9873s, set up and powered up to the bit clock, their amplifiers off");
+			ok = hakios_speaker_clock_test();
+			sleep_ms(seconds * 1000);
+			goto out;
+		}
 		sleep_ms(seconds * 1000);
 		ok = true;
 		goto out;
@@ -1444,7 +1523,8 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	if (level >= 3) {
 		/* the clock runs (the port is started, the stream as well): the amplifiers can lock to it */
-		announce("the amplifiers, set up from Android's Music profile, then started at the lowest volume");
+		announce(renoir ? "the TFA9873s, set up from the container's stereo profile, then started" :
+		    "the amplifiers, set up from Android's Music profile, then started at the lowest volume");
 		if (!hakios_speaker_prepare(acf, acf_size) || !hakios_speaker_start()) {
 			goto out;
 		}
@@ -1453,7 +1533,10 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	if (level >= 3 && !hakios_speaker_volume(below, 50)) {
 		goto out;
 	}
-	if (level >= 3) {
+	if (level >= 3 && renoir) {
+		say("sound: THE TONE PLAYS NOW for %u s: 1 kHz at -%u dBFS (-20 dBFS made %u x 6 dB quieter), both speakers\n",
+		    seconds, 20 + 6 * tone_shift, tone_shift);
+	} else if (level >= 3) {
 		say("sound: THE TONE PLAYS NOW for %u s: 1 kHz at -20 dBFS, both speakers, %u.%03u dB under Android's level\n",
 		    seconds, below / 8, below % 8 * 125);
 	}
@@ -1484,6 +1567,23 @@ hakios_sound_dsp_up(void)
 	}
 	PE_parse_boot_argn("sound_secs", &seconds, sizeof(seconds));
 	PE_parse_boot_argn("sound_below", &below, sizeof(below));
+	{
+		char board[16] = "";
+
+		if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
+			renoir = true;
+			tdm_pins = renoir_pins;
+			port = RENOIR_PORT;
+			rate = RENOIR_RATE;
+			audio_stream = RENOIR_AUDIO_STREAM;
+			/* sound_below in 6 dB steps off the samples; the TFA9873s have no volume, and nobody knows Android's level yet */
+			tone_shift = below / 48 > 15 ? 15 : below / 48;
+			if (level >= 4) {
+				say("sound: board=renoir: iOS's sound (level 4) needs 96 kHz from the plug-in: not yet; level 3 instead\n");
+				level = 3;
+			}
+		}
+	}
 	PE_parse_boot_argn("sound_pause", &pause_ms, sizeof(pause_ms));
 	PE_parse_boot_argn("sound_guard_as", &guard_as, sizeof(guard_as));
 	PE_parse_boot_argn("sound_gain", &gain, sizeof(gain));

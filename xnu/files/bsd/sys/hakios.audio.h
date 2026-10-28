@@ -62,7 +62,8 @@ void hakios_camera_quiesce(void);      /* whatever of them was switched on, off:
 
 /*
  * The phone's speakers (bsd/dev/hakios.speaker.c): its two Awinic amplifiers, set up as
- * Android's driver sets them up, from Android's own configuration file (see there).
+ * Android's driver sets them up, from Android's own configuration file (see there); with
+ * board=renoir its two NXP TFA9873s, from settings of Xiaomi's container (no file needed).
  */
 bool hakios_speaker_prepare(const uint8_t *acf, uint64_t size);       /* found, reset, configured: powered down, muted */
 bool hakios_speaker_start(void);       /* powered up and unmuted at the lowest volume: only while the I2S clock runs */
@@ -70,6 +71,7 @@ bool hakios_speaker_volume(uint32_t below, uint32_t step_ms); /* below Android's
 bool hakios_speaker_healthy(void);     /* no fault reported; on one, both are powered down at once */
 void hakios_speaker_stop(void);        /* faded out, muted, powered down, in Android's order */
 void hakios_speaker_quiesce(void);     /* powered down at once, without sleeping: on a panic's way out */
+bool hakios_speaker_clock_test(void);  /* renoir: powered up to the bit clock and down again, amplifiers off (sound=1) */
 /* the amplifiers' own temperature and battery voltage read (every second while they play): the reduction they call for */
 uint32_t hakios_speaker_monitor(bool tell);
 
