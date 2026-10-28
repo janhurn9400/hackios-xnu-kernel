@@ -86,6 +86,10 @@ static efi_boot_services *BS;
 static efi_handle IMAGE;
 
 static char log_buf[32768];
+/* what the log partition held when this start began (disk_log_take): it survives Android */
+#define DISK_LOG_MAX       0x40000u
+static char previous_disk_log[DISK_LOG_MAX];
+static uint64_t previous_disk_len;
 static uint32_t log_len;
 
 void *
@@ -378,10 +382,6 @@ static uint64_t previous_klog_len, previous_klog_total;
 /* ... and this loader's own log of that start (llog_take) */
 static char previous_llog[LLOG_RING_SIZE];
 static uint64_t previous_llog_len, previous_llog_total;
-/* ... and what the log partition held when this start began (disk_log_take): it survives Android */
-#define DISK_LOG_MAX       0x40000u
-static char previous_disk_log[DISK_LOG_MAX];
-static uint64_t previous_disk_len;
 
 /* At the loader's start: the mirror of the previous start's log, then the mirror starts over. */
 static void
