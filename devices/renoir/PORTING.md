@@ -44,7 +44,12 @@ it worked. This is a research bring-up: expect to live in boot logs.
       `0x000`-`0x700`, 0-3 small) are the same. Kernel log: `Darwin Kernel Version 22.5.0`,
       `initialize_screen: b=E1000000, w=00000438, h=00000960`, `gic: v3`, `bsd_init`, then
       `Hello from user space on Darwin! I am process 1`; returned after 20 s as asked.
-- [ ] All 8 cores (`cpus=8 bootcpu=7 cpufreq=1`).
+- [x] All cores (`bootcpu=7 cpus=8 cpufreq=1`): the kernel gets seven (core 0 stays with the
+      loader for USB), cpufreq sets 1900 / 2208 / 2400 MHz for the three clusters (the 780G's
+      clocks). The three small A55 cores start 28 s after the others by design
+      (`small_cores_after`, `docs/ru/notes.md`), so `hello`, which exits at once, only sees four;
+      with `small_cores_after=0` all seven come up (`cpu 1`..`cpu 6 online`). The panic at the end,
+      "initproc failed to start", is `hello` exiting as process 1 (it does so on purpose).
 
 ## 5. Input + storage
 - [ ] `hakios_touch` for renoir's touch controller (confirm the part from DT first).
