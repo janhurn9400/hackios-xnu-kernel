@@ -117,6 +117,32 @@ it. `adsp_step=6` returns cleanly, so it is something step 7 leaves behind.
   `step_qrtr`, `step_apr`) do that and were never tried (step 7 seemed to be the crash). Next:
   `adsp_step=11 adsp_pause=0 adsp_keep=1` (or `adsp=1`).
 - Note: after a reset the phone restarts towards MagicOS; going to fastboot by keys keeps the RAM only
-  if it is done before Android starts.
+  if it is done before Android starts. The loader now also reads `logdump` before its first write and
+  hands it out (`THE LOG PARTITION AS THIS START FOUND IT`): its notes (every second, the kernel log's
+  last 1200 bytes) survive Android starting in between. (Magisk had no `su` in that MagicOS start.)
+
+## Steps 8-11 work; the DSP runs with its links (session 3, 18:22)
+
+`adsp_step=11 adsp_pause=0 adsp_keep=1 adsp_return=1 adsp_never_stop=1`, read back from `logdump`:
+
+```
+adsp: glink: THE CHANNEL "apr_audio_svc" IS OPEN both ways (ours 2, the DSP's 5)
+adsp: glink: THE CHANNEL "PMIC_RTR_ADSP_APPS" IS OPEN both ways (ours 3, the DSP's 6)
+adsp: qrtr: HELLO FROM NODE 5; ours to it: SENT        (12 services: 0x301, 0x42, 0x1004, 0x2b, 0xf x4, 0x190, 0x33 x2, 0x18)
+adsp: battmgr: < a notice, opcode 0x7, 16 bytes (0x30 0 0)
+adsp: 11: THE AUDIO SERVICES ARE UP after 23 ms and 1 questions
+adsp: THE AUDIO DSP STAYS ON while the system runs, and the link with it
+adsp: back to the loader (adsp_return)
+```
+
+The kernel ran on past 8 s with the DSP up: **the reset is not a timeout of the DSP. It comes when the
+kernel is back in the loader / UEFI after the DSP has run** (every run so far, the first one without
+`adsp_return` too: it ended in the small image's panic and the way back). Meanwhile the Mac loses the
+loader's USB ~3-5 s after the DSP's start, while the kernel still runs. On these Qualcomm SoCs the ADSP
+also runs the USB-C port (over the same PMIC GLINK router as the battery manager): when it starts it
+takes the port over. After the run the loader's first act is a USB transfer through Qualcomm's UEFI
+USB driver (`usb_rx` -> `USB->send`, before `usb_wait`'s first sign of life) -- the likely place of the
+reset. To check: a line before that send; then either keep the loader off USB after a run with the DSP
+(take the logs from RAM/logdump) or re-init USB. For iOS sessions this only hits at the end of a run.
 
 - Speaker amplifiers, for the sound later: two NXP TFA98xx at 0x34/0x35 (MagicOS dmesg).
