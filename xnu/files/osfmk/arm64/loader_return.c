@@ -383,7 +383,6 @@ loader_return(void)
 	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	hakios_adsp_quiesce();         /* nor the audio DSP */
 	hakios_mpss_quiesce();         /* nor the modem */
-	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
 	hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
 	hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
 	/*
@@ -402,6 +401,11 @@ loader_return(void)
 			loader_log_putc(*c);
 		}
 	}
+	/*
+	 * Last, once the log holds everything: the run of 2026-10-28 22:54 was last heard of right after
+	 * this, and the panic text that comes above was lost with it.
+	 */
+	hakios_ddr_quiesce();          /* the vote for the memory's bandwidth taken away */
 	loader_jump(0, 0);
 }
 
