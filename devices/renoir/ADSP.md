@@ -105,5 +105,18 @@ it. `adsp_step=6` returns cleanly, so it is something step 7 leaves behind.
   `adsp_step=6` (the DSP never started). So something a DSP run leaves behind meets UEFI: an
   IPCC/LPASS interrupt the kernel left enabled in the GIC, a watchdog nobody pets after the run, or
   a UEFI driver touching what the DSP's shutdown changed. The run's kernel log is in `logdump` (sda30).
+- **Not an interrupt, not the stop, not the shutdown** (session 3, 18:13-18:21): the loader reports no
+  shared interrupt pending after the run (`gic the run is back: ... no shared interrupt pending`; the
+  same as after `adsp_step=6`), and the reset comes before its next line. New boot-args in
+  `hakios.adsp.c`: `adsp_no_shutdown=1` (stop request, but no TrustZone shutdown, no AOP "off") and
+  `adsp_never_stop=1` (the DSP is left running everywhere, the way back included): **both reset, ~5 s
+  after `oem run`**. So a running DSP takes the phone down by itself a few seconds after it is up
+  (~3-4 s), whatever we do; the reset just happens to fall right after the 3 s watch.
+- Likely: it waits for the apps side to open its links -- the GLINK edge and the services Linux opens
+  right after "up" (sys_mon / ssctl over QRTR) -- and gives up. Steps 8-11 (`step_queues`, `step_link`,
+  `step_qrtr`, `step_apr`) do that and were never tried (step 7 seemed to be the crash). Next:
+  `adsp_step=11 adsp_pause=0 adsp_keep=1` (or `adsp=1`).
+- Note: after a reset the phone restarts towards MagicOS; going to fastboot by keys keeps the RAM only
+  if it is done before Android starts.
 
 - Speaker amplifiers, for the sound later: two NXP TFA98xx at 0x34/0x35 (MagicOS dmesg).
