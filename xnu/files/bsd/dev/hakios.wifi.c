@@ -4639,9 +4639,14 @@ renoir_bhi_prepare(void)
 			return false;
 		}
 	}
-	radio_stream = 0x2401;
+	/*
+	 * Stream 0x2400 alone, with PARF's BDF-to-SID table left empty (every device then has offset 0): THE PBL
+	 * TOOK THE IMAGE this way (2026-10-29 00:00). 0x2401 with the table filled as Linux fills it (hash 0x15)
+	 * reset the phone at the doorbell, as did no context at all. pcie_stream=0x2401 for the other way.
+	 */
+	radio_stream = 0x2400;
 	radio_stream_mask = 0;
-	PE_parse_boot_argn("pcie_stream", &radio_stream, sizeof(radio_stream));    /* 0x2400: the table left empty */
+	PE_parse_boot_argn("pcie_stream", &radio_stream, sizeof(radio_stream));
 	radio_space.wanted = 2;
 	pause_ms = renoir_pause ? renoir_pause : 1500;
 	new_from = 0;                           /* (every SMMU write waits pause_ms: see hold()) */

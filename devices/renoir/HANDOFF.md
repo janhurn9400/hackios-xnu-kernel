@@ -21,8 +21,10 @@
   01:00.0, then takes it down. Run: `KERNEL=devices/renoir/prebuilt/vm-kernel/mach.development.bcm2837
   RAMDISK=devices/renoir/prebuilt/vm-kernel/hold devices/renoir/run-open.sh 60 bootcpu=7 cpus=1 board=renoir
   pcie=5 wifi_return=1 -v` (no system image needed). **`pcie=6 pcie_pause=0`**: BAR0 (2 MB) placed, MHI's
-  registers read: the chip waits in its boot ROM (BHI EE 0 = PBL) for `amss20.bin`. Next: MHI/BHI firmware
-  download (`WIFI.md` step 4). Do not use the default `pcie_pause` with `pcie=6` (a long pause hung a config
+  registers read: the chip waits in its boot ROM (BHI EE 0 = PBL) for `amss20.bin`. **`pcie=7`** (2026-10-29
+  00:00, ramdisk `prebuilt/sysimg/root-wifi.apfs`): **THE PBL TOOK THE SBL through BHI, the chip runs it (EE 1,
+  MHI READY)**: SMMU stream 0x2400 alone, BDF-to-SID table empty (`WIFI.md` step 4 has what reset the phone).
+  Next: BHIe for the rest of the image (`WIFI.md` step 5). Do not use the default `pcie_pause` with `pcie=6` (a long pause hung a config
   write).
 - **Ringtones work without freezing** (user, 23:20) with kernel 23:14.
 

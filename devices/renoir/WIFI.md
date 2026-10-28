@@ -62,10 +62,22 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    write hung the kernel for good (no abort; the phone had to be reset). With `pcie_pause=0` and the link
    watched for 2 s in 500 ms steps (each a config read) it never happened: perhaps the link going idle
    (L1/clock request) with nothing to wake it. Keep the bus busy or look at ASPM/L1 before long pauses.
-4. **MHI host, ours** (next): first BHI alone -- the SBL part of `amss20.bin` into DMA memory, BHI_IMGADDR/
-   SIZE/TXDB, and EE going 0 -> 1 (SBL) -- before any rings. Then: Linux's MHI core is GPL-2.0, so it cannot be taken; ath11k's own `pci.c`/`mhi.c`
+4. **BHI: the SBL. DONE, 2026-10-29 00:00 (`pcie=7 pcie_pause=0`, ramdisk `prebuilt/sysimg/root-wifi.apfs` =
+   `sbin/launchd` (hold) + `fw/amss20.bin`, made with `tools/apfs/mkapfs.py --plain fw`).** The first 512 KB of
+   `amss20.bin` in one physical piece, shown to the chip through the SMMU at 0xa0000000 (match register 3,
+   context 3, our page tables: `hakios_wifi_radio_map()`), BHI IMGADDR/IMGSIZE, session 0x1234 to IMGTXDB:
+   after 20 ms BHI_STATUS 0x80001234 (success), **EE 1 (SBL), MHISTATUS 0x101 (READY)**.
+   What it took (each of these reset the phone at the doorbell, within microseconds):
+   - a physical address (PCIe 0's streams fault: nobody matches them);
+   - stream 0x2401 (the QCA6490's in dt iommu-map) with PARF's BDF-to-SID table filled as Linux does
+     (CRC-8 0x15 -> 0x100 << 16 | 1 << 8): the chip's requests still did not come as 0x2401;
+   - stream 0x2400 with mask 1 was not taken by the hypervisor (SMR read back unchanged).
+   **Working: stream 0x2400, mask 0, table empty** (all devices then offset 0). The hypervisor grants SMR/S2CR
+   for 0x2400 and 0x2401 alone. Reboot reason "bootloader" is now set for `pcie>=3` (resets land in fastboot).
+5. **MHI host, ours** (next): BHIe for the rest of `amss20.bin` (the SBL asks for the full image in
+   segments: vector table at BHIe), then MHI's own start. Then: Linux's MHI core is GPL-2.0, so it cannot be taken; ath11k's own `pci.c`/`mhi.c`
    are BSD-3-Clause-Clear and can. Needed: BHI/BHIe image download (`amss20.bin`), the MHI state machine
    to mission mode, context arrays, event rings, channels IPCR (20/21) -- behind Linux's `mhi.h` API so
    that ath11k's `mhi.c` runs unchanged.
-5. **SMMU** for stream 0x2400 (as redwood's `radio_space_on`), MSI (the tree's `qcom,pcie-msi`, SPIs).
-6. **ath11k_pci** for QCA6490 ("hsp") on `wifi/lx`, QMI over MHI's QRTR, then the station as on redwood.
+6. **MSI** (the tree's `qcom,pcie-msi`, SPIs); the SMMU part is done (step 4).
+7. **ath11k_pci** for QCA6490 ("hsp") on `wifi/lx`, QMI over MHI's QRTR, then the station as on redwood.
