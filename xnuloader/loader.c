@@ -169,6 +169,49 @@ str_eq(const char *a, const char *b)
  */
 static int screen_quiet;
 
+/*
+ * This loader's own log, mirrored line by line into a ring in memory the UEFI map reserves (after
+ * the crash log's slots) and written through to DDR: when the phone resets, the next start shows
+ * how far this one got (llog_take), the way back from a kernel included.
+ */
+#define LLOG_HEADER         (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x80000ULL + 0x800)
+#define LLOG_RING           (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x80000ULL + 0x41000)
+#define LLOG_RING_SIZE      0x3e000u
+#define LLOG_MAGIC          0x474f4c4c554e5821ULL   /* "!XNULLOG" */
+static void clean_dcache(uint64_t start, uint64_t end);
+static int llog_on;
+static uint64_t llog_pos, llog_cleaned;
+
+static void
+llog_clean(uint64_t from, uint64_t to)
+{
+	if (to - from >= LLOG_RING_SIZE) {
+		clean_dcache(LLOG_RING, LLOG_RING + LLOG_RING_SIZE);
+	} else if (from % LLOG_RING_SIZE <= (to - 1) % LLOG_RING_SIZE) {
+		clean_dcache(LLOG_RING + from % LLOG_RING_SIZE, LLOG_RING + (to - 1) % LLOG_RING_SIZE + 1);
+	} else {
+		clean_dcache(LLOG_RING + from % LLOG_RING_SIZE, LLOG_RING + LLOG_RING_SIZE);
+		clean_dcache(LLOG_RING, LLOG_RING + (to - 1) % LLOG_RING_SIZE + 1);
+	}
+}
+
+static void
+llog_put(char c)
+{
+	volatile uint64_t *h = (volatile uint64_t *)LLOG_HEADER;
+
+	((char *)LLOG_RING)[llog_pos % LLOG_RING_SIZE] = c;
+	llog_pos++;
+	if (c == '\n' || llog_pos - llog_cleaned >= 256) {
+		llog_clean(llog_cleaned, llog_pos);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		h[1] = llog_pos;
+		h[0] = LLOG_MAGIC;
+		clean_dcache(LLOG_HEADER, LLOG_HEADER + 16);
+		llog_cleaned = llog_pos;
+	}
+}
+
 static void
 put_char(char c)
 {
@@ -176,6 +219,9 @@ put_char(char c)
 
 	if (log_len < sizeof(log_buf) - 1) {
 		log_buf[log_len++] = c;
+	}
+	if (llog_on) {
+		llog_put(c);
 	}
 	if (ST->con_out != NULL && !screen_quiet) {
 		if (c == '\n') {
@@ -303,6 +349,35 @@ static uint64_t staged_len;
 #define CRASH_LOG_TEXT     0x40000u
 static char previous_klog[CRASH_LOG_TEXT];
 static uint64_t previous_klog_len, previous_klog_total;
+/* ... and this loader's own log of that start (llog_take) */
+static char previous_llog[LLOG_RING_SIZE];
+static uint64_t previous_llog_len, previous_llog_total;
+
+/* At the loader's start: the mirror of the previous start's log, then the mirror starts over. */
+static void
+llog_take(void)
+{
+	volatile uint64_t *h = (volatile uint64_t *)LLOG_HEADER;
+	uint64_t total, len, from;
+
+	flush_dcache(LLOG_HEADER, LLOG_HEADER + 16);
+	total = h[1];
+	if (h[0] == LLOG_MAGIC && total != 0 && total < (1ULL << 40)) {
+		len = total < LLOG_RING_SIZE ? total : LLOG_RING_SIZE;
+		from = total - len;
+		flush_dcache(LLOG_RING, LLOG_RING + LLOG_RING_SIZE);
+		for (uint64_t i = 0; i < len; i++) {
+			previous_llog[i] = ((const char *)LLOG_RING)[(from + i) % LLOG_RING_SIZE];
+		}
+		previous_llog_len = len;
+		previous_llog_total = total;
+	}
+	h[0] = 0;
+	h[1] = 0;
+	clean_dcache(LLOG_HEADER, LLOG_HEADER + 16);
+	llog_pos = llog_cleaned = 0;
+	llog_on = 1;
+}
 
 static void
 compose_logs(const char *klog, uint64_t klog_len)
@@ -322,6 +397,14 @@ compose_logs(const char *klog, uint64_t klog_len)
 	staged_data = out_buf;
 	memset(out_buf, 0, sizeof(out_buf));
 	memcpy(out_buf, log_buf, log_len);
+	if (klog == previous_klog || (klog == NULL && previous_llog_len != 0)) {
+		static const char lsep[] = "\n== LOADER LOG OF THE PREVIOUS START (as far as it got; its last part) ==\n";
+
+		memcpy(out_buf + n, lsep, sizeof(lsep) - 1);
+		n += sizeof(lsep) - 1;
+		memcpy(out_buf + n, previous_llog, previous_llog_len);
+		n += previous_llog_len;
+	}
 	if (klog != NULL) {
 		if (klog_len > sizeof(out_buf) - n - 8192) {
 			klog_len = sizeof(out_buf) - n - 8192;
@@ -955,7 +1038,7 @@ static uint64_t sound_len;
 #define CRASH_LOG_BASE          (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x80000ULL)
 #define CRASH_LOG_MAGIC         0x4853415243554e58ULL   /* "XNUCRASH": the first layout, one copy */
 #define CRASH_LOG_MAGIC2        0x3248535243554e58ULL   /* "XNUCRSH2": two slots, see below */
-#define CRASH_SLOT_SIZE         0x3f000u
+#define CRASH_SLOT_SIZE         0x20000u                /* (then the loader log's ring: LLOG_RING) */
 #define CRASH_SLOT_TEXT         (CRASH_SLOT_SIZE - 32)
 
 /*
@@ -2573,8 +2656,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			}
 		}
 	}
-	running_live = NULL;
-	crash_log_clear();              /* the run is back (or hung, and its log taken): nothing to keep */
+	running_live = NULL;            /* (the crash log is cleared once the run's logs are written: run_kernel) */
 
 	if (watching_only) {
 		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
@@ -3605,6 +3687,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		}
 	}
 	write_logs(klog, klog_len);
+	crash_log_clear();              /* the run is over and its logs are out: nothing to keep */
 	return 1;
 }
 
@@ -4129,8 +4212,13 @@ efi_main(efi_handle image, efi_system_table *st)
 	IMAGE = image;
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+	llog_take();                    /* first: from here on this start's lines go into the mirror */
 	crash_log_take();
 	print("== XNULOADER v3 ==\n");
+	if (previous_llog_len != 0) {
+		print("the previous start's own log is kept: the last %d of its %d bytes (oem log)\n", previous_llog_len,
+		    previous_llog_total);
+	}
 	if (previous_klog_len != 0) {
 		print("the previous run ended in a reset: the last %d of its %d bytes of kernel log are kept (oem log)\n",
 		    previous_klog_len, previous_klog_total);
