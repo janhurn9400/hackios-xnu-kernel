@@ -53,7 +53,11 @@ it worked. This is a research bring-up: expect to live in boot logs.
 
 ## 5. Input + storage
 - [ ] `hakios_touch` for renoir's touch controller (confirm the part from DT first).
-- [ ] UFS up → the iOS user space mounts and you reach the lock/home screen.
+- [x] UFS readable (`ufs=2`, 2026-10-28): read only by construction; the kernel asks the loader
+      on core 0, which reads with Qualcomm's UFSDxe, so no controller address of renoir is involved.
+      All six units (LUN 0: 30617600 × 4 KB = 119600 MB; 16, 16, 32, 2296, 32 MB), every GPT header
+      and table with the right crc, all 110 partitions, `super`'s metadata read; no read errors.
+- [ ] iOS user space mounts → lock/home screen (needs the IPSW and the system image).
 
 ## 6. GPU (should be close to redwood)
 - [ ] Adreno 642 via Mesa. redwood is Adreno 642L — same family, so this is adaptation, not bring-up.
