@@ -14,12 +14,16 @@ read off a real renoir (MIUI 14.0.7 vendor, rooted), its device tree, and renoir
   modules name it **FT5652**; renoir's `focaltech_spi/focaltech_config.h` builds with
   `FTS_CHIP_TYPE _FT3658U`, mapping `{0x88, 0x56, 0x52, ..., 0x56, 0xB2}` (runtime ID 0x56 0x52,
   boot-ROM ID 0x56 0xB2).
-- **Open question: flash or flashless.** The FT3658U family is the one redwood's driver uploads
-  firmware to (pramboot, `hakios.focaltech_fw.h`, from `focaltech_3658u`). If renoir's chip also
-  boots into its ROM after our reset (boot ID 0x56 0xB2 instead of runtime 0x56 0x52), it needs
-  **renoir's own** FT3658U/FT5652 firmware uploaded; redwood's FT3680 firmware must never be sent to
-  it. No FocalTech firmware file is in `/vendor/firmware`; look in renoir's `focaltech_spi` source
-  (`focaltech_flash/` / `*.i`) or `focaltech_touch.ko`.
+- **The chip has its own flash: no firmware upload.** renoir's driver is
+  `drivers/input/touchscreen/focaltech_3658u/` (`FTS_CHIP_TYPE _FT3658U`, firmware
+  `include/firmware/fw_ft3658_k9.i`, 90999 bytes; the `focaltech_spi/` directory with
+  `fw_ft3658_k11.i` is another Xiaomi phone's). Its upgrade routine is `fts_ft5652_upgrade()`
+  (`focaltech_flash/focaltech_upgrade_ft3658u.c`): erase pages, write flash, compare ECC. So the
+  k9 file only **updates the flash** when the version differs; after a reset the chip starts its own
+  firmware (0x13 here) and answers with the runtime ID 0x56 0x52. redwood instead uploads its
+  firmware (`hakios.focaltech_fw.h`, from `focaltech_ts_fw_m20.bin`, 116448 bytes) into PRAM after
+  every reset. **On renoir the driver must never upload or flash anything**: flashing is permanent;
+  if the chip answers with the boot-ROM ID 0x56 0xB2, stop and say so.
 - Some renoir units have **Goodix GT9897** instead (`goodix_gt9897t_fw_k9.bin` is in
   `/vendor/firmware` on every unit). The DT node carries parameters for both.
 
@@ -61,8 +65,8 @@ From renoir's `focaltech_spi/focaltech_spi.c` and `focaltech_core.[ch]`:
    (`touch_board=renoir`), redwood the default, so redwood is untouched.
 2. renoir power-on: ldoc2 1.8 V and **ldoc7 3.0 V** through the RPMh helper already there (instead
    of the avdd gpio), reset gpio 30, int gpio 31.
-3. Vendor: ask FocalTech's chip ID over SPI first; accept 0x56/0x52 (runtime). If the chip answers
-   with the boot ID 0x56/0xB2, stop with a clear message until renoir's firmware is in place.
-   Goodix path for GT9897 units afterwards.
+3. Vendor: ask FocalTech's chip ID over SPI first; accept 0x56/0x52 (runtime, after waiting up to
+   1 s past reset). If the chip answers with the boot ID 0x56/0xB2, stop with a clear message — never
+   upload or flash. Goodix path for GT9897 units afterwards.
 4. Build the kernel (`xnu-deps/setup.sh`, `xnu-build.sh`; see `WORKFLOW.md`) and test with
    `run-open.sh 30 cpus=1 touchscreen=1 touch_board=renoir -v`.
