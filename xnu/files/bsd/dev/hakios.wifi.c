@@ -4856,6 +4856,17 @@ renoir_pcie_link(unsigned level)
 	wr(parf, 1u << 13 | 1u << 12 | 1u << 10 | 1u << 11 | 1u << 6 | 1u << 4 | 1u << 2 | 1u << 1);
 	wr(parf + 0x1ac, 0);                            /* PARF_Q2A_FLUSH */
 	wr(parf + 0x358, 0x4000000);                    /* PARF_SLV_ADDR_SPACE_SIZE: qcom,slv-addr-space-size */
+	/*
+	 * Which SMMU stream a device's requests carry: PARF's BDF-to-SID table, 256 words indexed by the CRC-8
+	 * (polynomial 7, MSB first) of the bus/device/function in big-endian, each (BDF << 16 | offset from the
+	 * first stream of dt iommu-map << 8 | next). dt: RID 0 -> 0x2400, RID 0x100 (the QCA6490) -> 0x2401.
+	 * CRC-8 of 00 00 is 0, of 01 00 is 0x15. Without it the chip's first read (BHI) reset the phone.
+	 */
+	for (unsigned i = 0; i < 256; i++) {
+		wr(parf + 0x2000 + 4 * i, 0);
+	}
+	wr(parf + 0x2000 + 4 * 0x15, 0x100u << 16 | 1u << 8);
+	printf("wifi: pcie: BDF-to-SID: 01:00.0 -> stream 0x2400 + %u\n", (rd(parf + 0x2000 + 4 * 0x15) >> 8) & 0xff);
 	printf("wifi: pcie: DBI: id %#x, command %#x, class %#x, link %#x\n", rd(dbi), rd(dbi + 4), rd(dbi + 8),
 	    rd(dbi + 0x80));
 	renoir_say("5: the root port's buses 0/1/1, memory and bus mastering; PERST# released after 100 ms");
