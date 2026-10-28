@@ -89,9 +89,10 @@ SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
 # sound, outside the directories above: the virtual audio device, a plug-in that all of mediaserverd's
 # audio goes through, with its tunings (signal processing chains) for this model and for any, and the
-# system's own sounds. Not the neural networks among the tunings, nor the sounds of the watch.
+# system's own sounds, and the ringtones (53 files, 17 MB: without them Settings' ringtone list played nothing
+# and no other ringtone could be chosen). Not the neural networks among the tunings, nor the sounds of the watch.
 AUDIO = ('Library/Audio/Plug-Ins/', 'Library/Audio/Tunings/D22/', 'Library/Audio/Tunings/Generic/',
-         'System/Library/Audio/UISounds/')
+         'System/Library/Audio/UISounds/', 'Library/Ringtones/')
 SKIP_AUDIO = ('System/Library/Audio/UISounds/nano/',)
 KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
 
