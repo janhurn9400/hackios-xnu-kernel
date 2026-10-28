@@ -3912,12 +3912,28 @@ usb_rx(uint8_t *buf, uint64_t len)
 		usb_rx_queued = 0;      /* (every command is received the same way, into the same buffer) */
 		return usb_wait(USB_EP_OUT);
 	}
-	if (READ_SYSREG(CNTVCT_EL0) < after_run_until) {
-		/* (renoir resets on the way back after its audio DSP has run: is it here?) */
-		print("usb: a receive is about to be queued (connected %d), %d ms after the run\n", (uint64_t)usb_connected,
-		    (READ_SYSREG(CNTVCT_EL0) - after_run_from) * 1000 / READ_SYSREG(CNTFRQ_EL0));
-	}
-	if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {
+	efi_status s = USB->send(USB_EP_OUT, len, buf);
+	if (EFI_ERROR(s)) {
+		/*
+		 * On renoir the audio DSP, once started, takes the USB-C port over (it runs the port on
+		 * these Qualcomm SoCs): the host loses this device a few seconds later and every transfer
+		 * fails from then on, without a state change. This loop used to retry at once, forever,
+		 * without feeding the watchdog, which then reset the phone 30 s later. Now: feed it, and
+		 * restart the controller, at most every 2 s.
+		 */
+		static uint64_t last_restart, failures;
+		uint64_t now = READ_SYSREG(CNTVCT_EL0), freq = READ_SYSREG(CNTFRQ_EL0);
+
+		wdt_pet();
+		if (failures++ == 0 || now - last_restart >= 2 * freq) {
+			last_restart = now;
+			print("usb: a receive cannot be queued (%x, %d failures): the controller is restarted\n", s, failures);
+			USB->stop();
+			usb_connected = 0;
+			if (!usb_start()) {
+				print("usb: the controller does not come back\n");
+			}
+		}
 		return -1;
 	}
 	return usb_wait(USB_EP_OUT);
