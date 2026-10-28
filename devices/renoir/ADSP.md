@@ -156,7 +156,22 @@ hypervisor's virtual watchdog (`WDT_BITE_MS` 30 s): **the "reset" was that watch
 run. **The ADSP does not crash the phone.**
 
 Fix (`813328a`): a failed receive feeds the watchdog and restarts the USB controller (`stop`,
-`start_ex`), at most every 2 s. Open: whether USB comes back to the Mac while/after the DSP ran (the
-DSP may keep the port), and for real sessions the DSP running with iOS (`adsp=1`).
+`start_ex`), at most every 2 s. **Checked (18:37): after `adsp_step=7 adsp_return=1` the phone stays
+in the loader, kernel text on the screen, no reset for 90 s and more.** USB does **not** come back to
+the Mac (watched 75 s), controller restarts or not: the DSP leaves the USB-C port in a state UEFI's
+USB driver does not connect from, even after TrustZone shut it down. Leave the loader by a long press
+on power.
+
+## Next for the ADSP
+
+1. A real session: iOS with `adsp=1` (battery manager, sound; `NEXT.md` has the iOS run command). USB
+   goes away 3-5 s after the DSP starts, so no live log and no result over USB: take the logs from
+   RAM / `logdump` on the next start (`oem log`), or start the run with a long `loader_return_after`.
+2. USB under a running DSP: on these SoCs the ADSP's PMIC GLINK router also carries UCSI (USB-C
+   connector management) next to the battery manager (`PMIC_RTR_ADSP_APPS`); Linux's `ucsi_glink`
+   answers it. The DSP likely waits for the apps side there, or switches the port's data role. Look
+   at what it sends on that channel (the battmgr notice `opcode 0x7` was the first) and what Linux's
+   `drivers/usb/typec/ucsi/ucsi_glink.c` / `pmic_glink` answer.
+3. The loader could also stop using USB once a run with the DSP is over and say so on screen.
 
 - Speaker amplifiers, for the sound later: two NXP TFA98xx at 0x34/0x35 (MagicOS dmesg).

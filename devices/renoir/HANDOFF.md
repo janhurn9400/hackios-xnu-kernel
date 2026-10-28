@@ -1,4 +1,29 @@
-# Handoff for the next session (written 2026-10-28, ~17:45, end of session 2)
+# Handoff for the next session
+
+## Session 3 (2026-10-28, ~17:45-18:40): the ADSP is solved, USB after it is not
+
+- **The ADSP works, steps 1-11**: it starts (up after 38 ms), GLINK channels `apr_audio_svc` and
+  `PMIC_RTR_ADSP_APPS` open, QRTR hello and 12 services, a battery manager notice, APR "audio services
+  are up" (`ADSP.md`, `adsp_step=11 adsp_keep=1`).
+- **The "reset" was never the DSP**: once started, the DSP takes the USB-C port over; the loader's USB
+  receive then failed forever and its retry loop never fed the hypervisor watchdog, which bit after
+  30 s. Fixed in the loader (`813328a`): the phone now stays in the loader after a DSP run.
+- **USB does not come back** after a DSP run (the Mac loses the loader 3-5 s after the DSP starts).
+  Leave the loader then by a long press on power. Next steps: `ADSP.md` "Next for the ADSP".
+- **New loader** (`devices/renoir/prebuilt/xnu-usb-renoir-crashlog.img`, built from `xnuloader/` in the
+  VM: `cd xnuloader && ./build.sh`, needs `lzfse`): keeps across a reset the kernel's live log (two slots
+  at 0xF3F80000), its own log (ring at 0xF3FC1000) and what `logdump` held at its start, and hands them
+  out with `fastboot oem log; fastboot get_staged FILE`. DDR and the whole payload region survive a
+  reset and Xiaomi's boot loaders, but not Android starting: go to fastboot by keys right after a reset,
+  or rely on the `logdump` notes (every second, 1200 bytes of kernel log), which survive MagicOS.
+- New kernel boot-args (`hakios.adsp.c`): `adsp_no_shutdown`, `adsp_no_aop_off`, `adsp_never_stop`.
+  The kernel in `prebuilt/vm-kernel/` has them (18:20); the 17:34 one is kept as `.1734`.
+- The VM's clone is updated from the Mac's repo through the share (no push needed):
+  `git pull --ff-only /media/psf/Home/Desktop/ROMS/hackios-xnu-kernel renoir`.
+- Magisk had no `su` in the last MagicOS start (`read-log.sh` cannot read `logdump` then).
+- Still nothing pushed to GitHub.
+
+# Session 2's handoff (written 2026-10-28, ~17:45)
 
 Read this first, then `NEXT.md`, `WORKFLOW.md`, `ADSP.md`, `GPU.md`, `TOUCH.md`. Branch `renoir`,
 everything committed, nothing pushed. The user wants the ADSP solved next ("gib alles").
