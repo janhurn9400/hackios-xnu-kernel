@@ -52,8 +52,18 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
      bus 1 at 0x60100000.
    - Not done yet: CX level vote (the boot chain's was enough), the supplies are not voted off again (shared:
      a vote of ours replaces the boot chain's for this processor).
-3. **iATU + BAR** (next): map BAR0 of the chip in the 0x60300000 window; read MHI registers (MHIVER, BHI).
-4. **MHI host, ours**: Linux's MHI core is GPL-2.0, so it cannot be taken; ath11k's own `pci.c`/`mhi.c`
+3. **iATU + BAR**: `pcie=6`. **DONE, 23:29 (`logs/232853-renoir-open.log`)**: BAR0 is 2 MB (64-bit, reads
+   0xffe00004 after all ones), placed at 0x60400000; root port window 0x63f06030; iATU region 1 memory 1:1
+   over 0x60300000 + 0x3d00000; command 0x6. **The chip waits in its boot ROM for the firmware:** MHI regs:
+   MHIREGLEN 0x100, MHIVER 0xdeadbeef, MHICFG 0x00800080 (128 event rings, 128 channels), CHDBOFF 0x300,
+   ERDBOFF 0x700, BHIOFF 0x100, BHIEOFF 0x224, MHICTRL 0, MHISTATUS 0 (state RESET), error 0x8cb4d3a7;
+   BHI version 2.1, **EE 0 = PBL**, status 0, serial 0xfa5e5f9d, hardware id 1.
+   Caution: with `pcie_pause=2200` (a 2.2 s sleep between the id read and the first config write) the
+   write hung the kernel for good (no abort; the phone had to be reset). With `pcie_pause=0` and the link
+   watched for 2 s in 500 ms steps (each a config read) it never happened: perhaps the link going idle
+   (L1/clock request) with nothing to wake it. Keep the bus busy or look at ASPM/L1 before long pauses.
+4. **MHI host, ours** (next): first BHI alone -- the SBL part of `amss20.bin` into DMA memory, BHI_IMGADDR/
+   SIZE/TXDB, and EE going 0 -> 1 (SBL) -- before any rings. Then: Linux's MHI core is GPL-2.0, so it cannot be taken; ath11k's own `pci.c`/`mhi.c`
    are BSD-3-Clause-Clear and can. Needed: BHI/BHIe image download (`amss20.bin`), the MHI state machine
    to mission mode, context arrays, event rings, channels IPCR (20/21) -- behind Linux's `mhi.h` API so
    that ath11k's `mhi.c` runs unchanged.
