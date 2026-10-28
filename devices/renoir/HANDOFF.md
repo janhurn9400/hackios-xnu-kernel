@@ -11,7 +11,10 @@
   the DDR vote, before it). The motor was playing at that moment; renoir's motor is the PMIC's and plays on
   through a reset. Fixed in `loader_return.c`: the motor and the torch are stopped FIRST, the DDR vote is
   made LAST (after the panic text is in the log). Kernel 22:59 has both; running on the phone from 23:03.
-  Still open: why the run ended (next log has the panic text); a reset in the middle of a vibration would
+  **The freeze itself** (second try, panic text read from `logdump` in MagicOS, `logs/logdump-2306.txt`):
+  `kmem_alloc ... failed with 3` in `io_map` from `hv_put()`: the haptic driver mapped the arbiter's write
+  channel at every write and never unmapped it. Fixed (mapped once; kernel 23:14, on the phone from 23:17).
+  Still open: a reset in the middle of a vibration would
   still leave it on -- the loader could stop the motor at its start (SPMI write, `WIFI-BT-HAPTICS.md`).
 - **Wi-Fi started** (`WIFI.md`): the QCA6490 is on PCIe 0; a read-only survey (`board=renoir pcie=1/2`, in
   `hakios.wifi.c`) found PCIe 0 and the radio all off, GCC readable. Next: step 2, the link.
