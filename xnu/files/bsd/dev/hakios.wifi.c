@@ -5032,8 +5032,11 @@ renoir_mhi(vm_offset_t mhi)
 		mhi_wr64(mhi + rd(mhi + 0x18) + 8 * out, MHI_AT(0x6000 + ch_wp[0]));
 		printf("wifi: pcie: 9: QRTR HELLO SENT on channel %u (%u bytes)\n", out, (unsigned)sizeof(hello));
 	}
-	for (int ms = 0; ms < 3000; ms++) {
-		if (ms == 500 || ms == 1500) {
+	uint32_t watch = 3000;
+
+	PE_parse_boot_argn("pcie_watch", &watch, sizeof(watch));        /* how long channel 21 is watched, ms */
+	for (int ms = 0; ms < (int)watch; ms++) {
+		if (ms == 500 || ms == 1500 || (ms > 0 && ms % 5000 == 0)) {
 			mhi_wr64(mhi + rd(mhi + 0x18) + 8 * out, MHI_AT(0x6000 + ch_wp[0]));
 			mhi_wr64(mhi + rd(mhi + 0x18) + 8 * (out + 1), MHI_AT(0x7000 + ch_wp[1]));
 			mhi_event_doorbell(mhi, 1);
