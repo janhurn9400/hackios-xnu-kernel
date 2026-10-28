@@ -97,5 +97,13 @@ it. `adsp_step=6` returns cleanly, so it is something step 7 leaves behind.
   back to the loader with a DSP that has run.
 - Watch out: when the phone comes up in MagicOS after a crash, the kept log is gone (Linux uses that
   RAM). Go to fastboot by keys while it is still resetting.
+- **The kernel comes back; the reset comes after, in the loader / UEFI** (session 3, 18:04, the loader's
+  own log kept across the reset): `adsp_step=7 adsp_pause=0 adsp_return=1` ->
+  `kernel returned: log at f7b489c0, 29604 bytes`, `returned 29604 0`,
+  `log: 32768 bytes written to logdump (0), read back the same (0)` -- the last line; the reset follows
+  within about a second, while the loader is back in its USB loop and UEFI runs again. Not with
+  `adsp_step=6` (the DSP never started). So something a DSP run leaves behind meets UEFI: an
+  IPCC/LPASS interrupt the kernel left enabled in the GIC, a watchdog nobody pets after the run, or
+  a UEFI driver touching what the DSP's shutdown changed. The run's kernel log is in `logdump` (sda30).
 
 - Speaker amplifiers, for the sound later: two NXP TFA98xx at 0x34/0x35 (MagicOS dmesg).
