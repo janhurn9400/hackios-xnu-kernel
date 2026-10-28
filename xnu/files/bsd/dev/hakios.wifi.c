@@ -4363,6 +4363,7 @@ renoir_pcie_survey(uint32_t how)
  *   6  ... BAR0 placed and MHI's registers read (renoir_bar())
  *   7  ... the firmware's first 512 KB to the boot ROM through BHI (renoir_bhi())
  *   8  ... and the whole of it to the SBL through BHIe (renoir_bhie())
+ *   9  ... MHI to M0, the IPCR channels started, what the chip says on them (renoir_mhi())
  * Everything is taken back down at the end, in reverse, but for the supplies (see renoir_pcie_down()).
  * pcie_pause=MS (default 2200): a pause after each announcement, for the loader's notes if a write ends
  * the kernel (the hypervisor may keep some of this for itself).
@@ -4726,7 +4727,7 @@ renoir_bhi_prepare(void)
 	return renoir_level < 8 || renoir_bhie_prepare(image, size);
 }
 
-static void
+static uint32_t
 renoir_bhie(vm_offset_t mhi, vm_offset_t bhie)
 {
 	uint32_t status = 0, ee = 0;
@@ -4759,8 +4760,242 @@ renoir_bhie(vm_offset_t mhi, vm_offset_t bhie)
 			    rd(mhi + 0x50));
 			ee = now;
 		}
+		if (now == 2 && ms >= 500) {
+			break;
+		}
 		sleep_ms(100);
 	}
+	return ee;
+}
+
+/*
+ * pcie=9: MHI itself, once the chip runs its mission firmware (EE 2). Written for this kernel from MHI's
+ * register and ring layout; nothing of Linux's MHI core (GPL) is taken. One 64 KB piece of memory, shown to
+ * the chip, holds everything: the channel contexts (44 bytes each, as many as the chip has channels), two
+ * event ring contexts, the command ring's context, the rings (16-byte elements) and the buffers:
+ *   0x0000 channel contexts   0x2000 event contexts   0x2200 command context   0x3000 command ring
+ *   0x4000 event ring 0 (the chip's state, command completions)   0x5000 event ring 1 (IPCR's transfers)
+ *   0x6000 channel 20's ring (IPCR to the chip)   0x7000 channel 21's (IPCR from it)   0x8000 buffers
+ * The chip is told where they are (CCABAP, ECABAP, CRCBAP, the windows of control and data), the host's
+ * number of event rings goes into MHICFG, the event rings' doorbells say how far the chip may write, and
+ * MHICTRL asks for M0. Then the two IPCR channels are started by commands, channel 21 is given four
+ * buffers, and whatever comes on it (the firmware's QRTR hello) is shown. Polled: no MSI yet.
+ */
+#define MHI_MEM_SIZE            0x10000u
+#define MHI_CTRL                0x38
+#define MHI_STATUS              0x48
+#define MHI_CCABAP              0x58
+#define MHI_ECABAP              0x60
+#define MHI_CRCBAP              0x68
+#define MHI_CRDB                0x70
+#define MHI_CTRLBASE            0x80
+#define MHI_CTRLLIMIT           0x88
+#define MHI_DATABASE            0x98
+#define MHI_DATALIMIT           0xa0
+#define MHI_RING_ELEMENTS       64
+
+struct renoir_mhi_context {             /* channel, event and command contexts all have this shape */
+	uint32_t word[3];               /* channel: config, type, event ring; event: moderation, type, MSI vector */
+	uint64_t base, length, read, write;
+} __attribute__((packed));
+
+static volatile uint8_t *mhi_mem;       /* the 64 KB, uncached for us */
+static uint64_t mhi_seen;               /* ... and where the chip sees them */
+static uint32_t cmd_wp, ev_rp[2], ch_wp[2];
+
+#define MHI_AT(offset)          (mhi_seen + (offset))
+#define MHI_CTX(offset)         ((volatile struct renoir_mhi_context *)(mhi_mem + (offset)))
+#define MHI_ELEMENT(offset)     ((volatile uint32_t *)(mhi_mem + (offset)))
+
+static void
+mhi_wr64(vm_offset_t at, uint64_t value)
+{
+	wr(at + 4, (uint32_t)(value >> 32));
+	wr(at, (uint32_t)value);
+}
+
+/* One element from an event ring, if the chip has written one there: true, and its four words. */
+static bool
+mhi_event(unsigned ring, uint32_t *element)
+{
+	volatile struct renoir_mhi_context *context = MHI_CTX(0x2000 + 44 * ring);
+	uint32_t base = 0x4000 + 0x1000 * ring;
+
+	if (context->read == MHI_AT(base + ev_rp[ring])) {
+		return false;
+	}
+	for (int i = 0; i < 4; i++) {
+		element[i] = MHI_ELEMENT(base + ev_rp[ring])[i];
+	}
+	ev_rp[ring] = (ev_rp[ring] + 16) % (16 * MHI_RING_ELEMENTS);
+	return true;
+}
+
+/* The event ring's doorbell: the chip may write up to the element before the one we read next. */
+static void
+mhi_event_doorbell(vm_offset_t mhi, unsigned ring)
+{
+	uint32_t base = 0x4000 + 0x1000 * ring, last = (ev_rp[ring] + 16 * (MHI_RING_ELEMENTS - 1)) % (16 * MHI_RING_ELEMENTS);
+
+	MHI_CTX(0x2000 + 44 * ring)->write = MHI_AT(base + last);
+	__asm__ volatile ("dsb sy");
+	mhi_wr64(mhi + rd(mhi + 0x20) + 8 * ring, MHI_AT(base + last));
+}
+
+static void
+mhi_say_event(const char *where, const uint32_t *e)
+{
+	static const char *const types[] = { [0x20] = "state change", [0x21] = "command done", [0x22] = "transfer",
+		                            [0x40] = "execution environment" };
+	unsigned type = (e[3] >> 16) & 0xff;
+
+	printf("wifi: pcie: 9: %s: event %#x (%s): %08x %08x %08x %08x\n", where, type, type < 0x41 && types[type] ? types[type] :
+	    "?", e[0], e[1], e[2], e[3]);
+}
+
+/* A command (start a channel: 0x12) and its completion on event ring 0 */
+static bool
+mhi_command(vm_offset_t mhi, unsigned type, unsigned channel)
+{
+	uint32_t e[4], at = 0x3000 + cmd_wp;
+
+	MHI_ELEMENT(at)[0] = 0;
+	MHI_ELEMENT(at)[1] = 0;
+	MHI_ELEMENT(at)[2] = 0;
+	MHI_ELEMENT(at)[3] = channel << 24 | type << 16;
+	cmd_wp = (cmd_wp + 16) % (16 * 16);
+	MHI_CTX(0x2200)->write = MHI_AT(0x3000 + cmd_wp);
+	__asm__ volatile ("dsb sy");
+	mhi_wr64(mhi + MHI_CRDB, MHI_AT(0x3000 + cmd_wp));
+	for (int ms = 0; ms < 1000; ms++) {
+		while (mhi_event(0, e)) {
+			mhi_say_event("command", e);
+			if (((e[3] >> 16) & 0xff) == 0x21) {
+				mhi_event_doorbell(mhi, 0);
+				return (e[2] >> 24) == 1;
+			}
+		}
+		sleep_ms(1);
+	}
+	printf("wifi: pcie: 9: no completion for command %#x on channel %u\n", type, channel);
+	return false;
+}
+
+static void
+renoir_mhi(vm_offset_t mhi)
+{
+	vm_offset_t cached = 0;
+	uint64_t physical;
+	uint32_t cfg = rd(mhi + 0x10), channels = cfg & 0xff, e[4];
+
+	printf("wifi: pcie: 9: MHI: status %#x, config %#x (%u channels, %u event rings)\n", rd(mhi + MHI_STATUS), cfg, channels,
+	    (cfg >> 16) & 0xff);
+	if (channels * 44 > 0x2000 || kmem_alloc_contig(kernel_map, &cached, MHI_MEM_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO |
+	    KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("wifi: pcie: 9: no memory for MHI\n");
+		return;
+	}
+	physical = kvtophys(cached);
+	for (vm_offset_t line = cached; line < cached + MHI_MEM_SIZE; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	mhi_mem = (volatile uint8_t *)ml_io_map_unmappable(physical, MHI_MEM_SIZE, VM_WIMG_WCOMB);
+	if (mhi_mem == NULL || !hakios_wifi_radio_map(physical, MHI_MEM_SIZE, (unsigned long long *)&mhi_seen)) {
+		printf("wifi: pcie: 9: MHI's memory cannot be shown to the chip\n");
+		return;
+	}
+	/* channels 20 (to the chip) and 21 (from it), on event ring 1; enabled, doorbell bursts off */
+	for (unsigned i = 0; i < 2; i++) {
+		volatile struct renoir_mhi_context *c = MHI_CTX(44 * (20 + i));
+
+		c->word[0] = 1 | 2u << 8;
+		c->word[1] = i == 0 ? 1 : 2;
+		c->word[2] = 1;
+		c->base = c->read = c->write = MHI_AT(0x6000 + 0x1000 * i);
+		c->length = 16 * 16;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		volatile struct renoir_mhi_context *c = MHI_CTX(0x2000 + 44 * i);
+
+		c->word[0] = 0;
+		c->word[1] = 1;
+		c->word[2] = i;
+		c->base = c->read = MHI_AT(0x4000 + 0x1000 * i);
+		c->length = 16 * MHI_RING_ELEMENTS;
+		c->write = MHI_AT(0x4000 + 0x1000 * i + 16 * (MHI_RING_ELEMENTS - 1));
+	}
+	MHI_CTX(0x2200)->base = MHI_CTX(0x2200)->read = MHI_CTX(0x2200)->write = MHI_AT(0x3000);
+	MHI_CTX(0x2200)->length = 16 * 16;
+	__asm__ volatile ("dsb sy");
+	printf("wifi: pcie: 9: contexts at %#llx; the chip told where they are, 2 event rings of ours, M0 asked for\n", mhi_seen);
+	mhi_wr64(mhi + MHI_CCABAP, MHI_AT(0));
+	mhi_wr64(mhi + MHI_ECABAP, MHI_AT(0x2000));
+	mhi_wr64(mhi + MHI_CRCBAP, MHI_AT(0x2200));
+	mhi_wr64(mhi + MHI_CTRLBASE, RADIO_ADDRESSES);
+	mhi_wr64(mhi + MHI_CTRLLIMIT, RADIO_ADDRESSES + RADIO_ADDRESSES_SIZE - 1);
+	mhi_wr64(mhi + MHI_DATABASE, RADIO_ADDRESSES);
+	mhi_wr64(mhi + MHI_DATALIMIT, RADIO_ADDRESSES + RADIO_ADDRESSES_SIZE - 1);
+	wr(mhi + 0x10, (cfg & ~0xffff0000u) | 2u << 16);
+	mhi_event_doorbell(mhi, 0);
+	mhi_event_doorbell(mhi, 1);
+	wr(mhi + MHI_CTRL, (rd(mhi + MHI_CTRL) & ~0xff00u) | 2u << 8);
+	for (int ms = 0; ms < 2000; ms++) {
+		while (mhi_event(0, e)) {
+			mhi_say_event("after M0 asked", e);
+		}
+		if (((rd(mhi + MHI_STATUS) >> 8) & 0xff) == 2 && ms > 100) {
+			break;
+		}
+		sleep_ms(1);
+	}
+	mhi_event_doorbell(mhi, 0);
+	printf("wifi: pcie: 9: MHI status %#x (state 2 is M0), control %#x, error %#x\n", rd(mhi + MHI_STATUS), rd(mhi + MHI_CTRL),
+	    rd(mhi + 0x50));
+	if (((rd(mhi + MHI_STATUS) >> 8) & 0xff) != 2) {
+		return;
+	}
+	printf("wifi: pcie: 9: IN M0. Starting channels 20 and 21\n");
+	if (!mhi_command(mhi, 0x12, 20) || !mhi_command(mhi, 0x12, 21)) {
+		printf("wifi: pcie: 9: a channel did not start\n");
+		return;
+	}
+	printf("wifi: pcie: 9: CHANNELS 20 AND 21 RUN; four buffers of 4 KB given to channel 21\n");
+	for (unsigned i = 0; i < 4; i++) {
+		volatile uint32_t *t = MHI_ELEMENT(0x7000 + 16 * i);
+		uint64_t buffer = MHI_AT(0x8000 + 0x1000 * i);
+
+		t[0] = (uint32_t)buffer;
+		t[1] = (uint32_t)(buffer >> 32);
+		t[2] = 0x1000;
+		t[3] = 2u << 16 | 1u << 9 | 1u << 8;            /* a transfer; tell us at its end and at a block's */
+	}
+	ch_wp[1] = 16 * 4;
+	MHI_CTX(44 * 21)->write = MHI_AT(0x7000 + ch_wp[1]);
+	__asm__ volatile ("dsb sy");
+	mhi_wr64(mhi + rd(mhi + 0x18) + 8 * 21, MHI_AT(0x7000 + ch_wp[1]));
+	for (int ms = 0; ms < 3000; ms++) {
+		while (mhi_event(1, e)) {
+			mhi_say_event("channel event", e);
+			if (((e[3] >> 16) & 0xff) == 0x22 && (e[3] >> 24) == 21) {
+				uint32_t index = (uint32_t)((((uint64_t)e[1] << 32 | e[0]) - MHI_AT(0x7000)) / 16) & 3, length = e[2] & 0xffff;
+				const volatile uint8_t *data = mhi_mem + 0x8000 + 0x1000 * index;
+
+				printf("wifi: pcie: 9: FROM THE CHIP on channel 21, %u bytes:", length);
+				for (uint32_t b = 0; b < length && b < 48; b++) {
+					printf(" %02x", data[b]);
+				}
+				printf("\n");
+			}
+		}
+		while (mhi_event(0, e)) {
+			mhi_say_event("control event", e);
+		}
+		sleep_ms(1);
+	}
+	mhi_event_doorbell(mhi, 0);
+	mhi_event_doorbell(mhi, 1);
+	printf("wifi: pcie: 9: MHI status at the end %#x, error %#x\n", rd(mhi + MHI_STATUS), rd(mhi + 0x50));
 }
 
 static void
@@ -4811,8 +5046,8 @@ renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
 		}
 		sleep_ms(100);
 	}
-	if (renoir_level >= 8 && ee == 1) {
-		renoir_bhie(mhi, mhi + rd(mhi + 0x2c));
+	if (renoir_level >= 8 && ee == 1 && renoir_bhie(mhi, mhi + rd(mhi + 0x2c)) == 2 && renoir_level >= 9) {
+		renoir_mhi(mhi);
 	}
 	radio_space_faults();
 	/* (the chip is powered down with everything else; the copy is not freed: it might still be read) */
