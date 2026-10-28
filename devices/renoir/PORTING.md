@@ -16,10 +16,13 @@ it worked. This is a research bring-up: expect to live in boot logs.
       Done 2026-10-28: built in an aarch64 Ubuntu VM (`uefi/build-renoirpkg.sh`), `fastboot boot
       Mu-renoir.img` on a renoir with unlocked bootloader → Silicium logo, then "Failed to find an
       operating system". Display via the UEFI framebuffer works.
-- [ ] Apply HakiOS to renoirPkg: **step-by-step guide in
-      [`devices/renoir/uefi/APPLYING-HAKIOS.md`](uefi/APPLYING-HAKIOS.md)**
-      (the one renoir-specific edit = reserve `0xF0000000` XNU-Payload region; first success signal
-      = `logdump` partition readback, not a booting iOS).
+- [x] Apply HakiOS to renoirPkg: `uefi/apply.sh` (redwood's patch + XnuLoader + the `0xF0000000`
+      payload region), then `mkxnuimg.py -d renoir`. Done 2026-10-28: stage 0 runs on renoir and
+      writes its log (7762 bytes): EL1, boot CPU Cortex-A55 (`MIDR 0x412FD050`), CNTFRQ 19.2 MHz,
+      framebuffer `0xE1000000` 1080×2400 stride 1080 BGRA, payload region reserved in the UEFI map.
+      **renoir has two `logdump` partitions** (sda30 on LUN 0, sde55 on LUN 4); the loader writes
+      sda30, Android's by-name link points at sde55. Read the log with `read-log.sh`.
+      `uefi/debug-onscreen.py` makes the loader print a summary on screen (for when the log is empty).
 
 ## 2. SoC addresses
 - [ ] `devices/renoir/pull-soc.sh` → `soc.args.generated`.
