@@ -885,6 +885,15 @@ reboot_reason_set(void)
 static void
 reboot_reason_clear(void)
 {
+	uint32_t clear = 0;
+
+	/*
+	 * Left set by default (the user's wish, 2026-10-29): whatever restarts the phone after a run, it comes
+	 * back in fastboot, not in Android. crash_fastboot_clear=1 puts both back at an orderly end, as before.
+	 */
+	if (!PE_parse_boot_argn("crash_fastboot_clear", &clear, sizeof(clear)) || !clear) {
+		return;
+	}
 	if (rr_imem_set) {
 		wr(rr_imem + RR_IMEM_OFFSET, rr_imem_was);
 		rr_imem_set = false;
