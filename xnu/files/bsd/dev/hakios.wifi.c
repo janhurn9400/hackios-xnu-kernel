@@ -5015,6 +5015,19 @@ renoir_mhi(vm_offset_t mhi)
 		}
 		sleep_ms(1);
 	}
+	for (unsigned ch = 20; ch <= 21; ch++) {
+		volatile struct renoir_mhi_context *c = MHI_CTX(44 * ch);
+
+		printf("wifi: pcie: 9: channel %u context: config %#x type %u ring %u, base %#llx read %#llx write %#llx\n", ch,
+		    c->word[0], c->word[1], c->word[2], c->base, c->read, c->write);
+	}
+	for (unsigned er = 0; er < 2; er++) {
+		volatile struct renoir_mhi_context *c = MHI_CTX(0x2000 + 44 * er);
+
+		printf("wifi: pcie: 9: event ring %u context: %#x %#x %#x, base %#llx read %#llx write %#llx (ours %#x)\n", er,
+		    c->word[0], c->word[1], c->word[2], c->base, c->read, c->write, ev_rp[er]);
+	}
+	printf("wifi: pcie: 9: command context: read %#llx write %#llx\n", MHI_CTX(0x2200)->read, MHI_CTX(0x2200)->write);
 	mhi_event_doorbell(mhi, 0);
 	mhi_event_doorbell(mhi, 1);
 	printf("wifi: pcie: 9: MHI status at the end %#x, error %#x\n", rd(mhi + MHI_STATUS), rd(mhi + 0x50));
