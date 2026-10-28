@@ -1040,6 +1040,8 @@ struct hv_block {
 	const char *name;
 	uint16_t id, channel;
 	bool found, ours;
+	vm_offset_t write;                      /* its write channel, mapped at the first write (once: a mapping per write
+	                                         * ran the kernel out of address space after a few dozen ringtone vibrations) */
 };
 static struct hv_block hv_cfg = { "the configuration block", HV_CFG }, hv_ptn = { "the pattern block", HV_PTN },
     hv_hpwr = { "the power block", HV_HPWR };
@@ -1135,7 +1137,10 @@ hv_put(struct hv_block *b, uint8_t reg, uint8_t value)
 		hv_stop_now(ok ? "a write that may not be made" : "a register that is not on the list");
 		return false;
 	}
-	channel = (vm_offset_t)ml_io_map(R_ARB_CHNLS_PHYS + 0x10000UL * b->channel, 0x1000);
+	if (b->write == 0) {
+		b->write = (vm_offset_t)ml_io_map(R_ARB_CHNLS_PHYS + 0x10000UL * b->channel, 0x1000);
+	}
+	channel = b->write;
 	for (int tries = 0; tries < 3; tries++) {
 		if (!leaving) {
 			hakios_spmi_lock();
