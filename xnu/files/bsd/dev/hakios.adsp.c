@@ -820,6 +820,35 @@ static struct block rsc = { "rsc", 0x18220000, 0x10000 };
 #define MSGID_WRITE_WAITED      (8u | 1u << 8 | 1u << 16)       /* four bytes, an answer wanted, a write */
 #define RPMH_TCS                0                       /* the first of the two for requests made at once */
 
+/* A resource's RPMh address by its name in the command database; 0: not there. */
+static uint32_t
+rpmh_address_of(const char *name)
+{
+	char id[8] = { 0 };
+
+	if (cmd_db == NULL) {
+		cmd_db = (const struct cmd_db_header *)ml_io_map_unmappable(CMD_DB_PHYS, CMD_DB_SIZE, VM_WIMG_WCOMB);
+	}
+	if (!(cmd_db->magic[0] == 0xdb && cmd_db->magic[1] == 0x30 && cmd_db->magic[2] == 0x03 && cmd_db->magic[3] == 0x0c)) {
+		return 0;
+	}
+	strlcpy(id, name, sizeof(id));
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slave = &cmd_db->slave[s];
+		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
+
+		if (slave->id == 0 || slave->count > 512) {
+			continue;
+		}
+		for (unsigned i = 0; i < slave->count; i++) {
+			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
+				return entry[i].address;
+			}
+		}
+	}
+	return 0;
+}
+
 /* The level position RPMh takes for that rail and level; -1: not found. */
 static int
 rail_position(const char *name, uint32_t level, uint32_t *address)
@@ -881,7 +910,7 @@ static bool
 rails(uint32_t level)
 {
 	static const char *const names[2] = { "lcx.lvl", "lmx.lvl" };
-	uint32_t addresses[2] = { 0, 0 }, values[2] = { 0, 0 }, done = 0;
+	uint32_t addresses[3] = { 0, 0, 0 }, values[3] = { 0, 0, 0 }, done = 0, commands = 2, xo = 0;
 	uint64_t began;
 
 	for (unsigned r = 0; r < 2; r++) {
@@ -895,6 +924,22 @@ rails(uint32_t level)
 			return false;
 		}
 		values[r] = (uint32_t)position;
+	}
+	/*
+	 * Boot-arg adsp_xo=1 (renoir): the crystal too, as the DSP's proxy clock (dt: qcom,proxy-clock-names
+	 * "xo", the RPMh clock bi_tcxo = ARC resource xo.lvl, on = 3 as clk-rpmh.c has it), asked for with
+	 * the rails and not given back.
+	 */
+	PE_parse_boot_argn("adsp_xo", &xo, sizeof(xo));
+	if (xo && level != 0) {
+		addresses[2] = rpmh_address_of("xo.lvl");
+		values[2] = 3;
+		if (addresses[2] != 0) {
+			commands = 3;
+			printf("adsp: %u: and xo.lvl (%#x) = 3, the crystal on\n", step, addresses[2]);
+		} else {
+			printf("adsp: %u: adsp_xo=1, but RPMh has no xo.lvl\n", step);
+		}
 	}
 	need(&rsc);
 	lck_mtx_lock(&hakios_rsc_lock);
@@ -910,13 +955,13 @@ rails(uint32_t level)
 	snprintf(last_write, sizeof(last_write), "step %u asked RPMh for the audio DSP's rails at level %u", step, level);
 	hold();
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
-	for (unsigned r = 0; r < 2; r++) {
+	for (unsigned r = 0; r < commands; r++) {
 		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r), MSGID_WRITE_WAITED);
 		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 4, addresses[r]);
 		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 8, values[r]);
 	}
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_WAIT_FOR_DONE, 3);
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 3);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_WAIT_FOR_DONE, (1u << commands) - 1);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, (1u << commands) - 1);
 	settle();
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~TCS_TRIGGER);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_ACTIVE_MODE);
@@ -966,7 +1011,13 @@ step_survey(void)
 /* ---- step 2: the firmware -------------------------------------------------------------------------- */
 
 #define ADSP_MEMORY             0x86700000u     /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
-#define ADSP_MEMORY_SIZE        0x04000000u
+/*
+ * renoir (boot-arg board=renoir): everything of the DSP as above -- image 1, SMP2P items 443 and 429,
+ * IPCC client 3, rails lcx.lvl and lmx.lvl, the same address -- but its reserved memory is 48 MB
+ * (dt: adsp@86700000, reg <... 0x3000000>), and the image is not to be written past that.
+ */
+static uint32_t adsp_memory_size = 0x04000000u;
+#define ADSP_MEMORY_SIZE        adsp_memory_size
 #define PAS_ADSP                1               /* dt: qcom,pas-id */
 
 
@@ -1650,17 +1701,43 @@ step_start(void)
 	for (unsigned i = 0; i < 8 && (rang = rd(ipcc.base + IPCC_RECEIVED)) != IPCC_NOBODY && rang >> 16 == IPCC_LPASS; i++) {
 		put(&ipcc, "heard", IPCC_CLEAR, rang);
 	}
-	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
-	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_GLINK);
+	{
+		/* boot-arg adsp_ipcc=0 (renoir, looking for what resets the phone in this step): not listened for */
+		uint32_t listen = 1;
+
+		PE_parse_boot_argn("adsp_ipcc", &listen, sizeof(listen));
+		if (listen) {
+			put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
+			put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_GLINK);
+		} else {
+			printf("adsp: %u: adsp_ipcc=0: the DSP's doorbells are not listened for\n", step);
+		}
+	}
 	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
-	if (!rails(384)) {
-		lck_mtx_unlock(&dsp_lock);
-		return false;
+	/*
+	 * Boot-args for renoir, where asking for 384 has hung the whole phone (2026-10-28, the line
+	 * "about to ask RPMh ... (level 384)" the last of the log): adsp_level=N asks for that level
+	 * instead, adsp_rails=0 does not ask at all (the DSP is then started on what the rails are at).
+	 */
+	{
+		uint32_t level = 384, ask = 1;
+
+		PE_parse_boot_argn("adsp_level", &level, sizeof(level));
+		PE_parse_boot_argn("adsp_rails", &ask, sizeof(ask));
+		if (ask && !rails(level)) {
+			lck_mtx_unlock(&dsp_lock);
+			return false;
+		}
+		if (!ask) {
+			printf("adsp: %u: adsp_rails=0: the DSP's rails are not asked for\n", step);
+		}
+		rails_asked = ask != 0;
 	}
-	rails_asked = true;
 	if (!mailbox_send("{class: image, res: load_state, name: adsp, val: on}")) {
-		rails(0);
+		if (rails_asked) {
+			rails(0);
+		}
 		rails_asked = false;
 		lck_mtx_unlock(&dsp_lock);
 		return false;
@@ -1673,7 +1750,9 @@ step_start(void)
 		printf("adsp: %u: TRUSTZONE DOES NOT START THE AUDIO DSP: the call returns %d, its answer is %#llx\n", step, result,
 		    answer);
 		mailbox_send("{class: image, res: load_state, name: adsp, val: off}");
-		rails(0);
+		if (rails_asked) {
+			rails(0);
+		}
 		rails_asked = false;
 		lck_mtx_unlock(&dsp_lock);
 		return false;
@@ -3205,6 +3284,13 @@ hakios_adsp_init(void)
 	PE_parse_boot_argn("adsp_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {
 		return;
+	}
+	{
+		char board[16] = "";
+
+		if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
+			adsp_memory_size = 0x03000000u;
+		}
 	}
 	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {
 		printf("adsp: adsp=1 and adsp_step=N are for the phone's audio DSP, and this is not the phone\n");
