@@ -38,8 +38,10 @@ dtbo), Magisk root. Nothing is flashed by any of this; `fastboot reboot` returns
 4. `devices/renoir/run-open.sh SECS [kernel args]`: stages kernel + `hello` + args, runs, fetches
    the log into `logs/`. Kernel: `prebuilt/mach.development.bcm2837` (until one is built here).
 
-## Kernel build (not done yet)
+## Kernel build (works)
 
-`xnu/apply.sh`, `xnu-deps/setup.sh` (theos with its Linux cctools and `iPhoneOS16.5.sdk`, a
-MacOSX13.3.sdk mirror, Apple open source), `./xnu-build.sh -j8 -k`. Upstream builds on Linux
-x86-64; the VM is aarch64 with Rosetta for x86-64 binaries. Untested here.
+In the VM: `bash devices/renoir/setup-kernel-vm.sh` (packages, cctools, SDK, `xnu/apply.sh`,
+`xnu-deps/setup.sh`, `./xnu-build.sh -k`), started detached (`setsid nohup ... > /root/kbuild.log &`)
+so no exec session stays open. Ends with errors in `check_all_exports`, `IOKit.symbolset` and the
+lldbmacros copy: harmless, judge by the kernel's date. Copy the kernel to
+`devices/renoir/prebuilt/vm-kernel/` and run it with `KERNEL=... devices/renoir/run-open.sh`.

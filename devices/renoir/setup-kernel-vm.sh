@@ -16,7 +16,10 @@ log() { echo ">>> setup-kernel-vm: $*"; }
 if command -v apt-get >/dev/null; then
 	log "packages"
 	DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential git curl xz-utils clang lld \
-		python3 perl flex bison m4 autoconf automake libtool libxml2 >/dev/null
+		python3 perl flex bison m4 autoconf automake libtool libxml2-dev gawk >/dev/null
+	# bsd/kern/makesyscalls.sh writes "\(" in awk strings: gawk reads it as "(", Ubuntu's default
+	# mawk keeps the backslash and init_sysent.c does not compile
+	update-alternatives --set awk /usr/bin/gawk
 fi
 
 if [ ! -x "$THEOS/toolchain/linux/iphone/bin/ld" ]; then
@@ -37,7 +40,7 @@ if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr/include" ]; then
 fi
 
 [ -d xnu-src/xnu-8796.121.2 ] || { log "xnu/apply.sh"; xnu/apply.sh; }
-[ -x xnu-deps/host/bin/xnu-clang ] || { log "xnu-deps/setup.sh"; xnu-deps/setup.sh; }
+log "xnu-deps/setup.sh (keeps what is done)"; xnu-deps/setup.sh
 log "xnu-build.sh -j$JOBS -k (ends with an error in check_all_exports by design; see the kernel's date)"
 ./xnu-build.sh -j"$JOBS" -k || true
 k=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837

@@ -11,16 +11,14 @@ all seven kernel cores (`small_cores_after=0`), cpufreq 1900/2208/2400 MHz; UFS 
 
 ## Next steps, in order
 
-1. **Kernel toolchain in the VM** (not run yet): in the VM, as root,
-   `bash /root/hackios-xnu-kernel/devices/renoir/setup-kernel-vm.sh` (from the Mac:
-   `devices/renoir/vmx.sh 'cd /root/hackios-xnu-kernel && git pull -q origin renoir && bash devices/renoir/setup-kernel-vm.sh'`,
-   as a background job). It downloads the aarch64 iOS cctools (L1ghtmann/llvm-project), the
-   iPhoneOS16.5.sdk (theos/sdks) and Apple open source, then builds. The last attempt to start it from
-   the assistant was **blocked by Claude Code's auto-mode permission check** (downloads + build as root
-   in the VM); the user has to allow it or start it once by hand. Expect `xnu-build.sh -k` to end with
-   an error in `check_all_exports`: judge by the kernel file's date. First build the kernel
-   **unchanged** and boot it with `run-open.sh` (set the kernel path, or copy it over
-   `prebuilt/mach.development.bcm2837` locally) to prove the toolchain.
+1. ~~Kernel toolchain in the VM~~ **done** (2026-10-28, session 2): `setup-kernel-vm.sh` (now with
+   `libxml2-dev`, native `gawk` as `awk` -- mawk breaks `init_sysent.c` -- and `xnu-deps/setup.sh`
+   always run) builds `mach.development.bcm2837` in the VM (`-j2`; ends with the expected
+   `check_all_exports` / `IOKit.symbolset` / lldbmacros errors). The unchanged kernel built there
+   boots on renoir: `KERNEL=devices/renoir/prebuilt/vm-kernel/mach.development.bcm2837
+   devices/renoir/run-open.sh 20 cpus=1 -v` -> `Darwin Kernel Version 22.5.0: Wed Oct 28 12:14:55
+   CET 2026`, `I am process 1`. The iOS 16.5 disk images (`rootfs.dmg`, `cryptex-os.dmg`,
+   `cryptex-app.dmg`) are already downloaded into the Mac's `sysimage/` (for step 3).
 2. **Touch driver** (`xnu/files/bsd/dev/hakios.goodix.c`, edit in `xnu-src/` then `xnu/export.sh`
    per `xnu/README.md`): a renoir board profile chosen by boot-arg `touch_board=renoir`, redwood stays
    the default. All constants are in the table in `TOUCH.md` (SE 0x988000 = QUP0 SE2, pins 20-23

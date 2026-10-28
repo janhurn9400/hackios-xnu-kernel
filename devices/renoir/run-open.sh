@@ -11,6 +11,7 @@
 # re-plug the cable. xl does the same as this on Linux, but needs flock and timeout.
 #
 # usage: devices/renoir/run-open.sh [SECS] [kernel args]     (default: 20 s, "cpus=1 -v")
+#   KERNEL=path   another kernel than prebuilt/mach.development.bcm2837 (e.g. one built in the VM)
 set -e
 cd "$(dirname "$0")/../.."
 PATH=$HOME/Library/Android/sdk/platform-tools:$PATH
@@ -20,7 +21,7 @@ args=${*:-cpus=1 -v}
 fastboot devices | grep -q xnuloader || { echo "run-open.sh: no xnuloader on USB (boot xnu-usb-renoir.img, re-plug the cable)"; exit 1; }
 mkdir -p logs
 log=logs/$(date +%H%M%S)-renoir-open.log
-python3 xnuloader/mkpayload.py -o run-payload.bin kernel=prebuilt/mach.development.bcm2837 \
+python3 xnuloader/mkpayload.py -o run-payload.bin kernel="${KERNEL:-prebuilt/mach.development.bcm2837}" \
 	ramdisk=prebuilt/userland/hello --cmdline "loader_return_after=$secs epoch=$(date +%s) $args" >/dev/null
 t 60 fastboot stage run-payload.bin 2>&1 | grep -q OKAY || { echo "run-open.sh: upload failed"; exit 1; }
 t 10 fastboot oem run >/dev/null 2>&1
