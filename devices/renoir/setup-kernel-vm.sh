@@ -16,7 +16,7 @@ log() { echo ">>> setup-kernel-vm: $*"; }
 if command -v apt-get >/dev/null; then
 	log "packages"
 	DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential git curl xz-utils clang lld \
-		python3 perl flex bison m4 autoconf automake libtool libxml2-dev gawk >/dev/null
+		python3 perl flex bison m4 autoconf automake libtool libxml2-dev gawk lzfse >/dev/null
 	# bsd/kern/makesyscalls.sh writes "\(" in awk strings: gawk reads it as "(", Ubuntu's default
 	# mawk keeps the backslash and init_sysent.c does not compile
 	update-alternatives --set awk /usr/bin/gawk
