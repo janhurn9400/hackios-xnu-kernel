@@ -5028,6 +5028,12 @@ renoir_mhi(vm_offset_t mhi)
 		    c->word[0], c->word[1], c->word[2], c->base, c->read, c->write, ev_rp[er]);
 	}
 	printf("wifi: pcie: 9: command context: read %#llx write %#llx\n", MHI_CTX(0x2200)->read, MHI_CTX(0x2200)->write);
+	for (uint32_t at = 0x360; at < 0x3c0; at += 16) {
+		printf("wifi: pcie: 9: contexts +%#x: %08x %08x %08x %08x\n", at, MHI_ELEMENT(at)[0], MHI_ELEMENT(at)[1],
+		    MHI_ELEMENT(at)[2], MHI_ELEMENT(at)[3]);
+	}
+	printf("wifi: pcie: 9: channel 20's first element: %08x %08x %08x %08x\n", MHI_ELEMENT(0x6000)[0],
+	    MHI_ELEMENT(0x6000)[1], MHI_ELEMENT(0x6000)[2], MHI_ELEMENT(0x6000)[3]);
 	mhi_event_doorbell(mhi, 0);
 	mhi_event_doorbell(mhi, 1);
 	printf("wifi: pcie: 9: MHI status at the end %#x, error %#x\n", rd(mhi + MHI_STATUS), rd(mhi + 0x50));
