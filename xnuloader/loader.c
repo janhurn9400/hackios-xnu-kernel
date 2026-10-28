@@ -953,8 +953,32 @@ static uint64_t sound_len;
  * loader takes the copy over (crash_log_take) for "oem log". A run that comes back clears it.
  */
 #define CRASH_LOG_BASE          (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x80000ULL)
-#define CRASH_LOG_MAGIC         0x4853415243554e58ULL   /* "XNUCRASH" */
+#define CRASH_LOG_MAGIC         0x4853415243554e58ULL   /* "XNUCRASH": the first layout, one copy */
+#define CRASH_LOG_MAGIC2        0x3248535243554e58ULL   /* "XNUCRSH2": two slots, see below */
+#define CRASH_SLOT_SIZE         0x3f000u
+#define CRASH_SLOT_TEXT         (CRASH_SLOT_SIZE - 32)
 
+/*
+ * A reset can come in the middle of a copy: the first layout cleared its magic while copying, and
+ * the cache wrote the cleared header back early, so a reset during the copy (which is when it
+ * comes) left the text without its magic. Now there are two slots; a copy goes into the one the
+ * header does not name, is written through, and only then does the header name it.
+ */
+struct crash_slot {
+	uint64_t len;           /* bytes in text */
+	uint64_t total;         /* bytes the kernel had logged in all */
+	uint64_t at;            /* CNTVCT_EL0 of the copy */
+	uint64_t reserved;
+	char text[CRASH_SLOT_TEXT];
+};
+struct crash_header {
+	uint64_t magic;         /* CRASH_LOG_MAGIC2 */
+	uint64_t active;        /* the slot with the last complete copy */
+};
+#define CRASH_HEADER            ((volatile struct crash_header *)CRASH_LOG_BASE)
+#define CRASH_SLOT(n)           ((struct crash_slot *)(CRASH_LOG_BASE + 0x1000 + (uint64_t)(n) * CRASH_SLOT_SIZE))
+
+/* the first layout (header, then text), still read once to recover what it left */
 struct crash_log {
 	uint64_t magic;
 	uint64_t len;           /* bytes in text */
@@ -1000,7 +1024,9 @@ crash_log_copy(char *out, const char *log, const struct kernel_live *live, uint3
 static void
 crash_log_update(const struct kernel_live *live, uint64_t slide)
 {
-	struct crash_log *c = (struct crash_log *)CRASH_LOG_BASE;
+	volatile struct crash_header *h = CRASH_HEADER;
+	uint64_t slot = h->magic == CRASH_LOG_MAGIC2 && h->active < 2 ? 1 - h->active : 0;
+	struct crash_slot *c = CRASH_SLOT(slot);
 	const char *log = (const char *)(live->log + slide);
 	uint64_t now = READ_SYSREG(CNTVCT_EL0), total, from;
 	uint32_t len, ring_at;
@@ -1023,22 +1049,23 @@ crash_log_update(const struct kernel_live *live, uint64_t slide)
 	if (total > live->log_head + live->log_ring) {
 		return;
 	}
-	from = total > CRASH_LOG_TEXT ? total - CRASH_LOG_TEXT : 0;
-	c->magic = 0;
+	from = total > CRASH_SLOT_TEXT ? total - CRASH_SLOT_TEXT : 0;
 	crash_log_copy(c->text, log, live, ring_at, wrapped, from, total);
 	c->len = total - from;
 	c->total = total;
 	c->at = now;
-	c->magic = CRASH_LOG_MAGIC;
-	clean_dcache(CRASH_LOG_BASE, CRASH_LOG_BASE + 32 + c->len);
+	clean_dcache((uint64_t)(uintptr_t)c, (uint64_t)(uintptr_t)c + 32 + c->len);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	h->active = slot;
+	h->magic = CRASH_LOG_MAGIC2;
+	clean_dcache(CRASH_LOG_BASE, CRASH_LOG_BASE + 64);
 }
 
 static void
 crash_log_clear(void)
 {
-	struct crash_log *c = (struct crash_log *)CRASH_LOG_BASE;
-
-	c->magic = 0;
+	CRASH_HEADER->magic = 0;
+	CRASH_HEADER->active = 0;       /* (where the first layout kept its length: no false recovery) */
 	clean_dcache(CRASH_LOG_BASE, CRASH_LOG_BASE + 64);
 	crash_log_seen_len = crash_log_seen_ring_at = ~0ULL;
 	crash_log_last = 0;
@@ -1077,17 +1104,40 @@ memory_keep_survey(void)
 static void
 crash_log_take(void)
 {
-	struct crash_log *c = (struct crash_log *)CRASH_LOG_BASE;
+	volatile struct crash_header *h = CRASH_HEADER;
+	struct crash_log *old = (struct crash_log *)CRASH_LOG_BASE;
 
 	flush_dcache(CRASH_LOG_BASE, CRASH_LOG_BASE + 64);
-	print("crash log header at %x: magic %x len %x total %x\n", CRASH_LOG_BASE, c->magic, c->len, c->total);
-	if (c->magic != CRASH_LOG_MAGIC || c->len > CRASH_LOG_TEXT) {
-		return;
+	if (h->magic == CRASH_LOG_MAGIC2 && h->active < 2) {
+		struct crash_slot *c = CRASH_SLOT(h->active);
+
+		flush_dcache((uint64_t)(uintptr_t)c, (uint64_t)(uintptr_t)c + 32);
+		if (c->len <= CRASH_SLOT_TEXT) {
+			flush_dcache((uint64_t)(uintptr_t)c, (uint64_t)(uintptr_t)c + 32 + c->len);
+			memcpy(previous_klog, c->text, c->len);
+			previous_klog_len = c->len;
+			previous_klog_total = c->total;
+		}
+	} else if ((old->magic == CRASH_LOG_MAGIC || old->magic == 0) && old->len != 0 && old->len <= CRASH_LOG_TEXT &&
+	    old->total >= old->len) {
+		/* the first layout, possibly without its magic (a reset during a copy): take it if it reads as text */
+		uint64_t printable = 0;
+
+		flush_dcache(CRASH_LOG_BASE, CRASH_LOG_BASE + 32 + old->len);
+		for (uint64_t i = 0; i < old->len; i++) {
+			char ch = old->text[i];
+
+			printable += (ch >= 0x20 && ch < 0x7f) || ch == '\n' || ch == '\t';
+		}
+		print("crash log, first layout: magic %x len %x total %x, %d of its bytes text\n", old->magic, old->len,
+		    old->total, printable);
+		if (printable * 10 >= old->len * 9) {
+			memcpy(previous_klog, old->text, old->len);
+			previous_klog_len = old->len;
+			previous_klog_total = old->total;
+		}
+		old->len = 0;
 	}
-	flush_dcache(CRASH_LOG_BASE, CRASH_LOG_BASE + 32 + c->len);
-	memcpy(previous_klog, c->text, c->len);
-	previous_klog_len = c->len;
-	previous_klog_total = c->total;
 	crash_log_clear();
 }
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
