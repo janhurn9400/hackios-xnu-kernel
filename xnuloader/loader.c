@@ -168,6 +168,7 @@ str_eq(const char *a, const char *b)
  * the screen is left to the kernel (and to "oem screenshot").
  */
 static int screen_quiet;
+static uint64_t after_run_from, after_run_last, after_run_until;    /* usb_wait()'s signs of life after a run */
 
 /*
  * This loader's own log, mirrored line by line into a ring in memory the UEFI map reserves (after
@@ -3688,6 +3689,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	write_logs(klog, klog_len);
 	crash_log_clear();              /* the run is over and its logs are out: nothing to keep */
+	after_run_from = after_run_last = READ_SYSREG(CNTVCT_EL0);
+	after_run_until = after_run_from + 10 * READ_SYSREG(CNTFRQ_EL0);
 	return 1;
 }
 
@@ -3801,7 +3804,14 @@ usb_wait(uint8_t endpoint)
 		uint32_t msg = UsbDeviceEventNoEvent;
 		uint64_t size = 0;
 		usb_device_event_data data;
+		uint64_t now = READ_SYSREG(CNTVCT_EL0);
 
+		/* for a while after a run: signs of life, into the log that survives a reset (renoir's ADSP) */
+		if (now < after_run_until && now - after_run_last >= freq / 10) {
+			after_run_last = now;
+			print("alive %d ms after the run: pending interrupt %x, daif %x\n", (now - after_run_from) * 1000 / freq,
+			    READ_SYSREG(S3_0_C12_C12_2) & 0xffffff, READ_SYSREG(DAIF));
+		}
 		USB->handle_event(&msg, &size, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_connected = (data.device_state == UsbDeviceStateConnected);
