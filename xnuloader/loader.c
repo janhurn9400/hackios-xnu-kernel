@@ -1044,6 +1044,35 @@ crash_log_clear(void)
 	crash_log_last = 0;
 }
 
+/*
+ * Which parts of the payload region keep what this loader wrote across a reset and the boot loaders
+ * that run after it (Xiaomi's XBL and ABL do not know the region is ours): a marker with a count in
+ * the last page of every megabyte but the first (the boot shim copies the payload there), checked
+ * and renewed at each start. Prints the megabytes whose marker was still there.
+ */
+#define KEEP_MARK_MAGIC         0x5045454b554e5821ULL   /* "!XNUKEEP" */
+
+static void
+memory_keep_survey(void)
+{
+	uint64_t kept = 0, count = 0;
+
+	for (unsigned mb = 1; mb < PAYLOAD_MAX_SIZE >> 20; mb++) {
+		volatile uint64_t *m = (volatile uint64_t *)(PAYLOAD_BASE + ((uint64_t)mb << 20) + 0xff000);
+
+		flush_dcache((uint64_t)(uintptr_t)m, (uint64_t)(uintptr_t)m + 16);
+		if (m[0] == KEEP_MARK_MAGIC && m[1] < 1000000) {
+			kept |= 1ULL << mb;
+			count = m[1] > count ? m[1] : count;
+		}
+		m[1] = m[0] == KEEP_MARK_MAGIC && m[1] < 1000000 ? m[1] + 1 : 1;
+		m[0] = KEEP_MARK_MAGIC;
+		clean_dcache((uint64_t)(uintptr_t)m, (uint64_t)(uintptr_t)m + 16);
+	}
+	print("memory kept since the last start (megabytes of the payload region, bit = MB): %x, starts seen %d\n",
+	    kept, count);
+}
+
 /* At the loader's start: the copy a run left behind when the phone reset during it. */
 static void
 crash_log_take(void)
@@ -1051,6 +1080,7 @@ crash_log_take(void)
 	struct crash_log *c = (struct crash_log *)CRASH_LOG_BASE;
 
 	flush_dcache(CRASH_LOG_BASE, CRASH_LOG_BASE + 64);
+	print("crash log header at %x: magic %x len %x total %x\n", CRASH_LOG_BASE, c->magic, c->len, c->total);
 	if (c->magic != CRASH_LOG_MAGIC || c->len > CRASH_LOG_TEXT) {
 		return;
 	}
@@ -4055,6 +4085,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		print("the previous run ended in a reset: the last %d of its %d bytes of kernel log are kept (oem log)\n",
 		    previous_klog_len, previous_klog_total);
 	}
+	memory_keep_survey();           /* (a staged payload overwrites the markers below its own end) */
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
