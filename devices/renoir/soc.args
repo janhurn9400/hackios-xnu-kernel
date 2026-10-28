@@ -1,32 +1,16 @@
-# renoir SoC boot-args for HakiOS.
-#
-# DO NOT hand-edit the register lines below from guesswork. Generate them on the actual phone:
-#
-#     devices/renoir/pull-soc.sh          # adb pull /sys/firmware/fdt + tools/soc-args.py
-#
-# soc-args.py fills these from renoir's device tree:
-#   soc_ipa_base       qcom,ipa reg ipa-base + 0x40000
-#   soc_gsi_base       qcom,ipa reg gsi-base
-#   soc_ipcc           qcom,ipcc reg
-#   soc_aoss           AOSS QMP mailbox reg
-#   soc_rsc            qcom,rpmh-rsc reg drv-2 (apps DRV)
-#   soc_apps_smmu      apps-smmu reg
-#   soc_ipa_stream     ipa_smmu_ap iommus stream
-#   soc_ipa_stream_uc  ipa_smmu_uc iommus stream
-#   soc_pas_mpss       qcom,mss qcom,pas-id
-#   soc_pas_ipa        qcom,ipa_fws qcom,pas-id
-#   soc_ipa_fw         qcom,ipa_fws qcom,firmware-name
-#
-# Add these BY HAND from renoir's reserved-memory nodes:
-#   soc_smem           reserved-memory qcom,smem target
-#   soc_cmd_db         reserved-memory cmd_db
-#   soc_mpss_mem       reserved-memory mpss (modem image)
-#   modem_ipa_fw_at    reserved-memory ipa_gsi (IPA firmware load address)
-#   soc_imem           qcom,msm-imem, rounded down to its 2 MB block
-#
-# Reference: redwood's values (Snapdragon 778G) — renoir's WILL differ, do not copy:
-#   soc_ipa_base=0x1e40000  soc_gsi_base=0x1e04000  soc_ipcc=0x408000  soc_aoss=0xc300000
-#   soc_rsc=0x18220000  soc_apps_smmu=0x15000000  soc_smem=0x80900000  soc_cmd_db=0x80860000
-#   soc_mpss_mem=0x8b800000  soc_imem=0x14600000  soc_ipa_fw=yupik_ipa_fws
-#
-# --- renoir values (generated — leave the file like this until pull-soc.sh runs) ---
+soc_ipa_base=0x1e40000
+soc_gsi_base=0x1e04000
+soc_ipcc=0x408000
+soc_aoss=0xc300000
+soc_rsc=0x18220000
+soc_apps_smmu=0x15000000
+soc_cmd_db=0x80860000
+soc_mpss_mem=0x8b800000
+modem_ipa_fw_at=0x8b710000
+soc_smem=0x80900000
+soc_imem=0x14600000
+soc_ipa_stream=0x480
+soc_ipa_stream_uc=0x482
+soc_pas_mpss=0x4
+soc_pas_ipa=0xf
+soc_ipa_fw=ipa_fws

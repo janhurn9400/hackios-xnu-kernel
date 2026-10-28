@@ -60,17 +60,22 @@ echo ">>> stuart setup…";  python3 "$DB" --setup
 NASM_BIN="$(command -v nasm || true)"
 NDISASM_BIN="$(command -v ndisasm || true)"
 if [ -n "$NASM_BIN" ]; then
-  D="Mu_Basecore/BaseTools/Bin/mu_nasm_extdep/Linux-x86-64"
-  mkdir -p "$D"
+  # host-spezifisch: x86-64 (redwoods PC) und ARM-64 (Apple-Silicon-VM) — stuart sucht <OS>-<ARCH>-<BITS>
+  for H in Linux-x86-64 Linux-ARM-64; do
+    D="Mu_Basecore/BaseTools/Bin/mu_nasm_extdep/$H"
+    mkdir -p "$D"
+    ln -sf "$NASM_BIN" "$D/nasm"
+    [ -n "$NDISASM_BIN" ] && ln -sf "$NDISASM_BIN" "$D/ndisasm" || true
+  done
   echo 'version: 20016.1.1' > "Mu_Basecore/BaseTools/Bin/mu_nasm_extdep/extdep_state.yaml"
-  ln -sf "$NASM_BIN" "$D/nasm"
-  [ -n "$NDISASM_BIN" ] && ln -sf "$NDISASM_BIN" "$D/ndisasm" || true
   echo ">>> nasm-Umgehung gesetzt ($NASM_BIN)"
 fi
 
 # ---- 6. renoirPkg: update -> build ----------------------------------------------------------
+# build_uefi.py (Mu-Silicium) statt DeviceBuild.py direkt: setzt FD_BASE/FD_SIZE aus
+# Resources/Configs/renoir.toml; DeviceBuild.py kennt kein "-t".
 echo ">>> stuart update…"; python3 "$DB" --update
-echo ">>> build RELEASE…"; python3 "$DB" -t RELEASE
+echo ">>> build RELEASE…"; python3 build_uefi.py -d renoir -r RELEASE
 
 FD="$(find Build/renoirPkg -name '*.fd' 2>/dev/null | head -1 || true)"
 echo

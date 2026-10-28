@@ -21,20 +21,20 @@ What is reasonably known vs. what you must read off renoir's device tree / `/ven
 
 | Subsystem | redwood (reference) | renoir | Action |
 |---|---|---|---|
-| GPU | Adreno 642L, `a660_*` firmware | **Adreno 642, `a660_*` firmware ✓** | **Identical firmware names** (`a660_gmu.bin`, `a660_sqe.fw`, `a660_zap.{mdt,b00..b02,elf}`) — `hakios.adreno.c` firmware refs need no change |
-| Display | DSI panel, per-device brightness table | punch-hole AMOLED, 1080×2400, 90 Hz | Picture comes from UEFI framebuffer (GOP); brightness/refresh facts in One UI repo (see `DRIVERS.md`) |
-| Touch | Goodix GT9916 (Berlin-D) / FocalTech FT3680 | **Goodix GT9897 (Berlin) ✓** | **Goodix path applies** — same Berlin family as redwood; FocalTech branch not needed. Confirm SPI engine/GPIOs/regulator from renoir DT |
-| Storage | UFS | UFS | Same path, confirm controller reg from DT |
+| GPU | Adreno 642L, chipid `0x06030500`, `a660_*` firmware | **Adreno 642, chipid `0x06060010`, `a660_*` firmware ✓** | Same GPU/GMU/SMMU addresses (`3d00000`, `3d6a000`, `3da0000`) and firmware names; check where `hakios.adreno.c` depends on the chip id / speed bin |
+| Display | DSI panel, per-device brightness table | AMOLED 1080×2400, 90 Hz; this unit's panel `k9_42_02_0b_mp_dsc_cmd` | Picture comes from UEFI framebuffer (GOP); brightness/refresh facts in One UI repo (see `DRIVERS.md`) |
+| Touch | Goodix GT9916 / FocalTech FT3680 on SPI (SE 13) | **Goodix GT9897 or FocalTech on SPI ✓** — node `spi@988000/xiaomi_k9_touch@0` (`xiaomi,k9-spi`, 6 MHz), reset GPIO 30, IRQ GPIO 31, `avdd`/`iovdd` supplies; **this unit: FocalTech** (`fts_ts`) | Same bus and the same two vendors as redwood: retarget `hakios.goodix.c` to SE @ `0x988000`, GPIOs 30/31, renoir's regulators and vendor detection. (`i2c@988000/focaltech@38` in the DT is a disabled Qualcomm reference leftover) |
+| Storage | UFS | UFS ✓ | `ufshc@1d84000`, same three register ranges as redwood |
 | Wi-Fi | WCN6750 | likely WCN6750-class | Not in LineageOS blob list; `pull-firmware.sh` wpss.* on-device; `hakios.wifi.c` |
 | Audio DSP | ADSP (adsp.*) | ADSP ✓ | Pull `adsp.*`; battery/charging ride through it |
-| Haptics | Awinic aw8697 | **Awinic-class RTP ✓** | Effects as `N_click_P_RTP.bin` → `effect_N.bin`; adapt `hakios.haptic.c` to renoir's chip |
-| Modem | MPSS, IPA 4.11 | confirm IPA version | `pull-soc.sh` + `cellular_probe.py`; cellular unfinished upstream anyway |
+| Haptics | Awinic aw8697 | **Qualcomm PMIC `qcom-hv-haptics` ✓** | Different chip from redwood; effects as `N_click_P_RTP.bin` → `effect_N.bin`; `hakios.haptic.c` needs a new backend |
+| Modem | MPSS, IPA 4.11 | same SoC addresses, IPA firmware `ipa_fws` | `soc.args`; cellular unfinished upstream anyway |
 | Cameras | QTI sensormodule | QTI sensormodule | Pull camera tuning bins on-device |
 
-> ✓ = confirmed from public sources: LineageOS `android_device_xiaomi_renoir` (lineage-21)
-> `proprietary-files.txt`. The remaining items read from renoir's device tree (`pull-soc.sh` grabs
-> `/sys/firmware/fdt`) and `/vendor/firmware` on renoir's MIUI. The One UI ROM repo also documents
-> renoir's panel/brightness/haptics — reuse it.
+> ✓ = read on a real renoir (2026-10-28: MIUI 14.0.7 TKIMIXM vendor, kernel 5.4.233, its
+> `/sys/firmware/fdt` and `/proc/bus/input/devices`) or from LineageOS `android_device_xiaomi_renoir`
+> (lineage-21) `proprietary-files.txt`. renoir ships two touch vendors; the Goodix firmware sits in
+> `/vendor/firmware` on every unit, so the input device name says which chip a unit has.
 
 ## Firmware
 
@@ -52,11 +52,14 @@ git.
 devices/renoir/pull-soc.sh      # adb pull /sys/firmware/fdt, then upstream tools/soc-args.py -> soc.args
 ```
 
-`tools/soc-args.py` reads renoir's `qcom,ipa`, `qcom,ipcc`, AOSS mailbox, RPMh controller and
-`apps-smmu` nodes and prints the `soc_*` boot-args. The memory addresses (`soc_smem`,
-`soc_cmd_db`, `soc_mpss_mem`, `soc_imem`) come from renoir's reserved-memory nodes — add by hand.
-Unlike redwood (whose values equal the kernel defaults), **renoir's `soc.args` will carry real
-differences** — that is the first thing to get right. See `soc.args` for the empty template.
+`soc.args` holds renoir's values, read off a real renoir. **All of them equal redwood's kernel
+defaults except `soc_ipa_fw=ipa_fws`** (redwood: `yupik_ipa_fws`). `tools/soc-args.py` misses three
+on renoir because the nodes are named differently; they are in `soc.args` by hand: `soc_aoss`
+(`qcom,qmp-aop@c300000`, compatible `qcom,qmp-mbox`), `soc_cmd_db` (`reserved-memory@80860000`,
+compatible `qcom,cmd-db`), `soc_mpss_mem` (`mpss_wlan@8b800000`).
+
+`/sys/firmware/fdt` is not readable by the adb shell on renoir, so `pull-soc.sh` copies it as root
+and pulls the copy (`su -c cat` through adb runs in a pty and turns 0x0a into 0d 0a).
 
 ## Running (once ported)
 
