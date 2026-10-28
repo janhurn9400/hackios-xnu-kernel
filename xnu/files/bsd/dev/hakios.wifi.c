@@ -4349,6 +4349,346 @@ renoir_pcie_survey(uint32_t how)
 }
 
 /*
+ * pcie=3..5: the link, step by step, each level doing the ones before it (devices/renoir/WIFI.md, step 2).
+ * The order is Linux's (pcie-qcom.c, phy-qcom-qmp-pcie.c) and Qualcomm's (msm pci-msm.c, cnss2):
+ *   3  supplies through RPMh (the radio's and the PHY's), the radio's enable pin, the controller's power
+ *      domain, its clocks; reports what runs
+ *   4  ... the controller and its PHY out of reset, the PHY's own sequence from the device tree
+ *      (qcom,phy-sequence), and waits for the PHY to say it is ready; the pipe clock then from the PHY
+ *   5  ... the controller as root port, PERST# released, the link trained (LTSSM), and the radio's
+ *      configuration space read through the iATU: 17cb:1103 is a QCA6490
+ * Everything is taken back down at the end, in reverse, but for the supplies (see renoir_pcie_down()).
+ * pcie_pause=MS (default 2200): a pause after each announcement, for the loader's notes if a write ends
+ * the kernel (the hypervisor may keep some of this for itself).
+ */
+static const struct {
+	uint16_t offset;
+	uint8_t value;
+} renoir_phy_sequence[] = {
+	{ 0x240, 0x03 }, { 0x94, 0x08 }, { 0x154, 0x34 }, { 0x16c, 0x08 }, { 0x58, 0x0f }, { 0xa4, 0x42 },
+	{ 0x110, 0x24 }, { 0x11c, 0x03 }, { 0x118, 0xb4 }, { 0x10c, 0x02 }, { 0x1bc, 0x11 }, { 0xbc, 0x82 },
+	{ 0xd4, 0x03 }, { 0xd0, 0x55 }, { 0xcc, 0x55 }, { 0xb0, 0x1a }, { 0xac, 0x0a }, { 0xc4, 0x68 },
+	{ 0xe0, 0x02 }, { 0xdc, 0xaa }, { 0xd8, 0xab }, { 0xb8, 0x34 }, { 0xb4, 0x14 }, { 0x158, 0x01 },
+	{ 0x74, 0x06 }, { 0x7c, 0x16 }, { 0x84, 0x36 }, { 0x78, 0x06 }, { 0x80, 0x16 }, { 0x88, 0x36 },
+	{ 0x1b0, 0x1e }, { 0x1ac, 0xca }, { 0x1b8, 0x18 }, { 0x1b4, 0xa2 }, { 0x50, 0x07 }, { 0x10, 0x01 },
+	{ 0x1c, 0x31 }, { 0x20, 0x01 }, { 0x24, 0xde }, { 0x28, 0x07 }, { 0x30, 0x4c }, { 0x34, 0x06 },
+	{ 0xee4, 0x20 }, { 0xe84, 0x75 }, { 0xe90, 0x3f }, { 0x115c, 0x7f }, { 0x1160, 0xff }, { 0x1164, 0xbf },
+	{ 0x1168, 0x3f }, { 0x116c, 0xd8 }, { 0x1170, 0xdc }, { 0x1174, 0xdc }, { 0x1178, 0x5c }, { 0x117c, 0x34 },
+	{ 0x1180, 0xa6 }, { 0x1190, 0x34 }, { 0x10d8, 0x07 }, { 0xe40, 0x0c }, { 0x10dc, 0x00 }, { 0x104c, 0x08 },
+	{ 0x1050, 0x08 }, { 0x1044, 0xf0 }, { 0x11a4, 0x38 }, { 0x694, 0x00 }, { 0x654, 0x00 }, { 0x6a8, 0x0f },
+	{ 0x48, 0x90 }, { 0x620, 0xc1 }, { 0x388, 0xa8 }, { 0x398, 0x0b }, { 0x2dc, 0x05 }, { 0x200, 0x00 },
+	{ 0x244, 0x03 },
+};
+
+#define RENOIR_RSC              0x18220000u     /* RPMh: the application processor's DRV 2 */
+#define RENOIR_CMD_DB           0x80860000u
+#define R_TCS(reg)              (renoir_rsc + 0xd00 + (reg))
+#define RENOIR_PCIE_IATU        0x60001000u
+#define RENOIR_PCIE_CONF        0x60100000u
+
+static vm_offset_t renoir_rsc, renoir_tlmm, renoir_gcc_vote, renoir_gcc_pcie, renoir_gcc_phy;
+static uint32_t renoir_pause = 2200;
+
+static void
+renoir_say(const char *what)
+{
+	printf("wifi: pcie: %s\n", what);
+	if (renoir_pause) {
+		sleep_ms(renoir_pause);
+	}
+}
+
+/* An RPMh resource's address from the command database, by name (as hakios.goodix.c) */
+static uint32_t
+renoir_rpmh_address(const char *name)
+{
+	static const volatile uint8_t *db;
+	char id[8] = { 0 };
+
+	if (db == NULL) {
+		db = (const volatile uint8_t *)ml_io_map_wcomb(RENOIR_CMD_DB, 0x20000);
+	}
+
+	if (db[4] != 0xdb || db[5] != 0x30 || db[6] != 0x03 || db[7] != 0x0c) {
+		return 0;
+	}
+	strlcpy(id, name, sizeof(id));
+	for (unsigned sl = 0; sl < 8; sl++) {
+		const volatile uint8_t *slave = db + 8 + 16 * sl;
+		uint16_t sid = slave[0] | slave[1] << 8, header = slave[2] | slave[3] << 8, count = slave[6] | slave[7] << 8;
+
+		if (sid == 0 || header >= 0x1f000 || count > 512) {
+			continue;
+		}
+		for (unsigned i = 0; i < count; i++) {
+			const volatile uint8_t *entry = db + 0x90 + header + 24 * i;
+			bool same = true;
+
+			for (unsigned c = 0; c < 8; c++) {
+				same &= entry[c] == (uint8_t)id[c];
+			}
+			if (same) {
+				return entry[16] | entry[17] << 8 | entry[18] << 16 | (uint32_t)entry[19] << 24;
+			}
+		}
+	}
+	return 0;
+}
+
+/* Up to three writes to RPMh through command slot set 0, waited for (hakios.goodix.c's rpmh_write()) */
+static bool
+renoir_rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
+{
+	uint32_t irq_enable = rd(R_TCS(0x00));
+	bool done = false;
+
+	for (int i = 0; rd(R_TCS(0x18)) == 0; i++) {
+		if (i > 2000) {
+			return false;
+		}
+		sleep_us(100);
+	}
+	wr(R_TCS(0x14), rd(R_TCS(0x14)) & ~(1u << 24));
+	wr(R_TCS(0x14), rd(R_TCS(0x14)) & ~(1u << 16));
+	wr(R_TCS(0x08), 1);
+	for (unsigned i = 0; i < count; i++) {
+		wr(R_TCS(0x30 + 20 * i), 0x10008 | 0x100);
+		wr(R_TCS(0x34 + 20 * i), address[i]);
+		wr(R_TCS(0x38 + 20 * i), data[i]);
+	}
+	wr(R_TCS(0x10), (1u << count) - 1);
+	wr(R_TCS(0x1c), (1u << count) - 1);
+	wr(R_TCS(0x00), irq_enable | 1);
+	wr(R_TCS(0x14), 1u << 16);
+	wr(R_TCS(0x14), 1u << 16 | 1u << 24);
+	for (int i = 0; i < 2000 && !done; i++) {
+		done = rd(R_TCS(0x04)) & 1;
+		if (!done) {
+			sleep_us(100);
+		}
+	}
+	wr(R_TCS(0x14), rd(R_TCS(0x14)) & ~(1u << 24));
+	wr(R_TCS(0x14), rd(R_TCS(0x14)) & ~(1u << 16));
+	wr(R_TCS(0x1c), 0);
+	wr(R_TCS(0x10), 0);
+	wr(R_TCS(0x08), 1);
+	wr(R_TCS(0x00), irq_enable);
+	return done;
+}
+
+/* A regulator voted on (or off) at `mv'; LDOs also in high-power mode */
+static bool
+renoir_supply(const char *name, uint32_t mv, bool on)
+{
+	uint32_t base = renoir_rpmh_address(name);
+	uint32_t address[3] = { base, base + 4, base + 8 }, data[3] = { mv, on ? 1 : 0, 7 };
+	bool ldo = strncmp(name, "ldo", 3) == 0, done;
+
+	if (base == 0 || (base >> 16 & 0xf) != 4) {
+		printf("wifi: pcie: no regulator \"%s\" in the command database (%#x)\n", name, base);
+		return false;
+	}
+	done = renoir_rpmh_write(address, data, on && ldo ? 3 : 2);
+	printf("wifi: pcie: %s (%#x) %s %u mV: %s\n", name, base, on ? "on at" : "off, voted", mv, done ? "done" : "NO ANSWER");
+	return done;
+}
+
+static const struct {
+	const char *name;
+	uint32_t mv;
+} renoir_supplies[] = {
+	{ "smpc2", 950 }, { "smpb10", 1800 }, { "smpb11", 1880 }, { "smpb12", 1350 }, { "ldoc11", 2800 },   /* the radio */
+	{ "ldoc10", 880 }, { "ldob6", 1200 },                                                             /* the PHY */
+};
+
+static void
+renoir_pin(unsigned pin, unsigned function, unsigned pull, unsigned ma, int level)
+{
+	vm_offset_t cfg = renoir_tlmm + 0x1000 * pin;
+
+	if (level >= 0) {
+		wr(cfg + 4, level ? 2 : 0);
+	}
+	wr(cfg, pull | function << 2 | (ma / 2 - 1) << 6 | (level >= 0 ? 1u << 9 : 0));
+}
+
+static bool
+renoir_wait(vm_offset_t address, uint32_t mask, uint32_t value, uint32_t ms)
+{
+	for (uint32_t i = 0; i < ms * 10; i++) {
+		if ((rd(address) & mask) == value) {
+			return true;
+		}
+		sleep_us(100);
+	}
+	return (rd(address) & mask) == value;
+}
+
+/* the clock votes: 0x152008 bits 0-5 (the controller's branches), 0x152000 11, 12 (NoC), 18, 19 (TBUs) */
+#define RENOIR_VOTE1_BITS       0x3fu
+#define RENOIR_VOTE0_BITS       (1u << 11 | 1u << 12 | 1u << 18 | 1u << 19)
+
+static void
+renoir_pcie_down(unsigned level)
+{
+	printf("wifi: pcie: taking it all down again\n");
+	renoir_pin(94, 0, 1, 2, 0);                     /* PERST# low */
+	if (level >= 4) {
+		wr(renoir_gcc_pcie + 0x54, 2);          /* the pipe clock from XO again */
+		static vm_offset_t phy_down;
+
+		if (phy_down == 0) {
+			phy_down = ml_io_map(RENOIR_PCIE_PHY, 0x2000);
+		}
+		wr(phy_down + 0x240, 0);                /* the PHY powered down */
+	}
+	wr(renoir_gcc_vote + 8, rd(renoir_gcc_vote + 8) & ~RENOIR_VOTE1_BITS);
+	wr(renoir_gcc_vote, rd(renoir_gcc_vote) & ~RENOIR_VOTE0_BITS);
+	wr(renoir_gcc_pcie + 4, rd(renoir_gcc_pcie + 4) | 1);  /* the power domain collapsed */
+	renoir_pin(64, 0, 1, 2, -1);                    /* the radio's enable: an input pulled down, as found */
+	(void)renoir_wait(renoir_gcc_pcie + 4, 1u << 31, 0, 50);
+	/*
+	 * The supplies stay voted on: several are shared (the 1.8 V of smpb10 with much of the phone), and a
+	 * vote of ours replaces what this processor voted before, the boot chain's included.
+	 */
+	printf("wifi: pcie: down: power domain %#x, votes %#x %#x\n", rd(renoir_gcc_pcie + 4), rd(renoir_gcc_vote),
+	    rd(renoir_gcc_vote + 8));
+}
+
+static void
+renoir_pcie_link(unsigned level)
+{
+	vm_offset_t phy, parf, dbi, iatu, conf;
+	unsigned reached = 3;
+
+	PE_parse_boot_argn("pcie_pause", &renoir_pause, sizeof(renoir_pause));
+	renoir_rsc = ml_io_map(RENOIR_RSC, 0x10000);
+	renoir_tlmm = ml_io_map(0x0f100000, 0x100000);
+	renoir_gcc_vote = ml_io_map(RENOIR_GCC_VOTE, 0x1000);
+	renoir_gcc_pcie = ml_io_map(RENOIR_GCC_PCIE0, 0x1000);
+	renoir_gcc_phy = ml_io_map(RENOIR_GCC_PCIE0_PHY, 0x1000);
+
+	/* ---- 3: power and clocks ---- */
+	renoir_say("3: voting the radio's five supplies and the PHY's two on through RPMh (command slot set 0)");
+	for (unsigned i = 0; i < sizeof(renoir_supplies) / sizeof(renoir_supplies[0]); i++) {
+		if (!renoir_supply(renoir_supplies[i].name, renoir_supplies[i].mv, true)) {
+			goto down;
+		}
+	}
+	renoir_say("3: the radio's enable (gpio64) high, PERST# (gpio94) held low, CLKREQ# (gpio95) to the controller");
+	renoir_pin(94, 0, 1, 2, 0);
+	renoir_pin(95, 1, 3, 2, -1);
+	renoir_pin(64, 0, 3, 16, 1);
+	sleep_ms(100);                                  /* cnss: the radio's power-up before the bus touches it */
+	renoir_say("3: the power domain gcc_pcie_0_gdsc on (0x16b004 bit 0 cleared)");
+	wr(renoir_gcc_pcie + 4, rd(renoir_gcc_pcie + 4) & ~1u);
+	if (!renoir_wait(renoir_gcc_pcie + 4, 1u << 31, 1u << 31, 50)) {
+		printf("wifi: pcie: the power domain does not come on: %#x\n", rd(renoir_gcc_pcie + 4));
+		goto down;
+	}
+	printf("wifi: pcie: power domain on: %#x\n", rd(renoir_gcc_pcie + 4));
+	renoir_say("3: the aux clock at 19.2 MHz from XO (0x16b05c = 1, update), the clock votes on");
+	wr(renoir_gcc_pcie + 0x5c, 0x1);
+	wr(renoir_gcc_pcie + 0x58, rd(renoir_gcc_pcie + 0x58) | 1);
+	(void)renoir_wait(renoir_gcc_pcie + 0x58, 1, 0, 10);
+	wr(renoir_gcc_vote, rd(renoir_gcc_vote) | RENOIR_VOTE0_BITS);
+	wr(renoir_gcc_vote + 8, rd(renoir_gcc_vote + 8) | RENOIR_VOTE1_BITS);
+	sleep_ms(1);
+	renoir_branch(renoir_gcc_pcie, RENOIR_GCC_PCIE0, 0x10, "slv_q2a_axi");
+	renoir_branch(renoir_gcc_pcie, RENOIR_GCC_PCIE0, 0x14, "slv_axi");
+	renoir_branch(renoir_gcc_pcie, RENOIR_GCC_PCIE0, 0x1c, "mstr_axi");
+	renoir_branch(renoir_gcc_pcie, RENOIR_GCC_PCIE0, 0x24, "cfg_ahb");
+	renoir_branch(renoir_gcc_pcie, RENOIR_GCC_PCIE0, 0x28, "aux");
+	renoir_branch(renoir_gcc_pcie, RENOIR_GCC_PCIE0, 0x30, "pipe");
+	renoir_branch(renoir_gcc_pcie, RENOIR_GCC_PCIE0, 0x80, "aggre_noc_pcie_0_axi");
+	if (rd(renoir_gcc_pcie + 0x24) & 1u << 31) {
+		printf("wifi: pcie: the controller's AHB clock does not run: the controller cannot be reached\n");
+		goto down;
+	}
+	if (level < 4) {
+		goto down;
+	}
+
+	/* ---- 4: resets and the PHY ---- */
+	reached = 4;
+	parf = ml_io_map(RENOIR_PCIE_PARF, 0x3000);
+	phy = ml_io_map(RENOIR_PCIE_PHY, 0x2000);
+	renoir_say("4: the controller's and the PHY's resets pulsed (0x16b000, 0x16c01c)");
+	wr(renoir_gcc_pcie, 1);
+	wr(renoir_gcc_phy + 0x1c, 1);
+	sleep_us(1000);
+	wr(renoir_gcc_phy + 0x1c, 0);
+	wr(renoir_gcc_pcie, 0);
+	sleep_us(1000);
+	printf("wifi: pcie: PARF readable: sys_ctrl %#x, phy_ctrl %#x, ltssm %#x\n", rd(parf), rd(parf + 0x40), rd(parf + 0x1b0));
+	renoir_say("4: PARF: the PHY's test power-down off (phy_ctrl bit 0), root port; then the PHY's 73 writes");
+	wr(parf + 0x40, rd(parf + 0x40) & ~1u);
+	wr(parf + 0x1000, 4);                           /* PARF_DEVICE_TYPE: root complex */
+	for (unsigned i = 0; i < sizeof(renoir_phy_sequence) / sizeof(renoir_phy_sequence[0]); i++) {
+		wr(phy + renoir_phy_sequence[i].offset, renoir_phy_sequence[i].value);
+	}
+	sleep_us(1000);
+	if (!renoir_wait(phy + 0x214, 1u << 6, 0, 100)) {
+		printf("wifi: pcie: THE PHY IS NOT READY: status %#x (power down %#x, start %#x)\n", rd(phy + 0x214),
+		    rd(phy + 0x240), rd(phy + 0x244));
+		goto down;
+	}
+	printf("wifi: pcie: THE PHY IS READY: status %#x\n", rd(phy + 0x214));
+	wr(renoir_gcc_pcie + 0x54, 0);                  /* the pipe clock from the PHY now */
+	sleep_us(100);
+	renoir_branch(renoir_gcc_pcie, RENOIR_GCC_PCIE0, 0x30, "pipe (from the PHY)");
+	if (level < 5) {
+		goto down;
+	}
+
+	/* ---- 5: the root port, PERST#, the link ---- */
+	reached = 5;
+	dbi = ml_io_map(RENOIR_PCIE_DBI, 0x1000);
+	iatu = ml_io_map(RENOIR_PCIE_IATU, 0x1000);
+	renoir_say("5: PARF set up as Linux's 1.9.0 (DBI base 0, sys_ctrl, Q2A flush, address space size); DBI read");
+	wr(parf + 0x168, 0);                            /* PARF_DBI_BASE_ADDR */
+	/* MST/SLV_WAKEUP_EN, MSTR/SLV_ACLK_CGC_DIS, CORE_CLK_CGC_DIS, AUX_PWR_DET, L23/L1_CLK_RMV_DIS */
+	wr(parf, 1u << 13 | 1u << 12 | 1u << 10 | 1u << 11 | 1u << 6 | 1u << 4 | 1u << 2 | 1u << 1);
+	wr(parf + 0x1ac, 0);                            /* PARF_Q2A_FLUSH */
+	wr(parf + 0x358, 0x4000000);                    /* PARF_SLV_ADDR_SPACE_SIZE: qcom,slv-addr-space-size */
+	printf("wifi: pcie: DBI: id %#x, command %#x, class %#x, link %#x\n", rd(dbi), rd(dbi + 4), rd(dbi + 8),
+	    rd(dbi + 0x80));
+	renoir_say("5: the root port's buses 0/1/1, memory and bus mastering; PERST# released after 100 ms");
+	wr(dbi + 0x8bc, rd(dbi + 0x8bc) | 1);           /* DBI_RO_WR_EN */
+	wr(dbi + 0x18, 0x00010100);                     /* primary 0, secondary 1, subordinate 1 */
+	wr(dbi + 4, rd(dbi + 4) | 0x6);
+	wr(dbi + 0x8bc, rd(dbi + 0x8bc) & ~1u);
+	sleep_ms(100);
+	renoir_pin(94, 0, 1, 2, 1);
+	sleep_ms(1);
+	renoir_say("5: LTSSM on (PARF 0x1b0 bit 8): the link trains");
+	wr(parf + 0x1b0, rd(parf + 0x1b0) | 1u << 8);
+	if (!renoir_wait(dbi + 0x80, 1u << 29, 1u << 29, 1000)) {
+		printf("wifi: pcie: NO LINK: link status %#x, ltssm %#x, debug %#x %#x\n", rd(dbi + 0x80), rd(parf + 0x1b0),
+		    rd(dbi + 0x728), rd(dbi + 0x72c));
+		goto down;
+	}
+	printf("wifi: pcie: THE LINK IS UP: link control/status %#x (gen %u, x%u), ltssm %#x\n", rd(dbi + 0x80),
+	    (rd(dbi + 0x80) >> 16) & 15, (rd(dbi + 0x80) >> 20) & 63, rd(parf + 0x1b0));
+	renoir_say("5: iATU region 0 (unrolled at 0x60001000): config type 0 to bus 1 at 0x60100000; the radio's id read");
+	wr(iatu + 0x08, RENOIR_PCIE_CONF);
+	wr(iatu + 0x0c, 0);
+	wr(iatu + 0x10, RENOIR_PCIE_CONF + 0xfffff);
+	wr(iatu + 0x14, 1u << 24);
+	wr(iatu + 0x18, 0);
+	wr(iatu + 0x00, 4);                             /* CFG0 */
+	wr(iatu + 0x04, 1u << 31);
+	(void)renoir_wait(iatu + 0x04, 1u << 31, 1u << 31, 10);
+	conf = ml_io_map(RENOIR_PCIE_CONF, 0x1000);
+	printf("wifi: pcie: 01:00.0: id %#x (17cb:1103 is a QCA6490), command %#x, class %#x, BAR0 %#x\n", rd(conf),
+	    rd(conf + 4), rd(conf + 8), rd(conf + 0x10));
+	renoir_pin(94, 0, 1, 2, 0);
+	sleep_ms(1);
+down:
+	renoir_pcie_down(reached);
+}
+
+/*
  * Called while the system starts, before there is a root file system. With wifi_step=N the start
  * waits until the steps are over (see hakios_adreno_init()); with wifi=1 it does not.
  */
@@ -4363,6 +4703,10 @@ hakios_wifi_init(void)
 	if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
 		if (PE_parse_boot_argn("pcie", &on, sizeof(on)) && on) {
 			renoir_pcie_survey(on);
+			if (on >= 3) {
+				renoir_pcie_link(on);
+				renoir_pcie_survey(1);
+			}
 			if (PE_parse_boot_argn("wifi_return", &back, sizeof(back)) && back) {
 				printf("wifi: back to the loader (wifi_return)\n");
 				loader_return();
