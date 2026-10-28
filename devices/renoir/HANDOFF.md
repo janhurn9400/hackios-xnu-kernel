@@ -24,7 +24,8 @@
   registers read: the chip waits in its boot ROM (BHI EE 0 = PBL) for `amss20.bin`. **`pcie=7`** (2026-10-29
   00:00, ramdisk `prebuilt/sysimg/root-wifi.apfs`): **THE PBL TOOK THE SBL through BHI, the chip runs it (EE 1,
   MHI READY)**: SMMU stream 0x2400 alone, BDF-to-SID table empty (`WIFI.md` step 4 has what reset the phone).
-  Next: BHIe for the rest of the image (`WIFI.md` step 5). Do not use the default `pcie_pause` with `pcie=6` (a long pause hung a config
+  **`pcie=8`** (00:05): **THE WHOLE IMAGE through BHIe, THE CHIP RUNS ITS MISSION FIRMWARE (EE 2 = AMSS).**
+  Next: our MHI host (contexts, rings, M0, channels IPCR 20/21; `WIFI.md` step 6). Do not use the default `pcie_pause` with `pcie=6` (a long pause hung a config
   write).
 - **Ringtones work without freezing** (user, 23:20) with kernel 23:14.
 

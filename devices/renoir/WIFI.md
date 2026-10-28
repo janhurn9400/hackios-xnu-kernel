@@ -74,10 +74,19 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    - stream 0x2400 with mask 1 was not taken by the hypervisor (SMR read back unchanged).
    **Working: stream 0x2400, mask 0, table empty** (all devices then offset 0). The hypervisor grants SMR/S2CR
    for 0x2400 and 0x2401 alone. Reboot reason "bootloader" is now set for `pcie>=3` (resets land in fastboot).
-5. **MHI host, ours** (next): BHIe for the rest of `amss20.bin` (the SBL asks for the full image in
-   segments: vector table at BHIe), then MHI's own start. Then: Linux's MHI core is GPL-2.0, so it cannot be taken; ath11k's own `pci.c`/`mhi.c`
+5. **BHIe: the whole image. DONE, 2026-10-29 00:05 (`pcie=8 pcie_pause=0`, `logs/001039-bhie-crash.log`).**
+   All of `amss20.bin` (5197824 bytes) in 10 pieces of 512 KB, each in one physical piece and shown to the
+   chip (0xa0080000 on), the vector table (10 x {address, size}, 160 bytes) at 0xa0580000; BHIe (BHIEOFF
+   0x224) TXVECADDR 0x2c/0x30, TXVECSIZE 0x34, sequence 0x55 to TXVECDB 0x3c: **after 540 ms TXVECSTATUS
+   0x80000055 (done), 100 ms later EE 2 = AMSS: THE QCA6490 RUNS ITS MISSION FIRMWARE.** MHISTATUS stays
+   0x101 (READY), error 0x9cb4d3a7. No MHI context nor M0 was needed for BHIe. (The run takes ~90 s with
+   the slow SMMU writes; `run-open.sh 150` gives up before `getvar result` says returned: fetch with
+   `fastboot oem log; fastboot get_staged`.)
+6. **MHI host, ours** (next): the context arrays (channels, event rings, command ring) in shown memory, their
+   addresses in MHI's registers (CCABAP 0x58, ECABAP 0x60, CRCBAP 0x68, CRDB, and the data/control limits),
+   MHICTRL to M0, then the channels IPCR 20/21 for QRTR -- polling event rings at first (no MSI). Then: Linux's MHI core is GPL-2.0, so it cannot be taken; ath11k's own `pci.c`/`mhi.c`
    are BSD-3-Clause-Clear and can. Needed: BHI/BHIe image download (`amss20.bin`), the MHI state machine
    to mission mode, context arrays, event rings, channels IPCR (20/21) -- behind Linux's `mhi.h` API so
    that ath11k's `mhi.c` runs unchanged.
-6. **MSI** (the tree's `qcom,pcie-msi`, SPIs); the SMMU part is done (step 4).
-7. **ath11k_pci** for QCA6490 ("hsp") on `wifi/lx`, QMI over MHI's QRTR, then the station as on redwood.
+7. **MSI** (the tree's `qcom,pcie-msi`, SPIs); the SMMU part is done (step 4).
+8. **ath11k_pci** for QCA6490 ("hsp") on `wifi/lx`, QMI over MHI's QRTR, then the station as on redwood.
