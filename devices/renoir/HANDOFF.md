@@ -16,8 +16,12 @@
   channel at every write and never unmapped it. Fixed (mapped once; kernel 23:14, on the phone from 23:17).
   Still open: a reset in the middle of a vibration would
   still leave it on -- the loader could stop the motor at its start (SPMI write, `WIFI-BT-HAPTICS.md`).
-- **Wi-Fi started** (`WIFI.md`): the QCA6490 is on PCIe 0; a read-only survey (`board=renoir pcie=1/2`, in
-  `hakios.wifi.c`) found PCIe 0 and the radio all off, GCC readable. Next: step 2, the link.
+- **Wi-Fi: THE PCIe LINK IS UP** (`WIFI.md` step 2): `board=renoir pcie=5 wifi_return=1` (kernel 23:21) powers
+  the radio and PCIe 0, runs the PHY sequence, trains the link (Gen 3 x1) and reads `17cb:1103` (QCA6490) at
+  01:00.0, then takes it down. Run: `KERNEL=devices/renoir/prebuilt/vm-kernel/mach.development.bcm2837
+  RAMDISK=devices/renoir/prebuilt/vm-kernel/hold devices/renoir/run-open.sh 60 bootcpu=7 cpus=1 board=renoir
+  pcie=5 wifi_return=1 -v` (no system image needed). Next: step 3, BAR0 and the MHI registers.
+- **Ringtones work without freezing** (user, 23:20) with kernel 23:14.
 
 ## Session 4 (2026-10-28, ~19:00-20:55): vibration, crash -> fastboot, and SOUND in iOS
 

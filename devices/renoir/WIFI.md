@@ -35,11 +35,24 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    that register on shima) and clkref 0x18c004 = 1 (on); pipe mux 2, aux RCG 0x80000000 (root off).
    Pins: PERST# 94 input pulled down, CLKREQ# 95 and WAKE# 96 inputs reading 1, Wi-Fi enable 64 and BT
    enable 65 inputs pulled down (the radio is off). So step 2 starts from cold.
-2. **Link up**: supplies on (RPMh, as `hakios.goodix.c`/`hakios.adsp.c` vote), gpio64 high, GDSC on,
-   clocks voted, PHY sequence, PERST# released, LTSSM enable (PARF), wait for link; read config space of
-   0000:01:00.0: expect 17cb:1103. Risk: the hypervisor may keep GCC/PCIe for itself (the WPSS clocks on
-   redwood were).
-3. **iATU + BAR**: map BAR0 of the chip in the 0x60300000 window; read MHI registers (MHIVER, BHI).
+2. **Link up**: `board=renoir pcie=3|4|5` (`renoir_pcie_link()` in `hakios.wifi.c`; each level does the
+   ones before; everything is taken down again at the end, the supplies stay voted).
+   **DONE, 2026-10-28 23:22 (`logs/232251-renoir-open.log`): THE LINK IS UP, Gen 3 x1, and 01:00.0 reads
+   `17cb:1103`, class 0x028000, BAR0 0x4 (64-bit memory).** Nothing of it is kept from us by the hypervisor.
+   - 3: RPMh votes (DRV 2, slot set 0) smpc2 0.95 V, smpb10 1.8 V, smpb11 1.88 V, smpb12 1.35 V, ldoc11 2.8 V,
+     ldoc10 0.88 V, ldob6 1.2 V: all answered. gpio64 high, PERST# low, CLKREQ# function 1. GDSC on
+     (0xf822f000). Aux RCG cfg 1 (XO, 19.2 MHz). Votes 0x152008 |= 0x3f, 0x152000 |= bits 11, 12, 18, 19:
+     every branch runs.
+   - 4: BCR pulses 0x16b000 and 0x16c01c; PARF then reads (sys_ctrl 0x2000361c, phy_ctrl 0x900); phy_ctrl
+     bit 0 cleared, PARF_DEVICE_TYPE 4, the 73 writes of `qcom,phy-sequence`: PHY ready at once (0x214 = 0x86);
+     pipe mux 0x16b054 = 0 (from the PHY).
+   - 5: PARF_DBI_BASE_ADDR 0, PARF_SYS_CTRL 0x3c56, Q2A flush 0, SLV_ADDR_SPACE_SIZE 0x4000000; DBI id
+     0x010f17cb; root port buses 0/1/1 + memory/master; PERST# high after 100 ms; LTSSM (PARF 0x1b0 bit 8):
+     link status 0x3013 within the first poll, LTSSM 0x111. iATU region 0 (unrolled, 0x60001000) CFG0 to
+     bus 1 at 0x60100000.
+   - Not done yet: CX level vote (the boot chain's was enough), the supplies are not voted off again (shared:
+     a vote of ours replaces the boot chain's for this processor).
+3. **iATU + BAR** (next): map BAR0 of the chip in the 0x60300000 window; read MHI registers (MHIVER, BHI).
 4. **MHI host, ours**: Linux's MHI core is GPL-2.0, so it cannot be taken; ath11k's own `pci.c`/`mhi.c`
    are BSD-3-Clause-Clear and can. Needed: BHI/BHIe image download (`amss20.bin`), the MHI state machine
    to mission mode, context arrays, event rings, channels IPCR (20/21) -- behind Linux's `mhi.h` API so
