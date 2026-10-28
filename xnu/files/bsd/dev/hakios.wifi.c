@@ -4641,6 +4641,7 @@ renoir_bhi_prepare(void)
 	}
 	radio_stream = 0x2401;
 	radio_stream_mask = 0;
+	PE_parse_boot_argn("pcie_stream", &radio_stream, sizeof(radio_stream));    /* 0x2400: the table left empty */
 	radio_space.wanted = 2;
 	pause_ms = renoir_pause ? renoir_pause : 1500;
 	new_from = 0;                           /* (every SMMU write waits pause_ms: see hold()) */
@@ -4875,7 +4876,9 @@ renoir_pcie_link(unsigned level)
 	for (unsigned i = 0; i < 256; i++) {
 		wr(parf + 0x2000 + 4 * i, 0);
 	}
-	wr(parf + 0x2000 + 4 * 0x15, 0x100u << 16 | 1u << 8);
+	if (radio_stream != 0x2400) {
+		wr(parf + 0x2000 + 4 * 0x15, 0x100u << 16 | 1u << 8);
+	}
 	printf("wifi: pcie: BDF-to-SID: 01:00.0 -> stream 0x2400 + %u\n", (rd(parf + 0x2000 + 4 * 0x15) >> 8) & 0xff);
 	printf("wifi: pcie: DBI: id %#x, command %#x, class %#x, link %#x\n", rd(dbi), rd(dbi + 4), rd(dbi + 8),
 	    rd(dbi + 0x80));
