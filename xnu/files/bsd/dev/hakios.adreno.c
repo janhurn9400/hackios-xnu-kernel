@@ -127,6 +127,9 @@ struct gpu_board {
 	uint32_t prim_fifo_threshold;           /* kgsl: prim_fifo_threshold (PC_DBG_ECO_CNTL) */
 	uint32_t highest_bank_bit;              /* for UBWC: dt qcom,highest-bank-bit */
 	uint32_t gcc_debug_gpucc;               /* the GCC debug mux's input from the GPU's clock controller (debugcc-*.c) */
+	/* display_probe(): the display's clock controller (dispcc-*.c) and the interface the panel hangs on */
+	uint32_t dispcc_gdscr, dispcc_ahb, dispcc_mdp, dispcc_pclk0, dispcc_size;
+	vm_offset_t disp_intf;                  /* dt: qcom,mdss_mdp + qcom,sde-intf-off of the DSI one */
 };
 
 static const struct gpu_board redwood = {
@@ -134,6 +137,8 @@ static const struct gpu_board redwood = {
 	.speed_bin_fuse = 0x1e9, .gaming_bin_fuse = 0x1f5,
 	.khz = { 315000, 450000, 550000 }, .level = { 64, 128, 192 },
 	.gmem = 512 * 1024, .prim_fifo_threshold = 0x00200000, .highest_bank_bit = 14, .gcc_debug_gpucc = 0x146,
+	.dispcc_gdscr = 0x1004, .dispcc_ahb = 0x1050, .dispcc_mdp = 0x1014, .dispcc_pclk0 = 0x1010, .dispcc_size = 0x2000,
+	.disp_intf = 0x0ae36000,
 };
 
 /*
@@ -153,6 +158,9 @@ static const struct gpu_board renoir = {
 	.khz = { 285000, 443000, 490000 }, .level = { 64, 128, 144 },  /* bin 105's top three of four, see below */
 	.gmem = 1536 * 1024, .prim_fifo_threshold = 0x00300000, .highest_bank_bit = 15,
 	.gcc_debug_gpucc = 0x13c,               /* debugcc-shima.c; everything else of the counter as on redwood */
+	/* dispcc-shima.c: the clocks at 0x2000.., the power switch at 0x3000 (dt gdsc@af03000) */
+	.dispcc_gdscr = 0x3000, .dispcc_ahb = 0x2080, .dispcc_mdp = 0x200c, .dispcc_pclk0 = 0x2004, .dispcc_size = 0x4000,
+	.disp_intf = 0x0ae6b800,                /* 0xae00000 + 0x6b800: intf1, the first DSI one, of a DPU like SM8350's */
 };
 
 static const struct gpu_board *board = &redwood;
@@ -3646,10 +3654,10 @@ hakios_adreno_minute(void)
 static struct block dispcc = { "dispcc", 0x0af00000, 0x2000 };          /* dt: clock-controller@af00000 */
 static struct block disp_intf = { "intf1", 0x0ae36000, 0x300 };         /* dt: mdss_dsi0's mdp_intf_base */
 #define GCC_DISP_AHB_CBCR       0x27004
-#define DISPCC_MDSS_CORE_GDSCR  0x1004          /* dt: disp_cc_mdss_core_gdsc */
-#define DISPCC_MDSS_PCLK0_CBCR  0x1010
-#define DISPCC_MDSS_MDP_CBCR    0x1014
-#define DISPCC_MDSS_AHB_CBCR    0x1050
+#define DISPCC_MDSS_CORE_GDSCR  (board->dispcc_gdscr)  /* dt: disp_cc_mdss_core_gdsc */
+#define DISPCC_MDSS_PCLK0_CBCR  (board->dispcc_pclk0)
+#define DISPCC_MDSS_MDP_CBCR    (board->dispcc_mdp)
+#define DISPCC_MDSS_AHB_CBCR    (board->dispcc_ahb)
 #define INTF_TIMING_ENGINE_EN   0x000
 #define INTF_HSYNC_CTL          0x008           /* clocks a line << 16 | of which the pulse */
 #define INTF_VSYNC_PERIOD       0x00c           /* clocks a frame */
@@ -3660,6 +3668,65 @@ static struct block disp_intf = { "intf1", 0x0ae36000, 0x300 };         /* dt: m
 #define INTF_FRAME_COUNT        0x0ac
 #define INTF_LINE_COUNT         0x0b0
 
+/*
+ * The tear check, read only (display_probe=1): whether the display controller waits for the
+ * panel's TE pulse before it sends a frame. On a DPU 7 (renoir) it is in the interface itself
+ * (dt qcom,sde-intf-tear-irq-off; offsets from sde_hw_intf.c of renoir's kernel); the panel says
+ * qcom,mdss-dsi-te-using-te-pin and qcom,platform-te-gpio 82. Then where the tear check's own
+ * counters are, eight times, and the TE pin's level 40 times a millisecond apart (a 60 Hz pulse
+ * shows as a few samples of the other level). Nothing is written.
+ */
+#define INTF_TEAR_MDP_VSYNC_SEL 0x280
+#define INTF_TEAR_LINE_COUNT    0x2b0
+#define INTF_TEAR_OUT_LINE_COUNT 0x2ac
+
+static void
+tear_probe(void)
+{
+	static const struct {
+		const char *name;
+		uint32_t offset;
+	} tear[] = {
+		{ "tear mdp_vsync_sel", 0x280 }, { "tear check_en", 0x284 }, { "tear sync_config_vsync", 0x288 },
+		{ "tear sync_config_height", 0x28c }, { "tear sync_wrcount", 0x290 }, { "tear vsync_init_val", 0x294 },
+		{ "tear int_count_val", 0x298 }, { "tear sync_thresh", 0x29c }, { "tear start_pos", 0x2a0 },
+		{ "tear rd_ptr_irq", 0x2a4 }, { "tear wr_ptr_irq", 0x2a8 }, { "tear autorefresh_config", 0x2b4 },
+		{ "tear detect_ctrl", 0x2b8 },
+	};
+	static struct block te_pin = { "tlmm gpio82", 0x0f100000 + 0x1000 * 82, 0x1000 };
+	uint32_t levels = 0, changes = 0, last = 2;
+
+	if (board != &renoir) {
+		return;
+	}
+	announce("the tear check in the panel's interface (0xae6ba80..: NOT READ BEFORE), read only");
+	for (unsigned i = 0; i < sizeof(tear) / sizeof(tear[0]); i++) {
+		get(&disp_intf, tear[i].name, tear[i].offset);
+	}
+	quiet = true;
+	for (int i = 0; i < 8; i++) {
+		printf("adreno: 0: the tear check: intf line %u, tear line %u, tear out line %u\n",
+		    rd(disp_intf.base + INTF_LINE_COUNT), rd(disp_intf.base + INTF_TEAR_LINE_COUNT),
+		    rd(disp_intf.base + INTF_TEAR_OUT_LINE_COUNT));
+		sleep_us(1300);
+	}
+	quiet = false;
+	announce("the panel's TE pin, gpio 82 (0xf152000), read only");
+	get(&te_pin, "cfg", 0);
+	get(&te_pin, "in_out", 4);
+	quiet = true;
+	for (int i = 0; i < 40; i++) {
+		uint32_t level = rd(te_pin.base + 4) & 1;
+
+		levels += level;
+		changes += last != 2 && level != last;
+		last = level;
+		sleep_us(1000);
+	}
+	quiet = false;
+	printf("adreno: 0: THE TE PIN: high in %u of 40 samples a millisecond apart, %u changes\n", levels, changes);
+}
+
 static void
 display_probe(void)
 {
@@ -3668,6 +3735,8 @@ display_probe(void)
 
 	step = newest_step = 0;
 	fine = 1;
+	dispcc.size = board->dispcc_size;
+	disp_intf.phys = board->disp_intf;
 	announce("the display: has its clock controller its bus clock (gcc 0x127004; GCC answers always)");
 	if (get(&gcc, "disp_ahb_cbcr", GCC_DISP_AHB_CBCR) & CBCR_OFF) {
 		announce("turn the bus clock of the display's clock controller on (gcc 0x127004 bit 0: THE ONE WRITE)");
@@ -3753,6 +3822,7 @@ display_probe(void)
 		    rd(disp_intf.base + INTF_FRAME_COUNT));
 		sleep_us(1300);
 	}
+	tear_probe();
 out:
 	fine = saved_fine;
 	newest_step = 0;

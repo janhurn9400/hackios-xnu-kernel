@@ -141,6 +141,13 @@ static TUNABLE(uint32_t, gRecStart, "rec_start", 0);
 static TUNABLE(uint32_t, gRecMegabytes, "rec_mb", 480);
 static TUNABLE(uint32_t, gRecRing, "rec_ring", 0);
 static TUNABLE(uint32_t, gRecStep, "rec_step", 3);
+/*
+ * Boot-arg rec_fb=1: each frame is taken from the panel's framebuffer, as the display controller
+ * sends it, right after it was drawn there, instead of from the surface it was drawn from. A frame
+ * that the GPU was still drawing into while it was copied shows torn here, where the surface,
+ * finished by the time it is recorded, would not.
+ */
+static TUNABLE(uint32_t, gRecFB, "rec_fb", 0);
 static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
 /*
  * Boot-arg fb_filter=0: the picture is scaled to the panel nearest neighbour, as it once was. The
@@ -527,8 +534,11 @@ IOMobileFramebuffer::record(MiniIOSurface * s)
 	for (uint32_t y = 0; y < header->height; y++) {
 		const uint32_t * from = (const uint32_t *) (s->pixels() + (size_t) (y * REC_STEP + 1) * s->info.bytesPerRow);
 
+		if (gRecFB) {
+			from = (const uint32_t *) (fBase + (size_t) ((y * REC_STEP + 1) * fPanelHeight / fHeight) * fRowBytes);
+		}
 		for (uint32_t x = 0; x < header->width; x++) {
-			uint32_t pixel = from[x * REC_STEP + 1];        /* B G R A in memory */
+			uint32_t pixel = gRecFB ? from[(x * REC_STEP + 1) * fPanelWidth / fWidth] : from[x * REC_STEP + 1];
 
 			*to++ = (uint8_t) (pixel >> 16);
 			*to++ = (uint8_t) (pixel >> 8);

@@ -61,3 +61,22 @@ picture may come out wrong: the first thing to look at when it draws.
 `gpu=1` needs the firmware in the small image (`fw-gpu/` in the VM's checkout, then
 `GL=1 REST=1 userland/build.sh`: Mesa via `tools/mk-mesa.sh`, needs meson, ninja, llvm-ar,
 python3-venv). Then the run of `NEXT.md` step 3 with `board=renoir gpu=1`.
+
+## The display (frame pacing and tearing, 2026-10-28 afternoon)
+
+- Frame benchmark (`RC_JOBS=rc.jobs.fps`, `touch_lat=1`, `tools/frames.py`, `logs/133544-renoir-open.log`):
+  40 % of frames over 16.7 ms, 6 % over 33 ms (redwood upstream: 25-30 % and 6 %). The copy into the
+  panel's framebuffer takes 7-13 ms a frame here (redwood: about 4).
+- `display_probe=1` with renoir's addresses (in `struct gpu_board`): the DSI interface is intf1 at
+  `0xae6b800` (0xae00000 + `qcom,sde-intf-off` 0x6b800), the display clock controller as in
+  `dispcc-shima.c` (power switch `0x3000`, ahb `0x2080`, mdp `0x200c`, pclk0 `0x2004`). The firmware leaves
+  the panel in **command mode at 60 Hz**: the timing engine is off, the line counter runs 1 to ~2400 in
+  8.6-8.9 ms per frame and rests at 1 in between. Its tear check (DPU 7: in the interface, `0x280..0x2b8`,
+  `sde_hw_intf.c`) is on, synced to the panel's TE pin (gpio 82, function 1, toggling): `check_en 1`,
+  `sync_config_vsync 0x180085`, `autorefresh_config 0x80000001`, start_pos/vsync_init 2400.
+- The tearing that is seen is **not** in the framebuffer: frames recorded from it (`rec_fb=1 rec_ring=1
+  rec_step=6`, automated swipes) are whole; the framebuffer is mapped write-combined, not cached. Copying
+  right after the panel's burst (an experiment, `fb_vsync`) did not end it and hung the phone twice; it was
+  taken out again. So it happens between the display controller and the panel. Open: the panel nodes in
+  this device tree (Visionox R66451, 2340 lines, 120/90/60 Hz) are not renoir's panel (the firmware set
+  2400 lines); the right one is named on MagicOS's kernel command line (`msm_drm.dsi_display0=`).

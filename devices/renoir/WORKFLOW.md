@@ -33,10 +33,14 @@ dtbo), Magisk root. Nothing is flashed by any of this; `fastboot reboot` returns
    `xnuloader/mkpayload.py -o usb.bin loader.efi=prebuilt/loader.efi --usb` and
    `mkxnuimg.py -d renoir -p usb.bin -o xnu-usb-renoir.img`, copy to `devices/renoir/prebuilt/`.
 3. On the Mac: `adb reboot bootloader`, `fastboot boot devices/renoir/prebuilt/xnu-usb-renoir.img`.
-   **Then unplug and re-plug the USB cable**: macOS registers the loader ("xnuloader", 18d1:d00d)
-   only if it enumerates after the loader is up; otherwise `fastboot devices` stays empty.
+   Wait for "xnuloader" (18d1:d00d) in `fastboot devices`; it often comes by itself within ~15 s. If
+   it does not, unplug and re-plug the USB cable (macOS registers it only if it enumerates after the
+   loader is up).
 4. `devices/renoir/run-open.sh SECS [kernel args]`: stages kernel + `hello` + args, runs, fetches
-   the log into `logs/`. Kernel: `prebuilt/mach.development.bcm2837` (until one is built here).
+   the log into `logs/`. `KERNEL=`, `RAMDISK=` (e.g. `prebuilt/sysimg/root-gl.apfs`), `FOLLOW=N`
+   (live log), `FOLLOW_KEEP=1`. The system image goes first: `fastboot oem ramdisk`, `fastboot stage
+   devices/renoir/prebuilt/sysimg/system.apfs` (80 s; do not touch the cable meanwhile). `fastboot oem
+   stop` ends a run early. A run that hangs the phone needs a long press on power.
 
 ## Kernel build (works)
 

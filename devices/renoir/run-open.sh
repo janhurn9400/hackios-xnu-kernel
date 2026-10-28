@@ -15,6 +15,8 @@
 #   RAMDISK=path  another process 1 than prebuilt/userland/hello (e.g. hold, which does not exit)
 #   FOLLOW=N      every N seconds the log as it stands so far into logs/<time>-renoir-open.log.live
 #                 (the loader answers during a run; asked in the same loop, so one fastboot at a time)
+#   FOLLOW_KEEP=1 ... and every one of them kept, .live.1, .live.2, ... (a long run's middle, which the
+#                 final log loses once more than a megabyte follows it; tools/frames.py LOG LOG.live*)
 set -e
 cd "$(dirname "$0")/../.."
 PATH=$HOME/Library/Android/sdk/platform-tools:$PATH
@@ -35,7 +37,8 @@ for _ in $(seq 1 $(( secs / 3 + 40 ))); do
 	if [ -n "$FOLLOW" ] && [ $(( $(date +%s) - followed )) -ge "$FOLLOW" ]; then
 		followed=$(date +%s)
 		t 10 fastboot oem log 2>&1 | grep -q OKAY && t 30 fastboot get_staged "$log.live.raw" >/dev/null 2>&1 &&
-			tr -d '\000' < "$log.live.raw" > "$log.live" && rm -f "$log.live.raw"
+			tr -d '\000' < "$log.live.raw" > "$log.live" && rm -f "$log.live.raw" &&
+			{ [ -z "$FOLLOW_KEEP" ] || cp "$log.live" "$log.live.$(( ++followed_n ))"; }
 	fi
 	sleep 3
 done
