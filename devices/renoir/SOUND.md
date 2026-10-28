@@ -61,6 +61,18 @@ is at rest (both lines high). The TERT_MI2S pins 120/121/122/124 are GPIOs (func
 the sound path sets them to their MI2S functions; reset gpio15 reads 0 (not in reset), speaker switch
 gpio24 an input reading 0.
 
+## The container decoded (`devices/renoir/tools/tfa-container.py fw-audio-renoir/tfa98xx.cnt`)
+
+Self-describing: descriptors are a 24-bit offset with the type in the top byte; bitfield items are a
+16-bit value and a 16-bit field id `register << 8 | position << 4 | (length - 1)`, so no NXP tables are
+needed. **0x34 is "RCV"** (the earpiece speaker, top), **0x35 is "SPK"** (the main speaker, bottom):
+renoir's stereo is earpiece + speaker. Per device: 30 bitfields (registers 0x02, 0x04, 0x20-0x27,
+0x54, 0x5f, 0x68, 0x6f-0x76, 0x85, 0xf9) and a small register patch (`PA1_00`, no DSP code); the two
+differ only in 0x26/0x27 (which slot/channel each takes). Profile `stereo`: 0x02[3:0] = 9 (96 kHz),
+0x00[4] = 1, 0x64[15:14] = 0, 0x62[15:14] = 0; `*.standby` / `powerdown.standby`: 0x00[0] = 1
+(power down); `calibrate.cal` with four files (MG3_01 messages). Still needed: NXP's TFA2 start order
+(power-up, clocks/PLL wait, patch, profile, unmute) from its Linux driver.
+
 ## What the port needs, in order
 
 1. From renoir in MagicOS (adb; `su` if Magisk works): `/vendor/etc/mixer_paths*.xml` (the speaker
