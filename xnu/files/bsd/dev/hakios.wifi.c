@@ -4573,9 +4573,18 @@ renoir_bar(vm_offset_t dbi, vm_offset_t iatu, vm_offset_t conf)
 	uint32_t size, base, bhi;
 	vm_offset_t mhi;
 
-	renoir_say("6: BAR0's size asked (all ones written to it)");
+	for (int i = 0; i < 4; i++) {
+		printf("wifi: pcie: 6: %d ms after: link %#x, ltssm %#x; ", i * 500, rd(dbi + 0x80),
+		    rd(ml_io_map(RENOIR_PCIE_PARF, 0x3000) + 0x1b0));
+		printf("the radio's id %#x, status/command %#x\n", rd(conf), rd(conf + 4));
+		sleep_ms(500);
+	}
+	printf("wifi: pcie: 6: BAR0's size asked (all ones written to it)\n");
 	wr(conf + 0x10, 0xffffffff);
-	size = ~(rd(conf + 0x10) & ~0xfu) + 1;
+	printf("wifi: pcie: 6: written\n");
+	size = rd(conf + 0x10);
+	printf("wifi: pcie: 6: reads %#x\n", size);
+	size = ~(size & ~0xfu) + 1;
 	printf("wifi: pcie: BAR0 is %#x bytes (BAR1 %#x)\n", size, rd(conf + 0x14));
 	if (size == 0 || size > RENOIR_PCIE_MEM_SIZE / 2) {
 		printf("wifi: pcie: no room for that in the window\n");
