@@ -4397,6 +4397,7 @@ static vm_offset_t renoir_rsc, renoir_tlmm, renoir_gcc_vote, renoir_gcc_pcie, re
 static uint32_t renoir_pause = 2200;
 static unsigned renoir_level;
 static vm_offset_t renoir_dbi;            /* the root port's registers, once mapped (pcie=5 on) */
+static vm_offset_t renoir_conf;           /* the QCA6490's configuration space (pcie=5 on) */
 
 static void
 renoir_say(const char *what)
@@ -4928,6 +4929,30 @@ renoir_mhi(vm_offset_t mhi)
 	MHI_CTX(0x2200)->base = MHI_CTX(0x2200)->read = MHI_CTX(0x2200)->write = MHI_AT(0x3000);
 	MHI_CTX(0x2200)->length = 16 * 16;
 	__asm__ volatile ("dsb sy");
+	/*
+	 * MSI on, as Linux has it before MHI starts: the chip may move no data without. Its messages go to the
+	 * last 4 KB of our piece (0xf000), shown to it like the rest, where they can be looked at; data 0.
+	 */
+	{
+		uint32_t at = rd(renoir_conf + 0x34) & 0xfc;
+
+		for (int hops = 0; at != 0 && hops < 16 && (rd(renoir_conf + at) & 0xff) != 0x05; hops++) {
+			at = (rd(renoir_conf + at) >> 8) & 0xfc;
+		}
+		if (at != 0 && (rd(renoir_conf + at) & 0xff) == 0x05) {
+			uint32_t control = rd(renoir_conf + at) >> 16, mmc = (control >> 1) & 7;
+
+			wr(renoir_conf + at + 4, (uint32_t)MHI_AT(0xf000));
+			wr(renoir_conf + at + 8, (uint32_t)(MHI_AT(0xf000) >> 32));
+			wr(renoir_conf + at + 0xc, 0);
+			control = (control & ~0x70u) | mmc << 4 | 1;
+			wr(renoir_conf + at, (rd(renoir_conf + at) & 0xffff) | control << 16);
+			printf("wifi: pcie: 9: MSI at %#x: control now %#x (%u vectors offered, all taken), address %#x %#x\n", at,
+			    rd(renoir_conf + at) >> 16, 1u << mmc, rd(renoir_conf + at + 4), rd(renoir_conf + at + 8));
+		} else {
+			printf("wifi: pcie: 9: no MSI capability found\n");
+		}
+	}
 	printf("wifi: pcie: 9: contexts at %#llx; the chip told where they are, 2 event rings of ours, M0 asked for\n", mhi_seen);
 	mhi_wr64(mhi + MHI_CCABAP, MHI_AT(0));
 	mhi_wr64(mhi + MHI_ECABAP, MHI_AT(0x2000));
@@ -5035,6 +5060,8 @@ renoir_mhi(vm_offset_t mhi)
 		    c->word[0], c->word[1], c->word[2], c->base, c->read, c->write, ev_rp[er]);
 	}
 	printf("wifi: pcie: 9: command context: read %#llx write %#llx\n", MHI_CTX(0x2200)->read, MHI_CTX(0x2200)->write);
+	printf("wifi: pcie: 9: the MSI page: %08x %08x %08x %08x\n", MHI_ELEMENT(0xf000)[0], MHI_ELEMENT(0xf000)[1],
+	    MHI_ELEMENT(0xf000)[2], MHI_ELEMENT(0xf000)[3]);
 	for (uint32_t at = 0x360; at < 0x3c0; at += 16) {
 		printf("wifi: pcie: 9: contexts +%#x: %08x %08x %08x %08x\n", at, MHI_ELEMENT(at)[0], MHI_ELEMENT(at)[1],
 		    MHI_ELEMENT(at)[2], MHI_ELEMENT(at)[3]);
@@ -5301,7 +5328,7 @@ renoir_pcie_link(unsigned level)
 	wr(iatu + 0x00, 4);                             /* CFG0 */
 	wr(iatu + 0x04, 1u << 31);
 	(void)renoir_wait(iatu + 0x04, 1u << 31, 1u << 31, 10);
-	conf = ml_io_map(RENOIR_PCIE_CONF, 0x1000);
+	renoir_conf = conf = ml_io_map(RENOIR_PCIE_CONF, 0x1000);
 	printf("wifi: pcie: 01:00.0: id %#x (17cb:1103 is a QCA6490), command %#x, class %#x, BAR0 %#x\n", rd(conf),
 	    rd(conf + 4), rd(conf + 8), rd(conf + 0x10));
 	if (level >= 6 && rd(conf) == 0x110317cb) {
