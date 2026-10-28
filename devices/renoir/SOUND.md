@@ -23,6 +23,27 @@ group 0x9100; pins 97-100, function mi2s0), 2 slots of 32 bits at 48 kHz. `sound
   still to read off renoir.
 - MagicOS dmesg (session 2) has the two amplifiers at 0x34/0x35.
 
+## Read off renoir in MagicOS (session 3, 18:55; files in `fw-audio-renoir/`, not committed)
+
+- **Amplifiers: NXP TFA9873** (container `9873N1B`), module `tfa98xx_dlkm.ko`, I2C bus 1 = `a84000`.
+  Firmware `/vendor/firmware/tfa98xx.cnt`, **3828 bytes** (sha256 `5be2bd90...e071d09e`), container
+  format `PM3_01`, customer "Mi", 2 devices, 7 profiles: `stereo`, `handset`, `left`, `right`, each
+  with a `.standby` variant, plus `calibrate`; the patch is `TFA9873N1B0_dummy.patch` (no DSP
+  patch: register settings and a few `SetAlgoParams` / `SetCoeffs` messages), profiles at 96 kHz.
+  dmesg: `tfa98xx 1-0034` and `1-0035`, `container_loaded ... 9873N1B, 2 ndev, 7 nprof`.
+  The HAL's mixer control "TFA Profile" (default `Powerdown`).
+- **Interface: TERT_MI2S_RX** (`/vendor/etc/audio/sku_shima/mixer_paths_shimaidp.xml`: every playback
+  path routes MultiMedia* to it; `mixer_paths_overlay_static.xml`: `TERT_MI2S_RX Channels Two`,
+  `Format S24_LE`, `SampleRate KHZ_96`). DT `qcom,msm-dai-q6-mi2s-tert`: dev-id 2, rx-lines 0x2 (data1),
+  tx-lines 0x1 (data0, the amplifiers' feedback); `qcom,msm-mi2s-master` 1 (the SoC drives the clocks).
+  Qualcomm's numbers (q6afe): AFE port TERTIARY_MI2S_RX `0x1004` (TX `0x1005`), bit clock
+  `LPASS_CLK_ID_TER_MI2S_IBIT 0x104`; 96 kHz x 2 x 32-bit slots = 6.144 MHz.
+- **Pins** (pinctrl-shima.c function numbers): SCK gpio120 `mi2s2_sck` (1), WS gpio122 `mi2s2_ws` (1),
+  data0 gpio121 `mi2s2_data0` (1, in), **data1 gpio124 `mi2s2_data1` (function 3**, out to the amps); all
+  8 mA, no pull. The I2C bus: QUP wrapper 1 SE1 (`GCC_QUPV3_WRAP1_S1_CLK`), gpio36/37 function `qup1`.
+  TFA pins: reset gpio15, irq gpio47 (0x34) / gpio84 (0x35), speaker switch gpio24.
+- The generic `mixer_paths.xml` / `mixer_paths_qrd.xml` (WSA codec) are Qualcomm's templates, not used.
+
 ## Sources
 
 - Xiaomi's kernel source has no renoir branch (MiCode/Xiaomi_Kernel_OpenSource: `lisa-r-oss`,
