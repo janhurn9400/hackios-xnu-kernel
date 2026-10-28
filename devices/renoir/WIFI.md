@@ -93,7 +93,18 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    event on event ring 1 (its context read pointer never moves), nothing on 21. Both channel contexts read
    config 0x2 (running; the chip cleared our doorbell-burst bits 0x200) and their read pointer field holds
    0x100000001 (channel 20) / 0x100000002 (channel 21) -- the chip's own use of it? (Linux never reads it.)
-   Event rings with MSI vectors 1/2 instead of 0/1 changed nothing. Ideas: what the chip wants in the channel
+   Event rings with MSI vectors 1/2 instead of 0/1 changed nothing.
+   **00:40-00:55, found:** (a) **MHI's data path works**: with `pcie_ch=0` the LOOPBACK pair 0/1 echoes our
+   52 bytes (transfer events on event ring 1 for both, the bytes back in the buffer of channel 1). So rings,
+   doorbells, TREs, buffers and the SMMU are right; it is the WLAN side's IPCR client that never takes
+   anything. (b) MSI on (capability at 0x50, 32 vectors, address = a page of ours): the chip writes vector 1
+   there (event ring 0), nothing changes for IPCR. (c) Three event rings as dt's `mhi_events` (0 control
+   MSI 1, 1 data MSI 2, 2 bandwidth MSI 0, `pcie_rings=`): nothing. (d) Device wake (doorbell 127 = 1):
+   nothing. (e) Watched 30 s (`pcie_watch=30000`), doorbells rung again every 5 s: nothing; MHI stays
+   0x201, no SMMU fault. The channel contexts' read field holds (type, event ring) -- the chip's own use.
+   **Android for comparison** (`fw-collect-renoir/dmesg-full.txt` 14.29-15.13 s): WLAN_EN, link (Gen 2 x1
+   there, Gen 3 x1 here), MHI INIT/POWER_ON, amss20.bin, "MISSION_MODE" at 15.075, "Disable ADSP power
+   collapse", **WLFW server (node 7 port 1) at 15.13: 55 ms after mission mode.** Ideas left: what the chip wants in the channel
    context before START (Linux's MHI init for "enabled" channels; pollcfg; the read pointer it overwrote),
    the doorbell value's form, whether channel 20 is IPCR on this firmware (ath11k's QCA6390 table: 20/21),
    MSI being needed for the data path (no interrupts are set up: the chip may wait for MSI enable in its
