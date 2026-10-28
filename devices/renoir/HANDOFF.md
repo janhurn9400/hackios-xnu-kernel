@@ -1,5 +1,21 @@
 # Handoff for the next session
 
+## Session 5 (2026-10-28, ~22:30-23:05): ringtones, the endless vibration, Wi-Fi started
+
+- **Ringtones play** in Settings and can be chosen: `sysimage/select-system.py` had left `Library/Ringtones/`
+  out of the system image (now kept, 17 MB). New image: `prebuilt/sysimg/system-fw-ring.apfs` (built with
+  `KEEP=1 sysimage/fetch.sh; GL=1 REST=1 userland/build.sh`, has the ADSP firmware too). Use it instead of
+  `system-fw.apfs`.
+- **Endless vibration** while browsing ringtones (log `logs/225712-ring-vib.log`): iOS's run ended from cpu 2
+  (cause unknown: the panic text is appended to the log only at the end, and the phone reset right after
+  the DDR vote, before it). The motor was playing at that moment; renoir's motor is the PMIC's and plays on
+  through a reset. Fixed in `loader_return.c`: the motor and the torch are stopped FIRST, the DDR vote is
+  made LAST (after the panic text is in the log). Kernel 22:59 has both; running on the phone from 23:03.
+  Still open: why the run ended (next log has the panic text); a reset in the middle of a vibration would
+  still leave it on -- the loader could stop the motor at its start (SPMI write, `WIFI-BT-HAPTICS.md`).
+- **Wi-Fi started** (`WIFI.md`): the QCA6490 is on PCIe 0; a read-only survey (`board=renoir pcie=1/2`, in
+  `hakios.wifi.c`) found PCIe 0 and the radio all off, GCC readable. Next: step 2, the link.
+
 ## Session 4 (2026-10-28, ~19:00-20:55): vibration, crash -> fastboot, and SOUND in iOS
 
 Read first: this, then `SOUND.md` (all of the sound, with the run command and how to get the log after a
