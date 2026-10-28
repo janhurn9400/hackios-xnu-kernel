@@ -4394,6 +4394,7 @@ static const struct {
 static vm_offset_t renoir_rsc, renoir_tlmm, renoir_gcc_vote, renoir_gcc_pcie, renoir_gcc_phy;
 static uint32_t renoir_pause = 2200;
 static unsigned renoir_level;
+static vm_offset_t renoir_dbi;            /* the root port's registers, once mapped (pcie=5 on) */
 
 static void
 renoir_say(const char *what)
@@ -4668,9 +4669,18 @@ renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
 	wr(bhi + BHI_IMGADDR_HIGH, (uint32_t)(renoir_seen >> 32));
 	wr(bhi + BHI_IMGADDR_LOW, (uint32_t)renoir_seen);
 	wr(bhi + BHI_IMGSIZE, renoir_length);
+	printf("wifi: pcie: 7: written: address %#x %#x, size %#x; now the doorbell\n", rd(bhi + BHI_IMGADDR_HIGH),
+	    rd(bhi + BHI_IMGADDR_LOW), rd(bhi + BHI_IMGSIZE));
 	wr(bhi + BHI_IMGTXDB, 0x1234);
 	for (int ms = 0; ms < 5000; ms += 10) {
+		if (ms < 100 || ms % 500 == 0) {
+			printf("wifi: pcie: 7: %d ms: reading BHI status\n", ms);
+		}
 		status = rd(bhi + BHI_STATUS);
+		if (ms < 100) {
+			printf("wifi: pcie: 7: %d ms: %#x, EE %u, link %#x\n", ms, status, rd(bhi + BHI_EXECENV),
+			    rd(renoir_dbi + 0x80));
+		}
 		if ((status >> 30) >= 2) {
 			printf("wifi: pcie: 7: after %d ms BHI says %#x: %s (error code %#x, %#x %#x %#x)\n", ms, status,
 			    (status >> 30) == 2 ? "THE PBL HAS TAKEN THE IMAGE" : "REFUSED", rd(bhi + BHI_ERRCODE), rd(bhi + 0x34),
@@ -4848,7 +4858,7 @@ renoir_pcie_link(unsigned level)
 
 	/* ---- 5: the root port, PERST#, the link ---- */
 	reached = 5;
-	dbi = ml_io_map(RENOIR_PCIE_DBI, 0x1000);
+	renoir_dbi = dbi = ml_io_map(RENOIR_PCIE_DBI, 0x1000);
 	iatu = ml_io_map(RENOIR_PCIE_IATU, 0x1000);
 	renoir_say("5: PARF set up as Linux's 1.9.0 (DBI base 0, sys_ctrl, Q2A flush, address space size); DBI read");
 	wr(parf + 0x168, 0);                            /* PARF_DBI_BASE_ADDR */
