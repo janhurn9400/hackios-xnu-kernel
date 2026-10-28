@@ -371,14 +371,19 @@ loader_return(void)
 	 */
 	psci_smp_stop_others();
 #endif
+	/*
+	 * First what moves or shines: renoir's vibration motor is the PMIC's, and the PMIC keeps playing
+	 * through a reset. A run that reset in the steps below (once after the DSP's and the memory's,
+	 * 2026-10-28, browsing ringtones) left the motor vibrating until power was held down.
+	 */
+	hakios_haptic_quiesce();       /* the vibration motor stopped, its chip back into reset, if it was let out */
+	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	hakios_adsp_quiesce();         /* nor the audio DSP */
 	hakios_mpss_quiesce();         /* nor the modem */
 	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
-	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
-	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
 	hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
 	hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
 	/*
