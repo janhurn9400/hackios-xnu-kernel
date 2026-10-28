@@ -4256,6 +4256,98 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+/* ---- renoir: the QCA6490 behind the first PCIe controller ------------------------------------------- */
+
+/*
+ * renoir (board=renoir, Mi 11 Lite 5G, SM7350 "shima") has no Wi-Fi DSP: its radio is a QCA6490, a chip
+ * of its own on the first PCIe controller (dt: qcom,pcie@1c00000, qcom,pci-msm; the chip at 0000:01:00.0,
+ * 17cb:1103), whose firmware the chip runs itself once the host has given it over MHI. Nothing of the
+ * steps above applies. What is here so far only looks, with pcie=1 (devices/renoir/WIFI.md):
+ *   - the controller's power domain and clocks in the GCC: the offsets are the SM8350's (Linux's
+ *     gcc-sm8350.c), which renoir's tree confirms where it says any (gcc_pcie_0_gdsc at 0x16b004);
+ *   - the pins: PERST# 94, CLKREQ# 95, WAKE# 96 (dt: perst-gpio, wake-gpio, pcie0 pinctrl), and the
+ *     radio's enables, Wi-Fi 64 and Bluetooth 65 (dt: cnss wlan-en-gpio, qcom,bt-en-gpio);
+ *   - with pcie=2, and only where the GCC says the controller's AHB clock runs: the controller's own
+ *     registers (PARF, the PHY's status, the link's state in the DBI) -- with that clock off a read
+ *     there is a bus error.
+ * Nothing is written.
+ */
+#define RENOIR_GCC_VOTE         0x00152000u     /* GCC_APCS_CLOCK_BRANCH_ENA_VOTE (+0) and _1 (+8) */
+#define RENOIR_GCC_PCIE0        0x0016b000u     /* PCIe 0's block: BCR +0, GDSC +4, the branches */
+#define RENOIR_GCC_PCIE0_PHY    0x0016c000u     /* its PHY's resets */
+#define RENOIR_GCC_CLKREF       0x0018c000u
+#define RENOIR_PCIE_PARF        0x01c00000u
+#define RENOIR_PCIE_PHY         0x01c06000u
+#define RENOIR_PCIE_DBI         0x60000000u
+
+static void
+renoir_branch(vm_offset_t block, uint32_t phys, uint32_t offset, const char *name)
+{
+	uint32_t value = rd(block + offset);
+
+	printf("wifi: pcie: %-26s %#x = %#010x: %s%s\n", name, phys + offset, value,
+	    (value & 1u << 31) ? "OFF" : "running", (value & 1) ? ", enabled here" : "");
+}
+
+static bool
+renoir_pcie_survey(uint32_t how)
+{
+	static const struct {
+		unsigned pin;
+		const char *what;
+	} pins[] = { { 94, "PCIe PERST#" }, { 95, "PCIe CLKREQ#" }, { 96, "PCIe WAKE#" }, { 64, "the radio's Wi-Fi enable" },
+		     { 65, "the radio's Bluetooth enable" } };
+	vm_offset_t vote = ml_io_map(RENOIR_GCC_VOTE, 0x1000), pcie = ml_io_map(RENOIR_GCC_PCIE0, 0x1000);
+	vm_offset_t phy = ml_io_map(RENOIR_GCC_PCIE0_PHY, 0x1000), clkref = ml_io_map(RENOIR_GCC_CLKREF, 0x1000);
+	vm_offset_t pins_base = ml_io_map(0x0f100000, 0x100000);
+	uint32_t gdsc, vote0, vote1, ahb;
+
+	printf("wifi: pcie: renoir's first PCIe controller and the QCA6490 behind it, read only\n");
+	gdsc = rd(pcie + 4);
+	printf("wifi: pcie: power domain gcc_pcie_0_gdsc %#x = %#010x: %s (sw collapse %u)\n", RENOIR_GCC_PCIE0 + 4, gdsc,
+	    (gdsc & 1u << 31) ? "ON" : "off", gdsc & 1);
+	printf("wifi: pcie: resets: controller (BCR) %#x, PHY %#x, link down %#x\n", rd(pcie), rd(phy + 0x1c), rd(phy + 0x14));
+	vote0 = rd(vote);
+	vote1 = rd(vote + 8);
+	printf("wifi: pcie: votes: %#010x %#010x (the controller's branches are bits 0-5 of the second; 12, 22 of the first)\n",
+	    vote0, vote1);
+	renoir_branch(pcie, RENOIR_GCC_PCIE0, 0x10, "slv_q2a_axi");
+	renoir_branch(pcie, RENOIR_GCC_PCIE0, 0x14, "slv_axi");
+	renoir_branch(pcie, RENOIR_GCC_PCIE0, 0x1c, "mstr_axi");
+	renoir_branch(pcie, RENOIR_GCC_PCIE0, 0x24, "cfg_ahb");
+	renoir_branch(pcie, RENOIR_GCC_PCIE0, 0x28, "aux");
+	renoir_branch(pcie, RENOIR_GCC_PCIE0, 0x30, "pipe");
+	renoir_branch(pcie, RENOIR_GCC_PCIE0, 0x38, "phy_rchng");
+	renoir_branch(pcie, RENOIR_GCC_PCIE0, 0x80, "aggre_noc_pcie_0_axi");
+	renoir_branch(clkref, RENOIR_GCC_CLKREF, 0x4, "pcie_0_clkref_en");
+	printf("wifi: pcie: pipe clock mux %#x, aux clock source %#x %#x\n", rd(pcie + 0x54), rd(pcie + 0x58), rd(pcie + 0x5c));
+	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+		uint32_t cfg = rd(pins_base + 0x1000 * pins[i].pin), io = rd(pins_base + 0x1000 * pins[i].pin + 4);
+
+		printf("wifi: pcie: gpio%u (%s): configuration %#x: function %u, pull %u, %u mA, %s; reads %u\n", pins[i].pin,
+		    pins[i].what, cfg, (cfg >> 2) & 15, cfg & 3, (((cfg >> 6) & 7) + 1) * 2, (cfg & 1u << 9) ? (io & 2 ?
+		    "DRIVES HIGH" : "DRIVES LOW") : "an input", io & 1);
+	}
+	ahb = rd(pcie + 0x24);
+	if (how >= 2 && !(gdsc & 1u << 31)) {
+		printf("wifi: pcie: pcie=2, but the power domain is off: the controller is not read\n");
+	} else if (how >= 2 && (ahb & 1u << 31)) {
+		printf("wifi: pcie: pcie=2, but the controller's AHB clock is off: the controller is not read\n");
+	} else if (how >= 2) {
+		vm_offset_t parf = ml_io_map(RENOIR_PCIE_PARF, 0x3000), phys = ml_io_map(RENOIR_PCIE_PHY, 0x2000);
+
+		printf("wifi: pcie: PARF: sys_ctrl %#x, phy_ctrl %#x, ltssm %#x, pm_stts %#x, device type %#x\n", rd(parf),
+		    rd(parf + 0x40), rd(parf + 0x1b0), rd(parf + 0x24), rd(parf + 0x1000));
+		printf("wifi: pcie: PHY: power down %#x, status %#x (bit 6: not ready)\n", rd(phys + 0x240), rd(phys + 0x214));
+		if (!(rd(pcie + 0x1c) & 1u << 31)) {
+			vm_offset_t dbi = ml_io_map(RENOIR_PCIE_DBI, 0x1000);
+
+			printf("wifi: pcie: DBI: id %#x, command %#x, link status %#x\n", rd(dbi), rd(dbi + 4), rd(dbi + 0x80));
+		}
+	}
+	return true;
+}
+
 /*
  * Called while the system starts, before there is a root file system. With wifi_step=N the start
  * waits until the steps are over (see hakios_adreno_init()); with wifi=1 it does not.
@@ -4266,7 +4358,18 @@ hakios_wifi_init(void)
 	uint32_t on = 0, back = 0, done = 0;
 	uint64_t size = 0;
 	thread_t thread;
+	char board[16] = "";
 
+	if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
+		if (PE_parse_boot_argn("pcie", &on, sizeof(on)) && on) {
+			renoir_pcie_survey(on);
+			if (PE_parse_boot_argn("wifi_return", &back, sizeof(back)) && back) {
+				printf("wifi: back to the loader (wifi_return)\n");
+				loader_return();
+			}
+		}
+		return;                         /* nothing else here is renoir's */
+	}
 	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {
 		return;
