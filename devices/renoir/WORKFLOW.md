@@ -10,7 +10,8 @@ Read this first when picking the port up in a new session. Progress: `PORTING.md
   adb/fastboot: `~/Library/Android/sdk/platform-tools` (not on PATH). No Docker, no Linux toolchain.
 - **Parallels VM "Ubuntu 26.04 (with Rosetta)"**, aarch64, headless (no Parallels window needed).
   Start it with `prlctl start "Ubuntu 26.04 (with Rosetta)"`, run commands in it as root with
-  `prlctl exec "Ubuntu 26.04 (with Rosetta)" '<cmd>'` (no SSH key works).
+  `prlctl exec "Ubuntu 26.04 (with Rosetta)" '<cmd>'` (no SSH key works); better `devices/renoir/vmx.sh '<cmd>'`,
+  which retries when Parallels does not open the session (it fails now and then even when idle).
   - only **one** exec session at a time: a second one fails with "Unable to open new session" /
     "Invalid argument"; run long builds as a background job on the Mac and do not poke the VM meanwhile.
   - the Mac's home is `/media/psf/Home` in the VM: copy results to
