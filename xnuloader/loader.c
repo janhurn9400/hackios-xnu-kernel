@@ -299,12 +299,26 @@ static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
 static const char *staged_data = out_buf;   /* what "upload" sends: normally the log in out_buf */
 static uint64_t staged_len;
 
+/* the last part of the kernel log of a run that ended in a reset (crash_log_take) */
+#define CRASH_LOG_TEXT     0x40000u
+static char previous_klog[CRASH_LOG_TEXT];
+static uint64_t previous_klog_len, previous_klog_total;
+
 static void
 compose_logs(const char *klog, uint64_t klog_len)
 {
-	static const char sep[] = "\n== KERNEL LOG ==\n", end[] = "\n== END OF LOG ==\n";
+	static const char kernel_sep[] = "\n== KERNEL LOG ==\n", end[] = "\n== END OF LOG ==\n";
+	static const char previous_sep[] = "\n== KERNEL LOG OF THE PREVIOUS RUN (the phone reset during it; its last part) ==\n";
+	const char *sep = kernel_sep;
+	uint64_t sep_len = sizeof(kernel_sep) - 1;
 	uint64_t n = log_len;
 
+	if (klog == NULL && previous_klog_len != 0) {
+		klog = previous_klog;
+		klog_len = previous_klog_len;
+		sep = previous_sep;
+		sep_len = sizeof(previous_sep) - 1;
+	}
 	staged_data = out_buf;
 	memset(out_buf, 0, sizeof(out_buf));
 	memcpy(out_buf, log_buf, log_len);
@@ -312,8 +326,8 @@ compose_logs(const char *klog, uint64_t klog_len)
 		if (klog_len > sizeof(out_buf) - n - 8192) {
 			klog_len = sizeof(out_buf) - n - 8192;
 		}
-		memcpy(out_buf + n, sep, sizeof(sep) - 1);
-		n += sizeof(sep) - 1;
+		memcpy(out_buf + n, sep, sep_len);
+		n += sep_len;
 		memcpy(out_buf + n, klog, klog_len);
 		n += klog_len;
 		memcpy(out_buf + n, end, sizeof(end) - 1);
@@ -930,6 +944,122 @@ static const char *sound_data;
 static uint64_t sound_len;
 #define KERNEL_LIVE_MAGIC2      0x324556494c554e58ULL
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
+
+/*
+ * The kernel's log, copied while it runs into memory the UEFI map reserves (above the panic log,
+ * below the payload's last page) and written through to DDR. A run that ends in a reset of the
+ * phone is often over faster than anything else can say what happened (on renoir the audio DSP's
+ * start: within a second); DDR keeps its contents across the reset, and the next start of this
+ * loader takes the copy over (crash_log_take) for "oem log". A run that comes back clears it.
+ */
+#define CRASH_LOG_BASE          (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x80000ULL)
+#define CRASH_LOG_MAGIC         0x4853415243554e58ULL   /* "XNUCRASH" */
+
+struct crash_log {
+	uint64_t magic;
+	uint64_t len;           /* bytes in text */
+	uint64_t total;         /* bytes the kernel had logged in all */
+	uint64_t at;            /* CNTVCT_EL0 of the copy */
+	char text[CRASH_LOG_TEXT];
+};
+
+static uint64_t crash_log_seen_len, crash_log_seen_ring_at, crash_log_last;
+
+/* Copy logical bytes [from, to) of the kernel's log (the start of the boot, then the ring in order). */
+static void
+crash_log_copy(char *out, const char *log, const struct kernel_live *live, uint32_t ring_at, int wrapped,
+    uint64_t from, uint64_t to)
+{
+	uint64_t head = live->log_head, ring = live->log_ring;
+
+	if (!wrapped || ring_at >= ring) {
+		memcpy(out, log + from, to - from);
+		return;
+	}
+	for (uint64_t i = from; i < to;) {
+		uint64_t phys, n;
+
+		if (i < head) {
+			phys = i;
+			n = (to < head ? to : head) - i;
+		} else {
+			uint64_t j = (ring_at + (i - head)) % ring;
+
+			phys = head + j;
+			n = ring - j;
+			if (n > to - i) {
+				n = to - i;
+			}
+		}
+		memcpy(out, log + phys, n);
+		out += n;
+		i += n;
+	}
+}
+
+static void
+crash_log_update(const struct kernel_live *live, uint64_t slide)
+{
+	struct crash_log *c = (struct crash_log *)CRASH_LOG_BASE;
+	const char *log = (const char *)(live->log + slide);
+	uint64_t now = READ_SYSREG(CNTVCT_EL0), total, from;
+	uint32_t len, ring_at;
+	int wrapped;
+
+	if (now - crash_log_last < READ_SYSREG(CNTFRQ_EL0) / 500) {
+		return;
+	}
+	crash_log_last = now;
+	flush_dcache(live->log_len + slide, live->log_len + slide + 4);
+	len = *(volatile uint32_t *)(live->log_len + slide);
+	ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
+	wrapped = *(volatile uint8_t *)(live->log_wrapped + slide);
+	if (len == crash_log_seen_len && ring_at == crash_log_seen_ring_at) {
+		return;
+	}
+	crash_log_seen_len = len;
+	crash_log_seen_ring_at = ring_at;
+	total = wrapped ? live->log_head + live->log_ring : len;
+	if (total > live->log_head + live->log_ring) {
+		return;
+	}
+	from = total > CRASH_LOG_TEXT ? total - CRASH_LOG_TEXT : 0;
+	c->magic = 0;
+	crash_log_copy(c->text, log, live, ring_at, wrapped, from, total);
+	c->len = total - from;
+	c->total = total;
+	c->at = now;
+	c->magic = CRASH_LOG_MAGIC;
+	clean_dcache(CRASH_LOG_BASE, CRASH_LOG_BASE + 32 + c->len);
+}
+
+static void
+crash_log_clear(void)
+{
+	struct crash_log *c = (struct crash_log *)CRASH_LOG_BASE;
+
+	c->magic = 0;
+	clean_dcache(CRASH_LOG_BASE, CRASH_LOG_BASE + 64);
+	crash_log_seen_len = crash_log_seen_ring_at = ~0ULL;
+	crash_log_last = 0;
+}
+
+/* At the loader's start: the copy a run left behind when the phone reset during it. */
+static void
+crash_log_take(void)
+{
+	struct crash_log *c = (struct crash_log *)CRASH_LOG_BASE;
+
+	flush_dcache(CRASH_LOG_BASE, CRASH_LOG_BASE + 64);
+	if (c->magic != CRASH_LOG_MAGIC || c->len > CRASH_LOG_TEXT) {
+		return;
+	}
+	flush_dcache(CRASH_LOG_BASE, CRASH_LOG_BASE + 32 + c->len);
+	memcpy(previous_klog, c->text, c->len);
+	previous_klog_len = c->len;
+	previous_klog_total = c->total;
+	crash_log_clear();
+}
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
 #define START_SECONDS           5
@@ -2334,6 +2464,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			last_battery = READ_SYSREG(CNTVCT_EL0);
 		}
 		if (arrived && live != NULL) {
+			crash_log_update(live, slide);
 			if (live->heartbeat != last_beat) {
 				last_beat = live->heartbeat;
 				last_beat_at = READ_SYSREG(CNTVCT_EL0);
@@ -2363,6 +2494,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		}
 	}
 	running_live = NULL;
+	crash_log_clear();              /* the run is back (or hung, and its log taken): nothing to keep */
 
 	if (watching_only) {
 		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
@@ -3917,7 +4049,12 @@ efi_main(efi_handle image, efi_system_table *st)
 	IMAGE = image;
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+	crash_log_take();
 	print("== XNULOADER v3 ==\n");
+	if (previous_klog_len != 0) {
+		print("the previous run ended in a reset: the last %d of its %d bytes of kernel log are kept (oem log)\n",
+		    previous_klog_len, previous_klog_total);
+	}
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
