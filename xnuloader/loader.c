@@ -335,6 +335,31 @@ find_log_partition(void)
 }
 
 /*
+ * At the start, before this start writes its own: what the log partition holds. A run that resets
+ * the phone leaves there the notes the loader wrote while it ran (once a second in its first
+ * seconds), and unlike RAM that survives Android starting in between.
+ */
+static void
+disk_log_take(void)
+{
+	efi_block_io *bio = find_log_partition();
+	uint64_t bs, len;
+
+	if (bio == NULL || bio->media->block_size == 0) {
+		return;
+	}
+	bs = bio->media->block_size;
+	len = DISK_LOG_MAX / bs * bs;
+	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, len, previous_disk_log)) ||
+	    memcmp(previous_disk_log, "== XNULOADER", 12) != 0) {
+		previous_disk_len = 0;
+		return;
+	}
+	for (previous_disk_len = 0; previous_disk_len < len && previous_disk_log[previous_disk_len] != 0; previous_disk_len++) {
+	}
+}
+
+/*
  * The "staged" buffer holds the loader log followed by the kernel log of the
  * last run. It is what gets written to the log partition and what the host
  * fetches over USB (fastboot get_staged).
@@ -353,6 +378,10 @@ static uint64_t previous_klog_len, previous_klog_total;
 /* ... and this loader's own log of that start (llog_take) */
 static char previous_llog[LLOG_RING_SIZE];
 static uint64_t previous_llog_len, previous_llog_total;
+/* ... and what the log partition held when this start began (disk_log_take): it survives Android */
+#define DISK_LOG_MAX       0x40000u
+static char previous_disk_log[DISK_LOG_MAX];
+static uint64_t previous_disk_len;
 
 /* At the loader's start: the mirror of the previous start's log, then the mirror starts over. */
 static void
@@ -405,6 +434,14 @@ compose_logs(const char *klog, uint64_t klog_len)
 		n += sizeof(lsep) - 1;
 		memcpy(out_buf + n, previous_llog, previous_llog_len);
 		n += previous_llog_len;
+	}
+	if ((klog == previous_klog || klog == NULL) && previous_disk_len != 0) {
+		static const char dsep[] = "\n== THE LOG PARTITION AS THIS START FOUND IT (a previous start's notes) ==\n";
+
+		memcpy(out_buf + n, dsep, sizeof(dsep) - 1);
+		n += sizeof(dsep) - 1;
+		memcpy(out_buf + n, previous_disk_log, previous_disk_len);
+		n += previous_disk_len;
 	}
 	if (klog != NULL) {
 		if (klog_len > sizeof(out_buf) - n - 8192) {
@@ -2498,7 +2535,7 @@ note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t se
 	if (len > live->log_head + live->log_ring) {
 		len = 0;
 	}
-	from = len > 240 ? len - 240 : 0;
+	from = len > 1200 ? len - 1200 : 0;    /* (enough to see what a run that resets was doing; log_buf is 32 KB) */
 	flush_dcache((uint64_t)(uintptr_t)log + from, (uint64_t)(uintptr_t)log + len);
 	print("%d s: the kernel has logged %d bytes, heartbeat %d; the last of it:\n", seconds, (uint64_t)len, live->heartbeat);
 	for (uint32_t i = from; i < len; i++) {
@@ -2576,7 +2613,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		 * what the kernel is seen to do goes there as it happens. That needs UEFI's services,
 		 * so until NOTE_SECONDS are over this core keeps its interrupts.
 		 */
-		if (!watching_only && seconds_since(started) >= noted + 2) {
+		if (!watching_only && seconds_since(started) >= noted + 1) {
 			noted = seconds_since(started);
 			if (PLAT->log_other_cpu) {
 				if (!arrived) {
@@ -4257,10 +4294,14 @@ efi_main(efi_handle image, efi_system_table *st)
 	BS->set_watchdog_timer(0, 0, 0, NULL);
 	llog_take();                    /* first: from here on this start's lines go into the mirror */
 	crash_log_take();
+	disk_log_take();                /* before this start's first write to the log partition */
 	print("== XNULOADER v3 ==\n");
 	if (previous_llog_len != 0) {
 		print("the previous start's own log is kept: the last %d of its %d bytes (oem log)\n", previous_llog_len,
 		    previous_llog_total);
+	}
+	if (previous_disk_len != 0) {
+		print("the log partition held %d bytes of a previous start's log (oem log)\n", previous_disk_len);
 	}
 	if (previous_klog_len != 0) {
 		print("the previous run ended in a reset: the last %d of its %d bytes of kernel log are kept (oem log)\n",
