@@ -1465,6 +1465,12 @@ dsp_shutdown(const char *why)
 	uint64_t answer = ~0ull;
 	int32_t result;
 
+	/* adsp_never_stop=1: the DSP is left as it is, also on the way back to the loader (is it the stop?) */
+	if (option("adsp_never_stop")) {
+		printf("adsp: %u: %s: adsp_never_stop: the audio DSP is NOT asked to stop and NOT shut down\n", step, why);
+		dsp_started = false;
+		return true;
+	}
 	printf("adsp: %u: %s: the audio DSP is asked to stop, then TrustZone to shut it down\n", step, why);
 	if (!leaving) {
 		link_stop();
