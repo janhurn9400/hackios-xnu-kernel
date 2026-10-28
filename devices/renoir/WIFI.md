@@ -28,7 +28,13 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
 ## Plan
 
 1. **Survey, read only** (`board=renoir pcie=1`, `pcie=2` also reads the controller if its AHB clock runs):
-   is anything of PCIe 0 on after UEFI? Kernel `hakios.wifi.c` `renoir_pcie_survey()`. <- now
+   is anything of PCIe 0 on after UEFI? Kernel `hakios.wifi.c` `renoir_pcie_survey()`.
+   **Done (22:55, `logs/*-renoir-open.log`): everything is off, and the GCC reads fine from our kernel.**
+   GDSC 0x0022f001 (off, sw collapse set); BCRs 0; votes 0x152000 = 0x00e0057f, 0x152008 = 0x083c8000 (no
+   PCIe bit); every PCIe 0 branch reads CLK_OFF (0x8000xxxx) except phy_rchng 0x16b038 = 0 (perhaps not
+   that register on shima) and clkref 0x18c004 = 1 (on); pipe mux 2, aux RCG 0x80000000 (root off).
+   Pins: PERST# 94 input pulled down, CLKREQ# 95 and WAKE# 96 inputs reading 1, Wi-Fi enable 64 and BT
+   enable 65 inputs pulled down (the radio is off). So step 2 starts from cold.
 2. **Link up**: supplies on (RPMh, as `hakios.goodix.c`/`hakios.adsp.c` vote), gpio64 high, GDSC on,
    clocks voted, PHY sequence, PERST# released, LTSSM enable (PARF), wait for link; read config space of
    0000:01:00.0: expect 17cb:1103. Risk: the hypervisor may keep GCC/PCIe for itself (the WPSS clocks on
