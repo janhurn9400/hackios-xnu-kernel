@@ -3542,8 +3542,10 @@ static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };
 #define SMMU_IDR1               0x024           /* bit 31: 64K pages, [30:28] log2(pages)-1, [7:0] translation contexts */
 #define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
 #define SMMU_S2CR(n)            (0xc00 + 4 * (n))       /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
-#define RADIO_STREAM            0x1c00
-#define RADIO_STREAM_MASK       0x0001
+/* redwood's radio; renoir's (board=renoir) is PCIe 0's, 0x2400 the root port and 0x2401 the QCA6490 (dt iommu-map) */
+static uint32_t radio_stream = 0x1c00, radio_stream_mask = 0x0001;
+#define RADIO_STREAM            radio_stream
+#define RADIO_STREAM_MASK       radio_stream_mask
 
 static void
 smmu_look(void)
@@ -4554,6 +4556,7 @@ renoir_pcie_down(unsigned level)
 	 * The supplies stay voted on: several are shared (the 1.8 V of smpb10 with much of the phone), and a
 	 * vote of ours replaces what this processor voted before, the boot chain's included.
 	 */
+	radio_space_off();                      /* the SMMU as found, if renoir_bhi() took a context */
 	printf("wifi: pcie: down: power domain %#x, votes %#x %#x\n", rd(renoir_gcc_pcie + 4), rd(renoir_gcc_vote),
 	    rd(renoir_gcc_vote + 8));
 }
@@ -4595,6 +4598,7 @@ renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
 	const uint8_t *image = image_file("amss20.bin", &size);
 	vm_offset_t copy = 0;
 	uint32_t length, status = 0, ee = 0;
+	unsigned long long seen = 0;
 
 	if (image == NULL) {
 		return;
@@ -4613,10 +4617,33 @@ renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
 	physical = kvtophys(copy);
 	printf("wifi: pcie: 7: amss20.bin is %llu bytes; its first %u at physical %#llx; EE %u, BHI status %#x\n", size, length,
 	    physical, rd(bhi + BHI_EXECENV), rd(bhi + BHI_STATUS));
-	printf("wifi: pcie: 7: BHI: the image's address and size, session 0x1234 to the doorbell\n");
+	/*
+	 * The chip reads it through the SMMU as stream 0x2401, which the boot chain leaves to fault: without a
+	 * context the first try reset the phone a second after the doorbell. hakios_wifi_radio_map() takes a
+	 * free match register and context with page tables of ours (as for redwood's radio, wifi_smmu=2).
+	 */
+	need(&apps_smmu);
+	for (uint32_t n = 0; n < (rd(apps_smmu.base + SMMU_IDR0) & 0xff); n++) {
+		uint32_t smr = rd(apps_smmu.base + SMMU_SMR(n));
+
+		if (smr >> 31 && (((smr & 0x7fff) ^ 0x2400) & ~((smr >> 16 & 0x7fff) | 1)) == 0) {
+			printf("wifi: pcie: 7: match register %u (%#x) already covers PCIe 0's streams: not adding one\n", n, smr);
+			return;
+		}
+	}
+	radio_stream = 0x2400;
+	radio_stream_mask = 1;
+	radio_space.wanted = 2;
+	pause_ms = 0;
+	if (!hakios_wifi_radio_map(physical, RENOIR_SBL_SIZE, &seen)) {
+		printf("wifi: pcie: 7: the SMMU does not give the chip a view of the image\n");
+		return;
+	}
+	printf("wifi: pcie: 7: the chip sees the image at %#llx; BHI: its address and size, session 0x1234 to the doorbell\n",
+	    seen);
 	wr(bhi + BHI_STATUS, 0);
-	wr(bhi + BHI_IMGADDR_HIGH, (uint32_t)(physical >> 32));
-	wr(bhi + BHI_IMGADDR_LOW, (uint32_t)physical);
+	wr(bhi + BHI_IMGADDR_HIGH, (uint32_t)(seen >> 32));
+	wr(bhi + BHI_IMGADDR_LOW, (uint32_t)seen);
 	wr(bhi + BHI_IMGSIZE, length);
 	wr(bhi + BHI_IMGTXDB, 0x1234);
 	for (int ms = 0; ms < 5000; ms += 10) {
@@ -4643,6 +4670,7 @@ renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
 		}
 		sleep_ms(100);
 	}
+	radio_space_faults();
 	/* (the chip is powered down with everything else; the copy is not freed: it might still be read) */
 }
 
