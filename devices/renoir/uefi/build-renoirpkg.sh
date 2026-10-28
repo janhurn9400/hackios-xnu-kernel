@@ -49,7 +49,13 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r pip-requirements.txt
 
-# ---- 4. mono/nasm-Umgehung (aus redwoods uefi/README) ---------------------------------------
+# ---- 4. stuart setup: holt die Submodule (Mu_Basecore usw.) ---------------------------------
+# Muss VOR der nasm-Umgehung laufen: die legt Dateien in Mu_Basecore/ an, und ein nicht-leerer
+# Ordner lässt das Submodul-Klonen scheitern ("already exists and is not an empty directory").
+DB="Platforms/Xiaomi/renoirPkg/DeviceBuild.py"
+echo ">>> stuart setup…";  python3 "$DB" --setup
+
+# ---- 5. mono/nasm-Umgehung (aus redwoods uefi/README) ---------------------------------------
 # mu_nasm kommt über NuGet und will Mono; ohne/bei Problemen auf System-nasm zeigen.
 NASM_BIN="$(command -v nasm || true)"
 NDISASM_BIN="$(command -v ndisasm || true)"
@@ -62,9 +68,7 @@ if [ -n "$NASM_BIN" ]; then
   echo ">>> nasm-Umgehung gesetzt ($NASM_BIN)"
 fi
 
-# ---- 5. renoirPkg: setup -> update -> build -------------------------------------------------
-DB="Platforms/Xiaomi/renoirPkg/DeviceBuild.py"
-echo ">>> stuart setup…";  python3 "$DB" --setup
+# ---- 6. renoirPkg: update -> build ----------------------------------------------------------
 echo ">>> stuart update…"; python3 "$DB" --update
 echo ">>> build RELEASE…"; python3 "$DB" -t RELEASE
 
