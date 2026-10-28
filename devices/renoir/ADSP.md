@@ -145,4 +145,18 @@ USB driver (`usb_rx` -> `USB->send`, before `usb_wait`'s first sign of life) -- 
 reset. To check: a line before that send; then either keep the loader off USB after a run with the DSP
 (take the logs from RAM/logdump) or re-init USB. For iOS sessions this only hits at the end of a run.
 
+## The cause: not a crash -- the loader's USB loop starves the watchdog (session 3, 18:33)
+
+With a line before each USB receive after a run, the loader's kept log showed it **alive for the
+whole 10 s window**, printing `usb: a receive is about to be queued (connected 1)` over and over (47 MB
+of log). No USB state change was reported during the run. So: once started, the ADSP takes the USB-C
+port over (the Mac loses the loader 3-5 s later), every USB transfer fails from then on, and the
+loader's `usb_rx` retried at once forever without reaching `usb_wait`, the only place that feeds the
+hypervisor's virtual watchdog (`WDT_BITE_MS` 30 s): **the "reset" was that watchdog**, ~30 s after the
+run. **The ADSP does not crash the phone.**
+
+Fix (`813328a`): a failed receive feeds the watchdog and restarts the USB controller (`stop`,
+`start_ex`), at most every 2 s. Open: whether USB comes back to the Mac while/after the DSP ran (the
+DSP may keep the port), and for real sessions the DSP running with iOS (`adsp=1`).
+
 - Speaker amplifiers, for the sound later: two NXP TFA98xx at 0x34/0x35 (MagicOS dmesg).
