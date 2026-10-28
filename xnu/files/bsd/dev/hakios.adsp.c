@@ -1470,6 +1470,18 @@ dsp_shutdown(const char *why)
 		link_stop();
 	}
 	stopped_by_its_word = dsp_ask_to_stop(leaving ? 2000 : 5000);
+	/*
+	 * renoir resets within milliseconds of this sequence's end (the loader's crash log: after the
+	 * kernel is back and has written its logs, before anything else). To find which part does it:
+	 * adsp_no_shutdown=1 leaves TrustZone's shutdown (and the always-on processor's "off") out,
+	 * adsp_no_aop_off=1 only the "off".
+	 */
+	if (option("adsp_no_shutdown")) {
+		printf("adsp: %u: adsp_no_shutdown: the audio DSP is NOT shut down by TrustZone (it stopped: %s)\n", step,
+		    stopped_by_its_word ? "yes" : "no");
+		dsp_started = false;
+		return true;
+	}
 	result = scm("to shut the audio DSP down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_ADSP, 0, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("adsp: %u: TRUSTZONE DOES NOT SHUT THE AUDIO DSP DOWN: the call returns %d, its answer is %#llx\n", step, result,
@@ -1481,7 +1493,11 @@ dsp_shutdown(const char *why)
 	wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
 	doorbells();
 	dsp_started = false;
-	mailbox_send("{class: image, res: load_state, name: adsp, val: off}");
+	if (option("adsp_no_aop_off")) {
+		printf("adsp: %u: adsp_no_aop_off: the always-on processor is NOT told \"adsp: off\"\n", step);
+	} else {
+		mailbox_send("{class: image, res: load_state, name: adsp, val: off}");
+	}
 	if (rails_asked) {
 		rails(0);
 		rails_asked = false;
