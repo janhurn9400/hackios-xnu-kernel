@@ -73,6 +73,19 @@ differ only in 0x26/0x27 (which slot/channel each takes). Profile `stereo`: 0x02
 (power down); `calibrate.cal` with four files (MG3_01 messages). Still needed: NXP's TFA2 start order
 (power-up, clocks/PLL wait, patch, profile, unmute) from its Linux driver.
 
+## The start sequence: Goodix's (formerly NXP's) driver
+
+Source: **github.com/Goodix-vas/tfa98xx** (current, 2026-09; `src/tfa_init.c`, `src/tfa_dsp.c`,
+`src/tfa_container.c`, `inc/tfa9873_tfafieldnames_B0.h` for the field names). For our revision
+**0x0b73**, `tfa9873_specific()` (tfa_init.c ~751) is the chip's init: unlock (0x0f = 0x5a6b, then
+0xa0 = reg 0xfb ^ 0x005a, key 2), then `0x02=0x0628 0x61=0x0183 0x63=0x005a 0x6f=0x0082 0x70=0xa3eb
+0x71=0x107e 0x73=0x0187 0x83=0x071c 0x85=0x0380 0xd5=0x004d`, the error interrupts, FSSYNCEN = 0.
+`tfa_dev_start()` (tfa_dsp.c ~3435): `tfaRunSpeakerBoost` (cold start: power up, wait for the clocks
+-- needs the MI2S bit clock running --, the init above, the container's device bitfields and patch,
+the profile), then oscillator on, `tfa_dev_set_state(OPERATING | MUTE)`, the profile and filters,
+unmute. `tfa_dev_stop()`: mute, powerdown. Still to read in detail: `tfaRunSpeakerBoost`,
+`tfaRunStartup`, `tfa_dev_set_state` for TFA2 (which fields: PWDN, MANSCONF, MANCOLD, AMPE, ...).
+
 ## What the port needs, in order
 
 1. From renoir in MagicOS (adb; `su` if Magisk works): `/vendor/etc/mixer_paths*.xml` (the speaker
