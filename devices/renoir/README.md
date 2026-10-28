@@ -21,19 +21,20 @@ What is reasonably known vs. what you must read off renoir's device tree / `/ven
 
 | Subsystem | redwood (reference) | renoir | Action |
 |---|---|---|---|
-| GPU | Adreno 642L, `a660_*` firmware | **Adreno 642** | Nearly identical; confirm firmware names via `pull-firmware.sh` glob |
-| Display | DSI panel, per-device brightness table | punch-hole AMOLED, 90 Hz | Reuse One UI ROM's known panel/brightness facts; new `hakios_display` numbers |
-| Touch | Goodix | **confirm** (Focaltech/Novatek/Goodix) | Read touch node from renoir DT; adapt `hakios_touch` |
-| Storage | UFS | UFS | Same path, confirm controller reg |
-| Wi-Fi | WCN6750 | **confirm** (likely WCN6750-class) | `pull-firmware.sh` wpss.*; `hakios_wifi` |
-| Audio DSP | ADSP (adsp.*) | ADSP | Pull `adsp.*`; battery/charging ride through it |
-| Haptics | Awinic aw8697 | **confirm** | Pull `*haptic*`; adapt `hakios_haptic` |
-| Modem | MPSS, IPA 4.11 | **confirm IPA version** | `pull-soc.sh` + `cellular_probe.py`; cellular unfinished upstream anyway |
-| Cameras | QTI sensormodule | **confirm** | Pull camera tuning bins |
+| GPU | Adreno 642L, `a660_*` firmware | **Adreno 642, `a660_*` firmware ✓** | **Identical firmware names** (`a660_gmu.bin`, `a660_sqe.fw`, `a660_zap.{mdt,b00..b02,elf}`) — `hakios.adreno.c` firmware refs need no change |
+| Display | DSI panel, per-device brightness table | punch-hole AMOLED, 1080×2400, 90 Hz | Picture comes from UEFI framebuffer (GOP); brightness/refresh facts in One UI repo (see `DRIVERS.md`) |
+| Touch | Goodix GT9916 (Berlin-D) / FocalTech FT3680 | **Goodix GT9897 (Berlin) ✓** | **Goodix path applies** — same Berlin family as redwood; FocalTech branch not needed. Confirm SPI engine/GPIOs/regulator from renoir DT |
+| Storage | UFS | UFS | Same path, confirm controller reg from DT |
+| Wi-Fi | WCN6750 | likely WCN6750-class | Not in LineageOS blob list; `pull-firmware.sh` wpss.* on-device; `hakios.wifi.c` |
+| Audio DSP | ADSP (adsp.*) | ADSP ✓ | Pull `adsp.*`; battery/charging ride through it |
+| Haptics | Awinic aw8697 | **Awinic-class RTP ✓** | Effects as `N_click_P_RTP.bin` → `effect_N.bin`; adapt `hakios.haptic.c` to renoir's chip |
+| Modem | MPSS, IPA 4.11 | confirm IPA version | `pull-soc.sh` + `cellular_probe.py`; cellular unfinished upstream anyway |
+| Cameras | QTI sensormodule | QTI sensormodule | Pull camera tuning bins on-device |
 
-> Don't fabricate these — read them from renoir's device tree (`pull-soc.sh` grabs
-> `/sys/firmware/fdt`) and from `/vendor/firmware` on renoir's MIUI. Your One UI ROM repo already
-> documents much of renoir's hardware (panel, FPC fingerprint, haptics click effects) — reuse it.
+> ✓ = confirmed from public sources: LineageOS `android_device_xiaomi_renoir` (lineage-21)
+> `proprietary-files.txt`. The remaining items read from renoir's device tree (`pull-soc.sh` grabs
+> `/sys/firmware/fdt`) and `/vendor/firmware` on renoir's MIUI. The One UI ROM repo also documents
+> renoir's panel/brightness/haptics — reuse it.
 
 ## Firmware
 

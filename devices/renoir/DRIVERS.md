@@ -37,19 +37,18 @@ für Helligkeit/Refresh-Feintuning auf der HakiOS-Seite. Gut, dass sie schon dok
 
 ## renoir-spezifische XNU-Treiber — Reihenfolge & was zu tun ist
 
-### 1. Touch — `hakios.goodix.c` (❗ größte Unbekannte)
+### 1. Touch — `hakios.goodix.c` (✓ Chip bekannt: Goodix GT9897)
 redwood fährt **Goodix GT9916 ODER FocalTech FT3680** auf dem **SPI-Serial-Engine 13** der SoC,
 macht Power/Clocks/Pins/SPI komplett selbst (kein Framework im Kernel), Boot-Arg `touchscreen=1`,
 Polling 125×/s (`touch_poll_us=N`). Panel-Discriminator bei redwood: `GPIO96=1 & GPIO68=0` →
 FocalTech, sonst Goodix.
 
-**renoir:** Touch-Controller ist im One-UI-Repo **nicht** dokumentiert → **aus renoirs DT lesen**
-(`cellular_probe.py`-Ansatz / den Touch-Node im `/sys/firmware/fdt` suchen: Goodix/FocalTech/
-Novatek?). Danach in einer renoir-Variante des Treibers: Serial-Engine-Nummer, GPIOs (Reset/IRQ/
-Supply), Regulator (bei redwood LDO2 des PM8350C über RPMh) an renoirs Werte anpassen. redwood
-nennt als Register-Quellen die Vendor-Linux-Treiber (`spi-geni-qcom`, `qcom-geni-se`, `rpmh-rsc`,
-`cmd-db`, `gcc-sc7280`, `pinctrl-sc7280`, `goodix_berlin_*`, `focaltech_core`) + das DT — für renoir
-die SM7350-Pendants.
+**renoir: Goodix GT9897** (bestätigt aus LineageOS-Blobs: `goodix_gt9897t_fw_k9.bin` /
+`goodix_gt9897t_cfg_k9.bin`) — also **Goodix Berlin**, dieselbe Familie wie redwoods GT9916. Das
+heißt: **redwoods Goodix-Pfad greift, der FocalTech-Zweig entfällt.** Zu ermitteln bleibt nur das
+Drumherum aus renoirs DT: Serial-Engine-Nummer, GPIOs (Reset/IRQ/Supply), Regulator (bei redwood
+LDO2 des PM8350C über RPMh). Register-Quellen wie bei redwood (`spi-geni-qcom`, `qcom-geni-se`,
+`rpmh-rsc`, `cmd-db`, `gcc-*`, `pinctrl-*`, `goodix_berlin_*`) + renoirs DT.
 
 ### 2. Storage — `hakios.ufs.c` / `hakios.ufshc.c`
 UFS-Host-Controller; Registerbasis aus renoirs DT. Weg wie redwood, nur Adresse tauschen. Ohne UFS
@@ -59,9 +58,10 @@ mountet der iOS-Userspace nicht → kein Lock/Home-Screen.
 **Adreno 642 (renoir) ≈ Adreno 642L (redwood)** — gleiche a6xx-Familie, selbes SoC-Paket. Das ist
 **Anpassung, kein Bring-up von null**. Der Treiber geht in ~18 nachvollziehbaren Schritten hoch
 (`adreno=N` hält nach N an, liest vor dem Schreiben, bricht ab statt blind weiterzumachen —
-gebaut fürs Arbeiten unter Qualcomms Hypervisor). renoir-spezifisch: GPU-/GMU-/SMMU-Adressen und
-die Firmware-Namen (redwood: `fw/a660_{gmu.bin,sqe.fw,zap.mdt}` — renoirs echte Namen via
-`pull-firmware.sh`-Glob). TrustZone-Signaturprüfung des „zap shader" wie bei redwood.
+gebaut fürs Arbeiten unter Qualcomms Hypervisor). renoir-spezifisch sind nur die
+GPU-/GMU-/SMMU-Adressen aus renoirs DT — die **Firmware-Namen sind identisch** zu redwood
+(bestätigt: `a660_gmu.bin`, `a660_sqe.fw`, `a660_zap.{mdt,b00..b02,elf}`), im Treiber also nichts
+zu ändern. TrustZone-Signaturprüfung des „zap shader" wie bei redwood.
 
 ### 4. Danach (Tier A, wie redwood)
 WLAN (`hakios.wifi.c` + Linux-`ath11k`-Shim `hakios.lx.c`, Firmware `fw-wifi/` + `mac`/`network`),
@@ -80,8 +80,8 @@ Audio/Mic (`hakios.adsp.c`/`hakios.sound.c`/`hakios.mic.c`), Kameras, Haptik.
 | Treiber | renoir-Input | Woher |
 |---|---|---|
 | (Framebuffer) | Auflösung/Stride | UEFI GOP (automatisch) |
-| `hakios.goodix.c` | Touch-Chip, SPI-Engine, GPIOs, Regulator | **renoirs DT** (noch zu ermitteln) |
+| `hakios.goodix.c` | Chip = Goodix GT9897 ✓; SPI-Engine/GPIOs/Regulator | renoirs DT (nur noch Drumherum) |
 | `hakios.ufshc.c` | UFS-Controller-Reg | renoirs DT |
-| `hakios.adreno.c` | GPU/GMU/SMMU-Adressen, Firmware-Namen | renoirs DT + `pull-firmware.sh` |
+| `hakios.adreno.c` | GPU/GMU/SMMU-Adressen (FW-Namen = a660, identisch ✓) | renoirs DT |
 | Helligkeit/Refresh | max 2047, 90 Hz, HWC-Float | One-UI-Repo (siehe Tabelle oben) |
 | `hakios.wifi.c` | WLAN-Chip, Firmware | `pull-firmware.sh` (`fw-wifi/`) |
