@@ -28,7 +28,7 @@
   **`pcie=9`** (00:20-00:35): **our MHI reaches M0 and starts the IPCR channels 20/21** (commands complete
   with success); the QRTR hello sent on 20 is not taken yet, while the LOOPBACK channels 0/1 echo our data
   (`pcie_ch=0`): MHI works, the WLAN firmware's IPCR client does not come up (`WIFI.md` step 6 "Open").
-  Test runs: `scratchpad wrun.sh`-style loop (stage, `oem run`, wait ~110 s, `fastboot reboot-bootloader`,
+  Test runs: `devices/renoir/wifi-run.sh NAME 110 pcie=9 pcie_pause=0` (stage `oem run`, wait, `fastboot reboot-bootloader`,
   crashlog loader, `oem log`). Runs now end with `fastboot reboot-bootloader` from the loader (the reboot reason stays set by
   default: every restart after a run lands in fastboot), then the crashlog loader and `oem log`. Do not use the default `pcie_pause` with `pcie=6` (a long pause hung a config
   write).
