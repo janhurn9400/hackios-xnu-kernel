@@ -934,9 +934,317 @@ serve(void)
 	    HAPTIC_MAX_MS);
 }
 
+/* ==================================================================================================== */
+/*
+ * renoir (board=renoir): not an Awinic chip on I2C but the PMIC's own haptics -- the PM8350B's
+ * "hv-haptics" (SPMI slave 3: the configuration block at 0xf000, the pattern block at 0xf100, the
+ * power block at 0xf200), Linux's drivers/input/misc/qcom-hv-haptics.c. renoir's device tree:
+ * qcom,vmax-mv 2450, qcom,lra-period-us 4808 (~208 Hz), f0 0xc3..0xd2, brake on. See
+ * devices/renoir/WIFI-BT-HAPTICS.md.
+ *
+ * Through the same PMIC arbiter as the torch (hakios.torch.c: its registers, renoir's are the same:
+ * core 0xc440000, cnfg 0xc40a000, observer 0xe600000, channels 0xc600000), one transfer at a time
+ * with the buttons' driver. Every write is to a register of a short list only, and read back; any
+ * surprise stops the motor and all writing for the run.
+ *
+ *   haptic=1  reading only: the arbiter's channels for the three blocks (and whether they are ours
+ *             to write), the blocks' registers as the phone left them
+ *   haptic=4  ... and one pulse in "direct play": faults cleared, the module on, VMAX and the open-loop
+ *             LRA period from the device tree, the amplitude haptic_amp (default 0x80 of 0xff), played
+ *             haptic_ms (default 150, at most 500), stopped, and every register put back as found.
+ *             Not done (yet): the high-voltage boost Linux turns on through the PMIC's PBS -- without it
+ *             the pulse may be weak or none
+ */
+extern void hakios_spmi_lock(void);
+extern void hakios_spmi_unlock(void);
+
+#define R_ARB_CORE_PHYS         0x0c440000UL
+#define R_ARB_CNFG_PHYS         0x0c40a000UL
+#define R_ARB_OBSERVER_PHYS     0x0e600000UL
+#define R_ARB_CHNLS_PHYS        0x0c600000UL
+#define R_ARB_CHANNEL(n)        (0x900 + 4 * (n))
+#define R_ARB_OWNER(n)          (0x700 + 4 * (n))
+#define R_CMD_WRITE             (0u << 27)
+#define R_CMD_READ              (1u << 27)
+
+#define HV_CFG                  0x3f0           /* slave 3, peripheral 0xf0 */
+#define HV_PTN                  0x3f1
+#define HV_HPWR                 0x3f2
+#define HV_FAULT_STATUS         0x0c
+#define HV_INT_RT_STS           0x10
+#define HV_EN_CTL               0x46            /* [7] the module on */
+#define HV_VMAX                 0x48            /* mV / 50 */
+#define HV_SPMI_PLAY            0x4c            /* [7] play, [2:0] the source: 1 = direct play */
+#define HV_TLRA_OL_HIGH         0x5c            /* the open-loop LRA period / 5 us, [3:0] high */
+#define HV_TLRA_OL_LOW          0x5d
+#define HV_FAULT_CLR            0x66            /* [2] short circuit, [1] auto-resonance error, [0] power not ready */
+#define HV_PTN_DIRECT_PLAY      0x26            /* the amplitude, 0..0xff */
+#define HV_VMAX_MV              2450            /* renoir's qcom,vmax-mv */
+#define HV_LRA_PERIOD_US        4808            /* renoir's qcom,lra-period-us */
+
+struct hv_block {
+	const char *name;
+	uint16_t id, channel;
+	bool found, ours;
+};
+static struct hv_block hv_cfg = { "the configuration block", HV_CFG }, hv_ptn = { "the pattern block", HV_PTN },
+    hv_hpwr = { "the power block", HV_HPWR };
+static vm_offset_t hv_core, hv_cnfg, hv_observer;
+static bool hv_broken, hv_playing;
+
+static const char *
+hv_wait(vm_offset_t channel)
+{
+	uint64_t start = mach_absolute_time(), interval;
+	uint32_t status;
+
+	nanoseconds_to_absolutetime(2000 * (uint64_t)NSEC_PER_USEC, &interval);
+	do {
+		status = rd(channel + 0x08);
+	} while (!(status & 1) && mach_absolute_time() - start < interval);
+	return !(status & 1) ? "no answer from the arbiter" : (status & 4) ? "the arbiter refuses" : (status & 2) ?
+	       "the transfer failed" : (status & 8) ? "dropped" : NULL;
+}
+
+static const char *
+hv_read(const struct hv_block *b, uint8_t reg, uint8_t *bytes, uint32_t count)
+{
+	vm_offset_t channel = hv_observer + 0x80UL * b->channel;
+	const char *problem = "no channel";
+	uint32_t data[2] = { 0, 0 };
+
+	for (int tries = 0; b->found && tries < 3; tries++) {
+		if (!leaving) {
+			hakios_spmi_lock();
+		}
+		wr(channel + 0x00, R_CMD_READ | (uint32_t)reg << 4 | (count - 1));
+		problem = hv_wait(channel);
+		data[0] = rd(channel + 0x18);
+		data[1] = count > 4 ? rd(channel + 0x1c) : 0;
+		if (!leaving) {
+			hakios_spmi_unlock();
+		}
+		if (problem == NULL || strcmp(problem, "dropped") != 0) {
+			break;
+		}
+	}
+	for (uint32_t i = 0; problem == NULL && i < count; i++) {
+		bytes[i] = (uint8_t)(data[i / 4] >> (8 * (i % 4)));
+	}
+	return problem;
+}
+
+static bool hv_put(struct hv_block *b, uint8_t reg, uint8_t value);
+static vm_offset_t hakios_hv_channel_write(void);
+
+/* the motor stopped, whatever else went wrong (no list, no read-back: stopping always goes) */
+static void
+hv_stop_now(const char *why)
+{
+	vm_offset_t channel = hakios_hv_channel_write();
+
+	if (channel != 0) {
+		if (!leaving) {
+			hakios_spmi_lock();
+		}
+		wr(channel + 0x10, 0);
+		wr(channel + 0x00, R_CMD_WRITE | (uint32_t)HV_SPMI_PLAY << 4);
+		(void)hv_wait(channel);
+		if (!leaving) {
+			hakios_spmi_unlock();
+		}
+	}
+	hv_playing = false;
+	if (!hv_broken) {
+		hv_broken = true;
+		say("haptic: %s: the motor stopped, no more writing for the run\n", why);
+	}
+}
+
+static bool
+hv_put(struct hv_block *b, uint8_t reg, uint8_t value)
+{
+	static const struct { uint16_t id; uint8_t reg; } allowed[] = {
+		{ HV_CFG, HV_EN_CTL }, { HV_CFG, HV_VMAX }, { HV_CFG, HV_SPMI_PLAY }, { HV_CFG, HV_TLRA_OL_HIGH },
+		{ HV_CFG, HV_TLRA_OL_LOW }, { HV_CFG, HV_FAULT_CLR }, { HV_PTN, HV_PTN_DIRECT_PLAY },
+	};
+	vm_offset_t channel;
+	const char *problem = NULL;
+	uint8_t back = 0;
+	bool ok = false;
+
+	for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+		ok |= allowed[i].id == b->id && allowed[i].reg == reg;
+	}
+	if (hv_broken || !ok || !b->found || !b->ours ||
+	    ((rd(hv_core + R_ARB_CHANNEL(b->channel)) >> 8) & 0xfff) != b->id) {
+		hv_stop_now(ok ? "a write that may not be made" : "a register that is not on the list");
+		return false;
+	}
+	channel = (vm_offset_t)ml_io_map(R_ARB_CHNLS_PHYS + 0x10000UL * b->channel, 0x1000);
+	for (int tries = 0; tries < 3; tries++) {
+		if (!leaving) {
+			hakios_spmi_lock();
+		}
+		wr(channel + 0x10, value);
+		wr(channel + 0x00, R_CMD_WRITE | (uint32_t)reg << 4);
+		problem = hv_wait(channel);
+		if (!leaving) {
+			hakios_spmi_unlock();
+		}
+		if (problem == NULL || strcmp(problem, "dropped") != 0) {
+			break;
+		}
+	}
+	/* (the fault clear and the play register clear themselves or change as they work: not compared) */
+	if (problem == NULL && reg != HV_FAULT_CLR && reg != HV_SPMI_PLAY) {
+		problem = hv_read(b, reg, &back, 1);
+		if (problem == NULL && back != value) {
+			say("haptic: %s %#04x <- %#04x, but it reads %#04x\n", b->name, reg, value, back);
+			problem = "a register that did not read back as written";
+		}
+	}
+	if (problem != NULL) {
+		say("haptic: %s %#04x <- %#04x: %s\n", b->name, reg, value, problem);
+		hv_stop_now(problem);
+		return false;
+	}
+	return true;
+}
+
+/* the configuration block's write channel, for hv_stop_now() (0 if there is none of ours) */
+static vm_offset_t
+hakios_hv_channel_write(void)
+{
+	static vm_offset_t mapped;
+
+	if (mapped == 0 && hv_cfg.found && hv_cfg.ours) {
+		mapped = (vm_offset_t)ml_io_map(R_ARB_CHNLS_PHYS + 0x10000UL * hv_cfg.channel, 0x1000);
+	}
+	return mapped;
+}
+
+static void
+hv_find(struct hv_block *b)
+{
+	for (uint32_t n = 0; n < 512; n++) {
+		uint32_t map = rd(hv_core + R_ARB_CHANNEL(n)), owner;
+
+		if (map == 0 || ((map >> 8) & 0xfff) != b->id) {
+			continue;
+		}
+		owner = rd(hv_cnfg + R_ARB_OWNER(n)) & 7;
+		say("haptic: channel %u is %s (%#x); written by system %u%s\n", n, b->name, map, owner,
+		    owner == 0 ? ", which is us" : "");
+		if (!b->found || owner == 0) {
+			b->found = true;
+			b->channel = (uint16_t)n;
+			b->ours = owner == 0;
+		}
+	}
+	if (!b->found) {
+		say("haptic: no channel of the arbiter is %s (%#x)\n", b->name, b->id);
+	}
+}
+
+static void
+hv_show(const struct hv_block *b)
+{
+	uint8_t r[8];
+	char line[200];
+
+	for (unsigned base = 0; base < 0x100; base += 0x20) {
+		int n = snprintf(line, sizeof(line), "haptic: %s %#04x:", b->name, base);
+
+		for (unsigned i = 0; i < 0x20; i += 8) {
+			if (hv_read(b, (uint8_t)(base + i), r, 8) != NULL) {
+				n += snprintf(line + n, sizeof(line) - n, " --");
+				continue;
+			}
+			for (unsigned j = 0; j < 8; j++) {
+				n += snprintf(line + n, sizeof(line) - n, " %02x", r[j]);
+			}
+		}
+		say("%s\n", line);
+	}
+}
+
+static void
+renoir_haptics(void)
+{
+	uint8_t en = 0, vmax = 0, tlra[2] = { 0, 0 }, fault = 0, amp_was = 0;
+	uint32_t ms = 150, amp = 0x80, period = HV_LRA_PERIOD_US / 5;
+
+	hv_core = ml_io_map(R_ARB_CORE_PHYS, 0x1100);
+	hv_cnfg = ml_io_map(R_ARB_CNFG_PHYS, 0x1000);
+	hv_observer = ml_io_map(R_ARB_OBSERVER_PHYS, 0x10000);
+	say("haptic: renoir: the PM8350B's haptics; arbiter version %#x; level %u (%s)\n", rd(hv_core + 0x000), level,
+	    level >= 4 ? "one pulse" : "reading only");
+	hv_find(&hv_cfg);
+	hv_find(&hv_ptn);
+	hv_find(&hv_hpwr);
+	hv_show(&hv_cfg);
+	hv_show(&hv_ptn);
+	hv_show(&hv_hpwr);
+	if (level < 4) {
+		return;
+	}
+	if (!hv_cfg.ours || !hv_ptn.ours) {
+		say("haptic: the blocks are not ours to write: nothing played\n");
+		return;
+	}
+	PE_parse_boot_argn("haptic_ms", &ms, sizeof(ms));
+	PE_parse_boot_argn("haptic_amp", &amp, sizeof(amp));
+	ms = ms > 500 ? 500 : ms;
+	amp = amp > 0xff ? 0xff : amp;
+	if (hv_read(&hv_cfg, HV_EN_CTL, &en, 1) != NULL || hv_read(&hv_cfg, HV_VMAX, &vmax, 1) != NULL ||
+	    hv_read(&hv_cfg, HV_TLRA_OL_HIGH, tlra, 2) != NULL || hv_read(&hv_cfg, HV_FAULT_STATUS, &fault, 1) != NULL ||
+	    hv_read(&hv_ptn, HV_PTN_DIRECT_PLAY, &amp_was, 1) != NULL) {
+		say("haptic: the registers cannot be read: nothing played\n");
+		return;
+	}
+	say("haptic: found: enable %#04x, vmax %#04x (%u mV), open-loop period %#04x %#04x (%u us), faults %#04x, "
+	    "amplitude %#04x\n", en, vmax, vmax * 50, tlra[0], tlra[1], ((tlra[0] & 0xf) << 8 | tlra[1]) * 5, fault, amp_was);
+	if (hv_put(&hv_cfg, HV_FAULT_CLR, 0x07) && hv_put(&hv_cfg, HV_VMAX, HV_VMAX_MV / 50) &&
+	    hv_put(&hv_cfg, HV_TLRA_OL_HIGH, (uint8_t)(period >> 8 & 0xf)) &&
+	    hv_put(&hv_cfg, HV_TLRA_OL_LOW, (uint8_t)(period & 0xff)) && hv_put(&hv_cfg, HV_EN_CTL, 0x80) &&
+	    hv_put(&hv_ptn, HV_PTN_DIRECT_PLAY, (uint8_t)amp)) {
+		say("haptic: playing: direct play, amplitude %#x, %u mV, %u us, for %u ms\n", amp, HV_VMAX_MV, period * 5, ms);
+		hv_playing = true;
+		if (hv_put(&hv_cfg, HV_SPMI_PLAY, 0x81)) {
+			wait_ms(ms);
+		}
+		(void)hv_read(&hv_cfg, HV_FAULT_STATUS, &fault, 1);
+		say("haptic: faults after playing: %#04x\n", fault);
+		if (!hv_broken) {
+			(void)hv_put(&hv_cfg, HV_SPMI_PLAY, 0x01);
+			hv_playing = false;
+		}
+	}
+	if (hv_playing) {
+		hv_stop_now("still playing");
+	}
+	/* everything back as found (only if nothing went wrong: then the stop is all that is done) */
+	if (!hv_broken && hv_put(&hv_ptn, HV_PTN_DIRECT_PLAY, amp_was) && hv_put(&hv_cfg, HV_EN_CTL, en) &&
+	    hv_put(&hv_cfg, HV_TLRA_OL_HIGH, tlra[0]) && hv_put(&hv_cfg, HV_TLRA_OL_LOW, tlra[1]) &&
+	    hv_put(&hv_cfg, HV_VMAX, vmax)) {
+		say("haptic: the registers are back as found\n");
+	}
+}
+/* ==================================================================================================== */
+
 static void
 haptic_thread(__unused void *parameter, __unused wait_result_t result)
 {
+	char board[16] = "";
+
+	/* boot-arg board=renoir: the PMIC's haptics instead of redwood's Awinic chip */
+	if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
+		renoir_haptics();
+		say("haptic: done\n");
+		thread_terminate(current_thread());
+		return;
+	}
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	say("haptic: level %u: %s\n", level, level == 1 ? "a look, reading only" : level == 2 ? "the reset released, registers read" :
 	    level == 3 ? "the chip configured and its waveforms loaded, nothing played" : level == 4 ? "one effect played" :
@@ -994,6 +1302,10 @@ hakios_haptic_init(void)
 void
 hakios_haptic_quiesce(void)
 {
+	if (hv_playing) {                       /* renoir: a pulse that is still on is stopped */
+		leaving = true;
+		hv_stop_now("at the run's end");
+	}
 	if (released && tlmm != 0) {
 		leaving = true;
 		reset_pin(false);
