@@ -4631,8 +4631,9 @@ renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
 			return;
 		}
 	}
-	radio_stream = 0x2400;
-	radio_stream_mask = 1;
+	/* (stream 0x2400 with mask 1, both of PCIe 0's, was not taken: the hypervisor left the match register as it was) */
+	radio_stream = 0x2401;
+	radio_stream_mask = 0;
 	radio_space.wanted = 2;
 	pause_ms = 0;
 	if (!hakios_wifi_radio_map(physical, RENOIR_SBL_SIZE, &seen)) {
