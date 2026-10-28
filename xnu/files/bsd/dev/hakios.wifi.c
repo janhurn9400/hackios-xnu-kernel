@@ -177,6 +177,7 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, u
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern void loader_return(void);
+extern void hakios_reboot_reason_set(void);
 extern kern_return_t thread_terminate(thread_t thread);
 
 static LCK_GRP_DECLARE(wifi_lock_group, "hakios-wifi");
@@ -4591,36 +4592,42 @@ renoir_pcie_down(unsigned level)
 #define BHI_ERRCODE             0x30
 #define RENOIR_SBL_SIZE         (512u << 10)
 
-static void
-renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
+static unsigned long long renoir_seen;   /* where the chip sees the image (renoir_bhi_prepare()) */
+static uint32_t renoir_length;
+
+/*
+ * Before anything of PCIe is touched (pcie=7): the image into memory of one piece and shown to the chip
+ * through the SMMU. The SMMU's writes are the hypervisor's to grant, and one of them reset the phone
+ * once (stream 0x2401, 2026-10-28 23:38): they are made here with a pause after each, for the loader's
+ * notes, while no PCIe link is up to go idle.
+ */
+static bool
+renoir_bhi_prepare(void)
 {
 	uint64_t size = 0, physical;
 	const uint8_t *image = image_file("amss20.bin", &size);
 	vm_offset_t copy = 0;
-	uint32_t length, status = 0, ee = 0;
-	unsigned long long seen = 0;
 
 	if (image == NULL) {
-		return;
+		return false;
 	}
-	length = size < RENOIR_SBL_SIZE ? (uint32_t)size : RENOIR_SBL_SIZE;
+	renoir_length = size < RENOIR_SBL_SIZE ? (uint32_t)size : RENOIR_SBL_SIZE;
 	if (kmem_alloc_contig(kernel_map, &copy, RENOIR_SBL_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		printf("wifi: pcie: 7: no 512 KB in one piece\n");
-		return;
+		return false;
 	}
-	memcpy((void *)copy, image, length);
+	memcpy((void *)copy, image, renoir_length);
 	for (vm_offset_t line = copy; line < copy + RENOIR_SBL_SIZE; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
 	}
 	__asm__ volatile ("dsb sy");
 	physical = kvtophys(copy);
-	printf("wifi: pcie: 7: amss20.bin is %llu bytes; its first %u at physical %#llx; EE %u, BHI status %#x\n", size, length,
-	    physical, rd(bhi + BHI_EXECENV), rd(bhi + BHI_STATUS));
+	printf("wifi: pcie: 7: amss20.bin is %llu bytes; its first %u at physical %#llx\n", size, renoir_length, physical);
 	/*
-	 * The chip reads it through the SMMU as stream 0x2401, which the boot chain leaves to fault: without a
-	 * context the first try reset the phone a second after the doorbell. hakios_wifi_radio_map() takes a
-	 * free match register and context with page tables of ours (as for redwood's radio, wifi_smmu=2).
+	 * The chip reads it through the SMMU, and the boot chain leaves PCIe 0's streams to fault: handed a
+	 * physical address the chip reset the phone a second after the BHI doorbell (23:33). Stream 0x2400
+	 * with mask 1 (both of PCIe 0's) was not taken: the hypervisor left the match register as it was.
 	 */
 	need(&apps_smmu);
 	for (uint32_t n = 0; n < (rd(apps_smmu.base + SMMU_IDR0) & 0xff); n++) {
@@ -4628,24 +4635,39 @@ renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
 
 		if (smr >> 31 && (((smr & 0x7fff) ^ 0x2400) & ~((smr >> 16 & 0x7fff) | 1)) == 0) {
 			printf("wifi: pcie: 7: match register %u (%#x) already covers PCIe 0's streams: not adding one\n", n, smr);
-			return;
+			return false;
 		}
 	}
-	/* (stream 0x2400 with mask 1, both of PCIe 0's, was not taken: the hypervisor left the match register as it was) */
 	radio_stream = 0x2401;
 	radio_stream_mask = 0;
 	radio_space.wanted = 2;
-	pause_ms = 0;
-	if (!hakios_wifi_radio_map(physical, RENOIR_SBL_SIZE, &seen)) {
+	pause_ms = renoir_pause ? renoir_pause : 1500;
+	new_from = 0;                           /* (every SMMU write waits pause_ms: see hold()) */
+	fine = 1;
+	if (!hakios_wifi_radio_map(physical, RENOIR_SBL_SIZE, &renoir_seen)) {
 		printf("wifi: pcie: 7: the SMMU does not give the chip a view of the image\n");
+		return false;
+	}
+	pause_ms = 0;
+	fine = 0;
+	printf("wifi: pcie: 7: the chip is to see the image at %#llx\n", renoir_seen);
+	return true;
+}
+
+static void
+renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
+{
+	uint32_t status = 0, ee = 0;
+
+	if (renoir_seen == 0) {
 		return;
 	}
-	printf("wifi: pcie: 7: the chip sees the image at %#llx; BHI: its address and size, session 0x1234 to the doorbell\n",
-	    seen);
+	printf("wifi: pcie: 7: EE %u, BHI status %#x; BHI: the image's address and size, session 0x1234 to the doorbell\n",
+	    rd(bhi + BHI_EXECENV), rd(bhi + BHI_STATUS));
 	wr(bhi + BHI_STATUS, 0);
-	wr(bhi + BHI_IMGADDR_HIGH, (uint32_t)(seen >> 32));
-	wr(bhi + BHI_IMGADDR_LOW, (uint32_t)seen);
-	wr(bhi + BHI_IMGSIZE, length);
+	wr(bhi + BHI_IMGADDR_HIGH, (uint32_t)(renoir_seen >> 32));
+	wr(bhi + BHI_IMGADDR_LOW, (uint32_t)renoir_seen);
+	wr(bhi + BHI_IMGSIZE, renoir_length);
 	wr(bhi + BHI_IMGTXDB, 0x1234);
 	for (int ms = 0; ms < 5000; ms += 10) {
 		status = rd(bhi + BHI_STATUS);
@@ -4741,6 +4763,10 @@ renoir_pcie_link(unsigned level)
 
 	PE_parse_boot_argn("pcie_pause", &renoir_pause, sizeof(renoir_pause));
 	renoir_level = level;
+	if (level >= 7 && !renoir_bhi_prepare()) {
+		radio_space_off();
+		return;
+	}
 	renoir_rsc = ml_io_map(RENOIR_RSC, 0x10000);
 	renoir_tlmm = ml_io_map(0x0f100000, 0x100000);
 	renoir_gcc_vote = ml_io_map(RENOIR_GCC_VOTE, 0x1000);
@@ -4884,6 +4910,9 @@ hakios_wifi_init(void)
 
 	if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
 		if (PE_parse_boot_argn("pcie", &on, sizeof(on)) && on) {
+			if (on >= 3) {
+				hakios_reboot_reason_set();     /* a hang or reset of these tests lands in fastboot (hakios.torch.c) */
+			}
 			renoir_pcie_survey(on);
 			if (on >= 3) {
 				renoir_pcie_link(on);

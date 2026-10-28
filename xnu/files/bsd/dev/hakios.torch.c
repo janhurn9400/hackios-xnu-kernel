@@ -827,11 +827,22 @@ rr_sdam_write(uint8_t value)
 	return true;
 }
 
+/* (also called early by drivers whose tests return to the loader before this one starts: once is enough) */
+void
+hakios_reboot_reason_set(void)
+{
+	reboot_reason_set();
+}
+
 static void
 reboot_reason_set(void)
 {
 	char board[16] = "";
 	uint32_t on = 0;
+
+	if (rr_imem != 0) {
+		return;                 /* set already */
+	}
 
 	if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
 		on = 1;
