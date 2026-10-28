@@ -4986,7 +4986,12 @@ renoir_mhi(vm_offset_t mhi)
 	if (((rd(mhi + MHI_STATUS) >> 8) & 0xff) != 2) {
 		return;
 	}
-	printf("wifi: pcie: 9: IN M0 (%u event rings). Starting channels %u and %u\n", rings, out, out + 1);
+	/*
+	 * Device wake: the doorbell of channel 127 written 1, as Linux's MHI asserts it before it moves data; the
+	 * loopback pair answered without it, IPCR (the WLAN side's) did not (2026-10-29 00:46).
+	 */
+	mhi_wr64(mhi + rd(mhi + 0x18) + 8 * 127, 1);
+	printf("wifi: pcie: 9: IN M0 (%u event rings), device wake asserted. Starting channels %u and %u\n", rings, out, out + 1);
 	if (!mhi_command(mhi, 0x12, out) || !mhi_command(mhi, 0x12, out + 1)) {
 		printf("wifi: pcie: 9: a channel did not start\n");
 		return;
