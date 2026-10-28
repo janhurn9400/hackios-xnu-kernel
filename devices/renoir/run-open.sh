@@ -13,6 +13,8 @@
 # usage: devices/renoir/run-open.sh [SECS] [kernel args]     (default: 20 s, "cpus=1 -v")
 #   KERNEL=path   another kernel than prebuilt/mach.development.bcm2837 (e.g. one built in the VM)
 #   RAMDISK=path  another process 1 than prebuilt/userland/hello (e.g. hold, which does not exit)
+#   FOLLOW=N      every N seconds the log as it stands so far into logs/<time>-renoir-open.log.live
+#                 (the loader answers during a run; asked in the same loop, so one fastboot at a time)
 set -e
 cd "$(dirname "$0")/../.."
 PATH=$HOME/Library/Android/sdk/platform-tools:$PATH
@@ -26,9 +28,16 @@ python3 xnuloader/mkpayload.py -o run-payload.bin kernel="${KERNEL:-prebuilt/mac
 	ramdisk="${RAMDISK:-prebuilt/userland/hello}" --cmdline "loader_return_after=$secs epoch=$(date +%s) $args" >/dev/null
 t 60 fastboot stage run-payload.bin 2>&1 | grep -q OKAY || { echo "run-open.sh: upload failed"; exit 1; }
 t 10 fastboot oem run >/dev/null 2>&1
+followed=$(date +%s)
 for _ in $(seq 1 $(( secs / 3 + 40 ))); do
 	result=$(t 10 fastboot getvar result 2>&1 | grep '^result:' || true)
-	case "$result" in ""|*running*) sleep 3 ;; *) break ;; esac
+	case "$result" in ""|*running*) ;; *) break ;; esac
+	if [ -n "$FOLLOW" ] && [ $(( $(date +%s) - followed )) -ge "$FOLLOW" ]; then
+		followed=$(date +%s)
+		t 10 fastboot oem log 2>&1 | grep -q OKAY && t 30 fastboot get_staged "$log.live.raw" >/dev/null 2>&1 &&
+			tr -d '\000' < "$log.live.raw" > "$log.live" && rm -f "$log.live.raw"
+	fi
+	sleep 3
 done
 echo "run-open.sh: $result"
 # the loader stages loader + kernel log when the run is over; "oem log" would replace it with its own

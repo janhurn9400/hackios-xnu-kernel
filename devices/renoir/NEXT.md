@@ -28,7 +28,24 @@ all seven kernel cores (`small_cores_after=0`), cpufreq 1900/2208/2400 MHz; UFS 
    FocalTech, runtime ID 0x56/0x52, **firmware in its own flash: never upload or flash**; accept
    0x56/0x52, stop on boot-ROM ID 0x56/0xB2. SPI framing and the 15-bit report are already right.
    Test: `run-open.sh 30 cpus=1 touchscreen=1 touch_board=renoir -v`, then touch the screen.
-3. Then: IPSW + system image (`sysimage/fetch.sh`, `REST=1 userland/build.sh`, ~7.4 GB) for the lock
+3. **System image built, iOS boots to SpringBoard** (session 2): the three iOS 16.5 images downloaded on the Mac
+   (`sysimage/*.dmg`, 7.4 GB, linked into the VM's `sysimage/`), `KEEP=1 sysimage/fetch.sh` and
+   `REST=1 userland/build.sh` in the VM: `system.apfs` 2.5 GB + `root.apfs`, copied to
+   `devices/renoir/prebuilt/sysimg/` (sha256 checked). No `ldid` (a few test programs unsigned), `fw/`
+   empty (`pull-firmware.sh` not run).
+   **SpringBoard runs on renoir and touch works in iOS** (12:51, `logs/125102-renoir-open.log`): no
+   `xl` (no MacPorts gstat/gtimeout here), by hand: `fastboot oem ramdisk`, `fastboot stage
+   devices/renoir/prebuilt/sysimg/system.apfs` (2.4 GB, 80 s), then
+   `FOLLOW=15 KERNEL=devices/renoir/prebuilt/vm-kernel/mach.development.bcm2837
+   RAMDISK=devices/renoir/prebuilt/sysimg/root.apfs devices/renoir/run-open.sh 180 -v sb_delay=8
+   bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 touch_board=renoir`. In 180 s SpringBoard and backboardd
+   never exited; only searchd (SIGABRT) and some intents extensions. Slow: software rendering (no GPU).
+   `-v` writes the kernel console over the picture: leave it out for a clean screen.
+   The first image was built under `prlctl exec`'s umask 077: everything 0700/0600, SpringBoard as
+   mobile could not open "/" (`failed to open root directory: /: 13`) and launchd restarted it every 5 s.
+   `vmx.sh` now sets umask 022; after such a build: `chmod -R go+rX sysimage/{rootfs,cryptex,cryptex-app,20F66*}
+   userland` and `SYSTEM=1 REST=1 userland/build.sh` again.
+   Was: IPSW + system image (`sysimage/fetch.sh`, `REST=1 userland/build.sh`, ~7.4 GB) for the lock
    screen; GPU (`gpu=1`, chip id 0x06060010 vs redwood's 0x06030500); haptics (renoir has
    `qcom-hv-haptics`, not Awinic).
 
