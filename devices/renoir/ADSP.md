@@ -45,7 +45,22 @@ devices/renoir/run-open.sh 90 bootcpu=7 cpus=1 board=renoir adsp_step=N adsp_pau
 - Under MagicOS the same DSP starts fine (the sound card is up at 9.2 s); the boot lines of the start
   itself had already scrolled out of the kernel's buffer.
 
+## Compared with renoir's own start code (LineageOS subsys-pil-tz.c, peripheral-loader.c)
+
+Linux's order: AOP "on", proxy votes (rails, clock `xo`), PAS init image, mem setup, (hypervisor
+assignment only with `qcom,vmid`: renoir's ADSP has none), segments, then `scm_pas_enable_bw()` -- a vote
+for the crypto engine's way to DDR (dt `pil_scm_pas`, MASTER_CRYPTO to SLAVE_EBI1; on shima the BCMs
+CE0, SN8, SN0, SH0, MC0, ACV) -- regulators and clocks again, and `auth_and_reset`. `adsp_bw=1` makes
+that vote before the start: **it did not help either** (run 17:36, the same reset).
+
+Ruled out so far: the rails' level (384, 64), no rails at all, the IPCC doorbells, pauses, the `xo`
+proxy clock, the crypto engine's bandwidth.
+
 ## Next
+
+- See the crash: the kernel's log lies at a fixed address in DDR (`log at f7b4....`) and probably
+  survives the watchdog's reset; the loader (`xnuloader/loader.c`) could save the previous run's log
+  when it starts again. That would show the last line of every crash, not only this one.
 
 Compare step 7 with renoir's own start code (LineageOS `android_kernel_xiaomi_sm8350`:
 `drivers/soc/qcom/subsys-pil-tz.c`, `peripheral-loader.c`, the AOP QMP load state): the order of proxy

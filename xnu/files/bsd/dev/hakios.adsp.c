@@ -984,6 +984,69 @@ rails(uint32_t level)
 	return done != 0;
 }
 
+/*
+ * The way of the SoC's crypto engine to DDR, voted for while TrustZone authenticates the image, as
+ * Linux's subsys-pil-tz.c does around auth_and_reset (scm_pas_enable_bw(): the interconnect path of
+ * dt pil_scm_pas, MASTER_CRYPTO to SLAVE_EBI1, peak bandwidth unlimited). TrustZone hashes the whole
+ * image with that engine. On renoir (LineageOS drivers/interconnect/qcom/shima.c) the path's bus clock
+ * managers are CE0, SN8, SN0, SH0 and MC0/ACV. Boot-arg adsp_bw=1 (renoir, where the start resets the
+ * phone without it, 2026-10-28). A BCM vote: commit and valid bits, the vote in the low 14 bits.
+ */
+#define BCM_VOTE(on, vote)      (1u << 30 | (uint32_t)(on) << 29 | ((vote) & 0x3fffu))
+
+static bool
+crypto_bandwidth(bool on)
+{
+	static const char *const names[] = { "CE0", "SN8", "SN0", "SH0", "MC0", "ACV" };
+	uint32_t addresses[6], done = 0, count = 0;
+	uint64_t began;
+
+	for (unsigned i = 0; i < 6; i++) {
+		addresses[count] = rpmh_address_of(names[i]);
+		if (addresses[count] == 0) {
+			printf("adsp: %u: RPMh has no BCM %s: left out\n", step, names[i]);
+			continue;
+		}
+		count++;
+	}
+	if (count == 0) {
+		return false;
+	}
+	need(&rsc);
+	lck_mtx_lock(&hakios_rsc_lock);
+	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
+		printf("adsp: %u: TCS %u is busy: the crypto engine's bandwidth is not asked\n", step, RPMH_TCS);
+		lck_mtx_unlock(&hakios_rsc_lock);
+		return false;
+	}
+	printf("adsp: %u: about to ask RPMh for the crypto engine's way to memory %s (%u BCMs: CE0 %#x ...)\n", step,
+	    on ? "on" : "off", count, addresses[0]);
+	hold();
+	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
+	for (unsigned r = 0; r < count; r++) {
+		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r), MSGID_WRITE_WAITED);
+		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 4, addresses[r]);
+		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 8, BCM_VOTE(on, on ? 0x3fffu : 0));
+	}
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_WAIT_FOR_DONE, (1u << count) - 1);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, (1u << count) - 1);
+	settle();
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~TCS_TRIGGER);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_ACTIVE_MODE);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_TRIGGER);
+	began = now_us();
+	while (now_us() - began < 100000 && !(done = rd(rsc.base + RSC_IRQ_STATUS) & (1u << RPMH_TCS))) {
+		sleep_us(50);
+	}
+	printf("adsp: %u: RPMh %s the crypto engine's bandwidth %s after %llu us\n", step, done ? "HAS SET" : "HAS NOT SAID IT SET",
+	    on ? "on" : "off", now_us() - began);
+	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
+	lck_mtx_unlock(&hakios_rsc_lock);
+	return done != 0;
+}
+
 /* ---- step 1: the shared memory --------------------------------------------------------------------- */
 
 static bool
@@ -1741,6 +1804,14 @@ step_start(void)
 		rails_asked = false;
 		lck_mtx_unlock(&dsp_lock);
 		return false;
+	}
+	{
+		uint32_t bw = 0;
+
+		PE_parse_boot_argn("adsp_bw", &bw, sizeof(bw));
+		if (bw) {
+			crypto_bandwidth(true);
+		}
 	}
 	result = scm("to authenticate the audio DSP's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_ADSP, 0, 0,
 	    &answer);
