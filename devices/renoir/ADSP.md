@@ -56,10 +56,38 @@ that vote before the start: **it did not help either** (run 17:36, the same rese
 Ruled out so far: the rails' level (384, 64), no rails at all, the IPCC doorbells, pauses, the `xo`
 proxy clock, the crypto engine's bandwidth.
 
+## The crash seen (session 3, 2026-10-28 ~18:00): THE DSP STARTS; the reset comes after it
+
+The loader now keeps the kernel's live log across a reset (`xnuloader/loader.c`, crash log at
+0xF3F80000; **DDR and the whole 64 MB payload region survive the reset and Xiaomi's XBL/ABL**). The
+`adsp_step=7 adsp_pause=0` run's own log, recovered on the next start:
+
+```
+adsp: 7: TRUSTZONE HAS AUTHENTICATED THE IMAGE AND LET THE AUDIO DSP OUT OF RESET; watching for 10 s
+adsp: 7: +11.206 ms: the DSP's item APPEARS: SMP2P version 1 ...
+adsp: 7: THE AUDIO DSP SAYS IT IS UP: "slave-kernel" says 0x6, 37.913 ms after TrustZone started it
+adsp: 7: RPMh HAS DONE IT after 74 us ...            (our rails given back: the DSP has its own)
+adsp: 7: the watch is over after 3038 ms; its doorbells heard: GLINK 1, SMP2P 3
+adsp: 7: THE AUDIO DSP ACKNOWLEDGES THE STOP after 22.615 ms; its entry says 0x10e
+adsp: 7: TrustZone returns 0, answer 0 / THE AUDIO DSP IS SHUT DOWN
+adsp: 7: the always-on processor has taken it        ({image, load_state, adsp, off})
+adsp: the system goes on starting                    <- the last line; the reset follows
+```
+
+So the DSP's start works (as on MagicOS): it is up after 38 ms, runs 3 s, acknowledges the stop and
+TrustZone shuts it down. The "last line" session 2 saw (`about to ask RPMh ... level 384`) only was the
+last one the 2-3 s live log had caught. **The reset comes after the DSP was shut down**, ~5 s after
+`oem run`. This log is the loader-log channel only (`loader_log_line`); the kernel's own messages
+after "goes on starting" (root mount, the small image's missing init, the panic, the return) are not in
+it. `adsp_step=6` returns cleanly, so it is something step 7 leaves behind.
+
 ## Next
 
-- See the crash: the kernel's log lies at a fixed address in DDR (`log at f7b4....`) and probably
-  survives the watchdog's reset; the loader (`xnuloader/loader.c`) could save the previous run's log
-  when it starts again. That would show the last line of every crash, not only this one.
+- What resets after the shutdown: candidates are (a) the shut-down DSP / the AOP "load_state off" and
+  whatever still expects the DSP (its SMMU, the GLINK edge we opened, IPCC); (b) the loader on core 0
+  (`charger_poll()` every 5 s calls Qualcomm's UEFI charger DXE, which on Qualcomm talks to the battery
+  manager on the ADSP over GLINK: the reset at ~5 s fits); (c) the kernel's panic / return path.
+  Cheap tests: the same run with the loader's charger polling off; with the DSP left running (no
+  stop/shutdown at the end of the steps); the kernel's console mirrored into the live log.
 
 - Speaker amplifiers, for the sound later: two NXP TFA98xx at 0x34/0x35 (MagicOS dmesg).
