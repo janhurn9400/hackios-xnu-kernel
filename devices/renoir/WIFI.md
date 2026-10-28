@@ -82,7 +82,13 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    0x101 (READY), error 0x9cb4d3a7. No MHI context nor M0 was needed for BHIe. (The run takes ~90 s with
    the slow SMMU writes; `run-open.sh 150` gives up before `getvar result` says returned: fetch with
    `fastboot oem log; fastboot get_staged`.)
-6. **MHI host, ours** (next): the context arrays (channels, event rings, command ring) in shown memory, their
+6. **MHI host, ours: M0 and the IPCR channels DONE, 2026-10-29 00:20 (`pcie=9`, `renoir_mhi()`; log read off
+   `logdump` in MagicOS, `logs/logdump-mhi.txt`).** One 64 KB piece shown to the chip at 0xa0584000: channel
+   contexts (MHICFG says 128 channels, 128 event rings; we set NER 2), 2 event rings, command ring, rings of
+   channels 20/21, buffers. CCABAP/ECABAP/CRCBAP, control/data windows = the SMMU window, event doorbells, MHICTRL
+   M0: **event 0x20 (state M0) and 0x40 (EE 2), MHISTATUS 0x201; START for 20 and 21 completed with code 1.**
+   The firmware sent nothing on 21 by itself in 3 s: QRTR wants the host's hello first (now sent).
+   Originally planned as: the context arrays (channels, event rings, command ring) in shown memory, their
    addresses in MHI's registers (CCABAP 0x58, ECABAP 0x60, CRCBAP 0x68, CRDB, and the data/control limits),
    MHICTRL to M0, then the channels IPCR 20/21 for QRTR -- polling event rings at first (no MSI). Then: Linux's MHI core is GPL-2.0, so it cannot be taken; ath11k's own `pci.c`/`mhi.c`
    are BSD-3-Clause-Clear and can. Needed: BHI/BHIe image download (`amss20.bin`), the MHI state machine

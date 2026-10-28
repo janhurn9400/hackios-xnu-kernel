@@ -4974,6 +4974,28 @@ renoir_mhi(vm_offset_t mhi)
 	MHI_CTX(44 * 21)->write = MHI_AT(0x7000 + ch_wp[1]);
 	__asm__ volatile ("dsb sy");
 	mhi_wr64(mhi + rd(mhi + 0x18) + 8 * 21, MHI_AT(0x7000 + ch_wp[1]));
+	/*
+	 * QRTR's hello on channel 20 (the firmware says nothing until it has one, 2026-10-29 00:20): a version 1
+	 * header (version, type 2 = hello, our node 1 and control port, no confirmation, 20 bytes, to every node's
+	 * control port) and the control packet, whose first word is the command, hello again.
+	 */
+	{
+		static const uint32_t hello[13] = { 1, 2, 1, 0xfffffffe, 0, 20, 0xffffffff, 0xfffffffe, 2, 0, 0, 0, 0 };
+		volatile uint32_t *t = MHI_ELEMENT(0x6000 + ch_wp[0]);
+
+		for (unsigned i = 0; i < 13; i++) {
+			((volatile uint32_t *)(mhi_mem + 0xc000))[i] = hello[i];
+		}
+		t[0] = (uint32_t)MHI_AT(0xc000);
+		t[1] = (uint32_t)(MHI_AT(0xc000) >> 32);
+		t[2] = sizeof(hello);
+		t[3] = 2u << 16 | 1u << 9;
+		ch_wp[0] += 16;
+		MHI_CTX(44 * 20)->write = MHI_AT(0x6000 + ch_wp[0]);
+		__asm__ volatile ("dsb sy");
+		mhi_wr64(mhi + rd(mhi + 0x18) + 8 * 20, MHI_AT(0x6000 + ch_wp[0]));
+		printf("wifi: pcie: 9: QRTR HELLO SENT on channel 20 (%u bytes)\n", (unsigned)sizeof(hello));
+	}
 	for (int ms = 0; ms < 3000; ms++) {
 		while (mhi_event(1, e)) {
 			mhi_say_event("channel event", e);
