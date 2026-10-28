@@ -47,3 +47,16 @@ PCI, and the saved device tree. Raw material in `fw-collect-renoir/` (git-ignore
 
 Vibration first (SPMI writes, one register block), then sound (`SOUND.md`), then Wi-Fi (PCIe + MHI +
 ath11k), Bluetooth last.
+
+## Vibration works (session 4, 2026-10-28 evening)
+
+- `haptic=4 haptic_ms=500 haptic_amp=0xff` / `0x30`: strong and weak pulses felt and told apart, with
+  2450 mV, without the high-voltage boost (PBS). Use `RAMDISK=devices/renoir/prebuilt/vm-kernel/hold`:
+  with `hello` the panic at its exit cut a 500 ms pulse short before the registers were put back.
+- **`haptic=5` with `board=renoir` drives iOS's haptics** (taps and vibrations felt in iOS, confirmed by
+  the user): upstream's service (`/dev/hakios-haptic`, what iOS plays on its Taptic Engine) now calls
+  four motor actions (`motor_start/stop/gain/healthy`) that go to redwood's Awinic chip or to renoir's
+  PMIC: a tap is 20 ms of direct play, a vibration direct play until iOS stops, the strength follows
+  iOS's waveform on the amplitude register (0..0xff). At the run's end the motor is stopped and the
+  block put back as found; a PMIC fault stops it for the run.
+- Full run: `... board=renoir gpu=1 touchscreen=1 haptic=5` with `system.apfs` and `root-gl.apfs`.

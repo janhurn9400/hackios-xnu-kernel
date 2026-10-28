@@ -667,6 +667,7 @@ play_effect(unsigned effect)
 #define FOLLOW_US               20000           /* how often a vibration's strength follows iOS's */
 
 #define TOLD_EVENTS             24              /* the first so many taps and vibrations are each said */
+#define RENOIR_TAP_US           20000           /* renoir: how long a tap's pulse of direct play lasts */
 
 static volatile uint64_t heard_us;              /* when the last write that was not silence came */
 static volatile uint64_t quiet_us;              /* when the last write that was silence came */
@@ -808,10 +809,59 @@ chip_state(void)
  * vibrations at its gain, 0x80. So: Android's gain from a third of full scale up, and below that
  * down to five eighths of it for the softest -- never above Android's.
  */
+/*
+ * The motor's four actions for the service below: redwood's Awinic chip, or (board=renoir) the PMIC's
+ * haptics, whose functions are further down (renoir_motor_*).
+ */
+static bool renoir_mode;
+static bool renoir_motor_start(bool forever, uint8_t gain);
+static bool renoir_motor_stop(void);
+static bool renoir_motor_gain(uint8_t gain);
+static bool renoir_motor_healthy(const char *when);
+static bool renoir_motor_broken(void);
+
+static bool
+motor_start(unsigned waveform, bool forever, uint8_t gain)
+{
+	return renoir_mode ? renoir_motor_start(forever, gain) : start_waveform(waveform, forever, gain);
+}
+
+static bool
+motor_stop(void)
+{
+	return renoir_mode ? renoir_motor_stop() : stop_waveform();
+}
+
+/* stopped already (the Awinic chip in standby; renoir's motor not playing) */
+static bool
+motor_idle(void)
+{
+	return renoir_mode ? renoir_motor_stop() : wait_standby(0);
+}
+
+static bool
+motor_gain(uint8_t gain)
+{
+	return renoir_mode ? renoir_motor_gain(gain) : put(AW_PLAYCFG2, gain);
+}
+
+static bool
+motor_healthy(const char *when)
+{
+	return renoir_mode ? renoir_motor_healthy(when) : healthy(when);
+}
+
+static unsigned
+motor_state(void)
+{
+	return renoir_mode ? 0xfe : chip_state();
+}
+
 static uint8_t
 gain_for(uint32_t peak)
 {
-	uint32_t top = android_regs[AW_PLAYCFG2], low = top * 5 / 8, third = 32767 / 3;
+	/* renoir: the PMIC's amplitude, 0..0xff, its full scale what Android's vibrations use */
+	uint32_t top = renoir_mode ? 0xff : android_regs[AW_PLAYCFG2], low = top * 5 / 8, third = 32767 / 3;
 
 	return (uint8_t)(peak >= third ? top : low + (top - low) * peak / third);
 }
@@ -830,7 +880,7 @@ serve(void)
 		return;
 	}
 	say("haptic: THE MOTOR PLAYS WHAT IOS PLAYS ON ITS ACTUATOR (/dev/hakios-haptic) from here on, until the run ends\n");
-	while (!broken) {
+	while (!broken && !(renoir_mode && renoir_motor_broken())) {
 		uint64_t now = now_us();
 		bool active = heard_us != 0 && now - heard_us < ACTIVE_US;
 		uint32_t peak = heard_peak;
@@ -847,10 +897,10 @@ serve(void)
 			if (active && onset_us != tap_onset && now - onset_us >= SETTLE_US) {
 				uint64_t began = onset_us;
 
-				if (state == TAP && !wait_standby(0) && !stop_waveform()) {
+				if (state == TAP && !motor_idle() && !motor_stop()) {
 					break;
 				}
-				if (!start_waveform(1, false, gain ? gain : 1)) {
+				if (!motor_start(1, false, gain ? gain : 1)) {
 					break;
 				}
 				state = TAP;
@@ -860,15 +910,19 @@ serve(void)
 				if (taps + loops <= TOLD_EVENTS) {
 					wait_ms(4);
 					say("haptic: tap %u: iOS's waveform peaks at %u of 32768: Android's waveform 1 at gain %#04x; the "
-					    "chip's state %u\n", taps, peak, gain ? gain : 1, chip_state());
+					    "chip's state %u\n", taps, peak, gain ? gain : 1, motor_state());
 				}
 				break;
 			}
 			if (state == IDLE) {
 				break;
 			}
+			/* renoir: a tap is a short pulse of direct play, ended here (the Awinic chip ends its waveform 1 itself) */
+			if (renoir_mode && now - since > RENOIR_TAP_US) {
+				(void)motor_stop();
+			}
 			if (active && quiet_us < tap_onset && now - since > TAP_US) {
-				if (stop_waveform() && start_waveform(11, true, gain ? gain : 1)) {
+				if (motor_stop() && motor_start(11, true, gain ? gain : 1)) {
 					state = LOOP;
 					since = followed = now;
 					playing_gain = gain ? gain : 1;
@@ -879,11 +933,11 @@ serve(void)
 						wait_ms(4);
 						say("haptic: vibration %u: iOS goes on playing (peak %u): Android's waveform 11 over and over at "
 						    "gain %#04x, %u ms at most; the chip's state %u\n", loops, peak, gain ? gain : 1,
-						    HAPTIC_MAX_MS, chip_state());
+						    HAPTIC_MAX_MS, motor_state());
 					}
 				}
 			} else if (!active && now - since > TAP_US) {
-				state = wait_standby(0) || stop_waveform() ? IDLE : state;
+				state = motor_idle() || motor_stop() ? IDLE : state;
 			}
 			break;
 		case LOOP:
@@ -892,7 +946,7 @@ serve(void)
 				followed = now;
 				heard_peak = 0;
 				if (peak != 0 && (gain > playing_gain + 8 || gain + 8 < playing_gain)) {
-					if (!put(AW_PLAYCFG2, gain)) {
+					if (!motor_gain(gain)) {
 						break;
 					}
 					playing_gain = gain;
@@ -906,7 +960,7 @@ serve(void)
 					capped++;
 					rest_until = now + HAPTIC_MAX_MS * 1000ull;
 				}
-				if (stop_waveform()) {
+				if (motor_stop()) {
 					state = rest_until > now ? REST : IDLE;
 					if (taps + loops <= TOLD_EVENTS + 1) {
 						say("haptic: vibration %u: %s after %llu ms (its strength changed %u times, last to gain %#04x); "
@@ -924,7 +978,7 @@ serve(void)
 		}
 		if (state != IDLE && state != REST && now - last_look > 50000) {
 			last_look = now;
-			if (!healthy("while playing")) {
+			if (!motor_healthy("while playing")) {
 				break;
 			}
 		}
@@ -1169,6 +1223,62 @@ hv_show(const struct hv_block *b)
 	}
 }
 
+/* ---- renoir: the motor for iOS (haptic=5), the four actions serve() asks for ---------------------------- */
+
+static bool
+renoir_motor_start(bool forever, uint8_t gain)
+{
+	(void)forever;                          /* direct play goes on until stopped: serve() ends taps itself */
+	if (hv_broken || !hv_put(&hv_ptn, HV_PTN_DIRECT_PLAY, gain)) {
+		return false;
+	}
+	hv_playing = true;
+	if (!hv_put(&hv_cfg, HV_SPMI_PLAY, 0x81)) {
+		hv_stop_now("the start was not taken");
+		return false;
+	}
+	return true;
+}
+
+static bool
+renoir_motor_stop(void)
+{
+	if (!hv_playing) {
+		return true;
+	}
+	if (hv_broken || !hv_put(&hv_cfg, HV_SPMI_PLAY, 0x01)) {
+		hv_stop_now("the stop was not taken");
+		return false;
+	}
+	hv_playing = false;
+	return true;
+}
+
+static bool
+renoir_motor_gain(uint8_t gain)
+{
+	return !hv_broken && hv_put(&hv_ptn, HV_PTN_DIRECT_PLAY, gain);
+}
+
+static bool
+renoir_motor_healthy(const char *when)
+{
+	uint8_t fault = 0;
+
+	if (hv_read(&hv_cfg, HV_FAULT_STATUS, &fault, 1) != NULL || (fault & 0x07) != 0) {
+		say("haptic: %s: faults %#04x\n", when, fault);
+		hv_stop_now("a fault");
+		return false;
+	}
+	return true;
+}
+
+static bool
+renoir_motor_broken(void)
+{
+	return hv_broken;
+}
+
 static void
 renoir_haptics(void)
 {
@@ -1179,7 +1289,7 @@ renoir_haptics(void)
 	hv_cnfg = ml_io_map(R_ARB_CNFG_PHYS, 0x1000);
 	hv_observer = ml_io_map(R_ARB_OBSERVER_PHYS, 0x10000);
 	say("haptic: renoir: the PM8350B's haptics; arbiter version %#x; level %u (%s)\n", rd(hv_core + 0x000), level,
-	    level >= 4 ? "one pulse" : "reading only");
+	    level >= 5 ? "the motor for iOS" : level >= 4 ? "one pulse" : "reading only");
 	hv_find(&hv_cfg);
 	hv_find(&hv_ptn);
 	hv_find(&hv_hpwr);
@@ -1205,6 +1315,24 @@ renoir_haptics(void)
 	}
 	say("haptic: found: enable %#04x, vmax %#04x (%u mV), open-loop period %#04x %#04x (%u us), faults %#04x, "
 	    "amplitude %#04x\n", en, vmax, vmax * 50, tlra[0], tlra[1], ((tlra[0] & 0xf) << 8 | tlra[1]) * 5, fault, amp_was);
+	if (level >= 5) {
+		/* configured as for the pulse, then the service: what iOS plays on its actuator, until the run ends */
+		if (hv_put(&hv_cfg, HV_FAULT_CLR, 0x07) && hv_put(&hv_cfg, HV_VMAX, HV_VMAX_MV / 50) &&
+		    hv_put(&hv_cfg, HV_TLRA_OL_HIGH, (uint8_t)(period >> 8 & 0xf)) &&
+		    hv_put(&hv_cfg, HV_TLRA_OL_LOW, (uint8_t)(period & 0xff)) && hv_put(&hv_cfg, HV_EN_CTL, 0x80)) {
+			renoir_mode = true;
+			serve();
+		}
+		if (hv_playing) {
+			hv_stop_now("still playing at the end");
+		}
+		if (!hv_broken && hv_put(&hv_ptn, HV_PTN_DIRECT_PLAY, amp_was) && hv_put(&hv_cfg, HV_EN_CTL, en) &&
+		    hv_put(&hv_cfg, HV_TLRA_OL_HIGH, tlra[0]) && hv_put(&hv_cfg, HV_TLRA_OL_LOW, tlra[1]) &&
+		    hv_put(&hv_cfg, HV_VMAX, vmax)) {
+			say("haptic: the registers are back as found\n");
+		}
+		return;
+	}
 	if (hv_put(&hv_cfg, HV_FAULT_CLR, 0x07) && hv_put(&hv_cfg, HV_VMAX, HV_VMAX_MV / 50) &&
 	    hv_put(&hv_cfg, HV_TLRA_OL_HIGH, (uint8_t)(period >> 8 & 0xf)) &&
 	    hv_put(&hv_cfg, HV_TLRA_OL_LOW, (uint8_t)(period & 0xff)) && hv_put(&hv_cfg, HV_EN_CTL, 0x80) &&
@@ -1305,6 +1433,10 @@ hakios_haptic_quiesce(void)
 	if (hv_playing) {                       /* renoir: a pulse that is still on is stopped */
 		leaving = true;
 		hv_stop_now("at the run's end");
+	}
+	if (renoir_mode) {
+		say("haptic: at the run's end: %u taps and %u vibrations played (%u cut at %u ms), from %llu frames iOS wrote\n",
+		    taps, loops, capped, HAPTIC_MAX_MS, written_frames);
 	}
 	if (released && tlmm != 0) {
 		leaving = true;
