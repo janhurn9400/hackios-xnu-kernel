@@ -1,4 +1,27 @@
-# Where the renoir port stands, and what to do next (2026-10-28, end of session 1)
+# Where the renoir port stands, and what to do next
+
+## Session 2 (2026-10-28), in short
+
+Kernel built in the VM and booted; touch (FocalTech FT5652, `board=renoir`); iOS 16.5 to SpringBoard
+with touch; **GPU at 490 MHz** (Adreno 642, Mesa FD660, `gpu=1`, image `root-gl.apfs`); display measured
+(tearing is between display controller and panel, not in the framebuffer: `GPU.md`); firmware pulled
+(`fw-*`, Wi-Fi is a QCA6490 on PCIe); **ADSP steps 1-6 work, its start resets the phone** (`ADSP.md`).
+A full iOS run today:
+
+```
+fastboot oem ramdisk; fastboot stage devices/renoir/prebuilt/sysimg/system.apfs
+FOLLOW=10 KERNEL=devices/renoir/prebuilt/vm-kernel/mach.development.bcm2837 \
+RAMDISK=devices/renoir/prebuilt/sysimg/root-gl.apfs devices/renoir/run-open.sh 600 \
+  sb_delay=8 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 board=renoir gpu=1
+```
+
+Next, in order: save the crashed run's kernel log in the loader (to see the ADSP's last line); the
+ADSP's start (battery, sound); the status bar clock away from the punch hole (`inject_sb.c`, the
+non-notch layout); a crash landing in fastboot instead of MagicOS (the restart reason); tearing (renoir's
+real panel node, `msm_drm.dsi_display0=` on MagicOS's command line); Wi-Fi/Bluetooth (QCA6490: PCIe, MHI,
+ath11k; UART HCI) as a project of its own.
+
+## Session 1 (end of 2026-10-28 morning)
 
 Read first: `WORKFLOW.md` (Mac + VM, USB re-plug, run loop), `PORTING.md` (done/not done with log
 lines), `TOUCH.md` (all touch facts), `git log renoir`.

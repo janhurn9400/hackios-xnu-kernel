@@ -62,7 +62,4 @@ proxy clock, the crypto engine's bandwidth.
   survives the watchdog's reset; the loader (`xnuloader/loader.c`) could save the previous run's log
   when it starts again. That would show the last line of every crash, not only this one.
 
-Compare step 7 with renoir's own start code (LineageOS `android_kernel_xiaomi_sm8350`:
-`drivers/soc/qcom/subsys-pil-tz.c`, `peripheral-loader.c`, the AOP QMP load state): the order of proxy
-votes, clocks, bus votes and the TrustZone calls. Speaker amplifiers for later: two NXP TFA98xx at
-0x34/0x35.
+- Speaker amplifiers, for the sound later: two NXP TFA98xx at 0x34/0x35 (MagicOS dmesg).
