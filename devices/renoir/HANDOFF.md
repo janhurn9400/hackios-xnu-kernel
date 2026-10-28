@@ -2,6 +2,7 @@
 
 ## Session 3 (2026-10-28, ~17:45-18:40): the ADSP is solved, USB after it is not
 
+- **iOS shows the battery** (home screen, status bar) with `adsp=1` and `system-fw.apfs` (ADSP.md).
 - **The ADSP works, steps 1-11**: it starts (up after 38 ms), GLINK channels `apr_audio_svc` and
   `PMIC_RTR_ADSP_APPS` open, QRTR hello and 12 services, a battery manager notice, APR "audio services
   are up" (`ADSP.md`, `adsp_step=11 adsp_keep=1`).
