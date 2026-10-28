@@ -313,7 +313,7 @@ bus_give_back(void)
 
 /* A 16-bit register of an Awinic amplifier, most significant byte first. Returns false if nobody answers. */
 static bool
-register_read(uint8_t address, uint8_t reg, uint16_t *value)
+register_read_once(uint8_t address, uint8_t reg, uint16_t *value)
 {
 	bool answered;
 
@@ -338,7 +338,7 @@ register_read(uint8_t address, uint8_t reg, uint16_t *value)
 }
 
 static bool
-register_write(uint8_t address, uint8_t reg, uint16_t value)
+register_write_once(uint8_t address, uint8_t reg, uint16_t value)
 {
 	bool answered;
 
@@ -353,6 +353,42 @@ register_write(uint8_t address, uint8_t reg, uint16_t value)
 	i2c_stop();
 	bus_give_back();
 	return answered;
+}
+
+/*
+ * A transfer that went wrong on the bus (renoir, iOS running: now and then one is not acknowledged) is tried
+ * again, three times in all, before it counts as not answered. (Writing a register twice does no harm.)
+ */
+static unsigned bus_retries;
+
+static bool
+register_read(uint8_t address, uint8_t reg, uint16_t *value)
+{
+	for (unsigned try = 0; try < 3; try++) {
+		if (register_read_once(address, reg, value)) {
+			return true;
+		}
+		bus_retries++;
+		if (!leaving) {
+			spin_us(200);
+		}
+	}
+	return false;
+}
+
+static bool
+register_write(uint8_t address, uint8_t reg, uint16_t value)
+{
+	for (unsigned try = 0; try < 3; try++) {
+		if (register_write_once(address, reg, value)) {
+			return true;
+		}
+		bus_retries++;
+		if (!leaving) {
+			spin_us(200);
+		}
+	}
+	return false;
 }
 
 static const char *
@@ -643,10 +679,30 @@ acf_profiles(const uint8_t *acf, uint64_t size)
 }
 
 /* Both powered down at once, without the driver's ceremony: a fault, or a value that did not stick. */
+static const char *trouble;              /* why both were powered down at once, for the sound's status line */
+static char tfa_flags[96];              /* the last status that read as a fault, for the sound's status line */
+static unsigned tfa_second_looks;       /* faults gone on a second look (sticky flags, cleared by the first read) */
+static unsigned tfa_unread, tfa_unread_row;     /* status reads that failed on the bus: in all, and in a row */
+#define TFA_UNREAD_ROW_MAX      5               /* 5 looks in a row (1 s while it plays): then it is a fault */
+
+static char trouble_text[200];
+
+const char *
+hakios_speaker_trouble(void)
+{
+	if (!renoir || (trouble == NULL && tfa_second_looks == 0 && tfa_unread == 0 && bus_retries == 0)) {
+		return trouble;
+	}
+	snprintf(trouble_text, sizeof(trouble_text), "%s; %u passing alarms, %u reads lost, %u bus retries; last %s",
+	    trouble ? trouble : "none", tfa_second_looks, tfa_unread, bus_retries, tfa_flags[0] ? tfa_flags : "-");
+	return trouble_text;
+}
+
 static void
 power_down_now(const char *why)
 {
 	broken = true;
+	trouble = why;
 	if (renoir) {
 		/* the TFA9873s: 0x00 bit 0 power-down set, bit 3 the amplifier's enable cleared */
 		say("speaker: %s: BOTH AMPLIFIERS ARE POWERED DOWN AT ONCE (0x00: power-down set, amplifier off)\n", why);
@@ -923,7 +979,15 @@ tfa_faulty(struct amplifier *a, const char *when, bool tell)
 
 	if (!get(a, TFA_STATUS0, &s0) || !get(a, TFA_STATUS1, &s1) || !get(a, TFA_STATUS3, &s3) || !get(a, TFA_STATE, &state) ||
 	    !get(a, TFA_SYS0, &sys0) || !get(a, 0x01, &sys1)) {
-		return true;
+		/* not read is not a fault: only a bus that stays silent for TFA_UNREAD_ROW_MAX looks is */
+		tfa_unread++;
+		snprintf(tfa_flags, sizeof(tfa_flags), "%s %s: a status read failed on the bus", a->address == 0x34 ? "RCV" : "SPK", when);
+		return ++tfa_unread_row >= TFA_UNREAD_ROW_MAX;
+	}
+	tfa_unread_row = 0;
+	if ((s0 & TFA_STATUS0_GOOD) != TFA_STATUS0_GOOD || (s0 & TFA_STATUS0_BAD) != 0 || (s3 & TFA_STATUS3_OVDS) == 0) {
+		snprintf(tfa_flags, sizeof(tfa_flags), "%s %s: status %#06x %#06x %#06x, control %#06x", a->address == 0x34 ? "RCV" : "SPK",
+		    when, s0, s1, s3, sys0);
 	}
 	if (tell) {
 		say("speaker: the amplifier %s %s: control %#06x %#06x, status %#06x %#06x %#06x, state %u (clocks %s, PLL %s, "
@@ -1095,7 +1159,12 @@ tfa_healthy(void)
 			return false;
 		}
 		if (a->started && tfa_faulty(a, "while it plays", false)) {
-			(void)tfa_faulty(a, "while it plays", true);
+			/* the alarms are sticky and cleared by reading: a fault is one that is still there 2 ms later */
+			wait_ms(2);
+			if (!tfa_faulty(a, "while it plays, a second look", true)) {
+				tfa_second_looks++;
+				continue;
+			}
 			power_down_now("an amplifier reports a fault");
 			return false;
 		}

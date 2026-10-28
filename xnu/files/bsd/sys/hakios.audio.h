@@ -71,6 +71,7 @@ bool hakios_speaker_volume(uint32_t below, uint32_t step_ms); /* below Android's
 bool hakios_speaker_healthy(void);     /* no fault reported; on one, both are powered down at once */
 void hakios_speaker_stop(void);        /* faded out, muted, powered down, in Android's order */
 void hakios_speaker_quiesce(void);     /* powered down at once, without sleeping: on a panic's way out */
+const char *hakios_speaker_trouble(void); /* why both were powered down at once (NULL: never) */
 bool hakios_speaker_clock_test(void);  /* renoir: powered up to the bit clock and down again, amplifiers off (sound=1) */
 /* the amplifiers' own temperature and battery voltage read (every second while they play): the reduction they call for */
 uint32_t hakios_speaker_monitor(bool tell);

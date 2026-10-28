@@ -65,7 +65,9 @@
  * renoir (board=renoir): its TFA9873s sit on TERT_MI2S instead, AFE port 0x1004 at 96 kHz (see
  * RENOIR_PORT below and devices/renoir/SOUND.md); sound=1 also powers them up to the bit clock
  * with their amplifiers off (hakios_speaker_clock_test()), sound=3 plays the tone sound_below
- * made quieter in 6 dB steps, for want of a volume in the amplifiers; sound=4 is not there yet.
+ * made quieter in 6 dB steps, for want of a volume in the amplifiers; sound=4 takes iOS's 48 kHz
+ * through the guard at that rate, sound_below quieter in the same steps, then doubled to 96 kHz
+ * (upsample_96k()).
  *
  * What is started is stopped, and what is written is put back, when the time is over -- or, if
  * the DSP is to be shut down earlier (the run's end), before that (hakios_sound_dsp_down()).
@@ -98,6 +100,12 @@ static LCK_GRP_DECLARE(sound_lock_group, "hakios-sound");
 static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up or taken down */
 
 static uint32_t level, seconds = 3, below = 240, pause_ms = 1000, gain = HAKIOS_GUARD_MAX_GAIN;
+/*
+ * boot-arg sound_keep_on: once started, the amplifiers stay on through silence. renoir's default (=1): there,
+ * stopping the TFA9873s after three seconds of silence and starting them again left iOS's audio silent (iOS wrote
+ * nothing more, its haptics stopped too; 2026-10-28) -- not understood yet. Idle, they hiss not.
+ */
+static uint32_t keep_on = UINT32_MAX;
 static uint32_t guard_as = UINT32_MAX;  /* boot-arg sound_guard_as=N: the guard reckons the amplifiers at most N under (a test) */
 static char last_write[96] = "nothing written";
 
@@ -1205,27 +1213,60 @@ guard_say(const char *when, bool quiet)
 	    db_text(t[5], hakios_guard_decibels(r.slow)));
 }
 
+/*
+ * renoir: iOS's 48 kHz frames, which went through the guard at that rate, made sound_below quieter
+ * (its amplifiers have no volume) and then brought to the port's 96 kHz in place: every frame
+ * twice, the first of the two halfway from the one before (from the last, so nothing is
+ * overwritten that is still to be read).
+ */
+static int16_t last_left, last_right;
+
+static void
+upsample_96k(int16_t *samples, uint32_t frames)
+{
+	int32_t first_left = last_left, first_right = last_right;      /* the previous period's last frame */
+
+	for (uint32_t k = frames; k-- > 0;) {
+		int32_t left = samples[2 * k] >> tone_shift, right = samples[2 * k + 1] >> tone_shift;
+		int32_t before_left = k ? samples[2 * (k - 1)] >> tone_shift : first_left;
+		int32_t before_right = k ? samples[2 * (k - 1) + 1] >> tone_shift : first_right;
+
+		if (k == frames - 1) {
+			last_left = (int16_t)left;      /* (for the next period's first frame) */
+			last_right = (int16_t)right;
+		}
+		samples[4 * k + 2] = (int16_t)left;
+		samples[4 * k + 3] = (int16_t)right;
+		samples[4 * k] = (int16_t)((before_left + left) / 2);
+		samples[4 * k + 1] = (int16_t)((before_right + right) / 2);
+	}
+}
+
 /* A period from the ring, the rest of it silence. */
 static void
 period_fill_ios(unsigned period)
 {
 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
-	uint32_t tail = ring_tail, available = ring_head - tail, n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
+	uint32_t frames = PERIOD_FRAMES / (rate / RATE);        /* iOS's frames a period holds: 960, renoir's 480 */
+	uint32_t tail = ring_tail, available = ring_head - tail, n = available < frames ? available : frames;
 
 	OSMemoryBarrier();
 	for (uint32_t i = 0; i < n; i++) {
 		samples[2 * i] = ring[2 * ((tail + i) % RING_FRAMES)];
 		samples[2 * i + 1] = ring[2 * ((tail + i) % RING_FRAMES) + 1];
 	}
-	bzero(samples + 2 * n, (PERIOD_FRAMES - n) * 4);
+	bzero(samples + 2 * n, (frames - n) * 4);
 	OSMemoryBarrier();
 	ring_tail = tail + n;
 	fed_frames += n;
-	silent_frames += PERIOD_FRAMES - n;
+	silent_frames += frames - n;
 	/* the guard, on every period, silence too: its filter and its averages go on (hakios.guard.c) */
-	hakios_guard_process(samples, PERIOD_FRAMES);
+	hakios_guard_process(samples, frames);
 	if (n != 0 && hakios_audio_recording_fed()) {
 		hakios_audio_record_fed(samples, n);
+	}
+	if (frames != PERIOD_FRAMES) {
+		upsample_96k(samples, frames);
 	}
 	guard_periods++;
 	for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + PERIOD_BYTES; line += 64) {
@@ -1311,7 +1352,7 @@ static void
 watch(void)
 {
 	bool on = false, given_up = false, muted = false;
-	uint64_t last_look = 0, last_monitor = 0;
+	uint64_t last_look = 0, last_monitor = 0, last_status = 0;
 	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0;
 
 	guard_level(below);                     /* (from the first sample on: see guard_off()) */
@@ -1321,6 +1362,18 @@ watch(void)
 		uint32_t extra_now, generation_now;
 		bool muted_now;
 
+		/*
+		 * a short line twice a second: during a run with the DSP only the loader's notes of the log survive (its last
+		 * 1200 bytes, once a second, among iOS's own lines), and this one is meant to be in them
+		 */
+		if (now - last_status >= 500000) {
+			const char *trouble = hakios_speaker_trouble();
+
+			last_status = now;
+			say("sound: st on %u starts %u gave-up %u muted %u vol-changes %u ios %llu fed %llu peak %u sound %lld ms ago%s%s\n",
+			    on, starts, given_up, muted, changes, ios_frames, fed_frames, ios_peak, sounded ? (long long)((now - sounded) /
+			    1000) : -1LL, trouble ? " trouble: " : "", trouble ? trouble : "");
+		}
 		if (hakios_audio_volume(&extra_now, &muted_now, &generation_now) && generation_now != generation) {
 			generation = generation_now;
 			extra = extra_now;
@@ -1360,9 +1413,9 @@ watch(void)
 				/* (what is written now is heard after the periods already queued at the DSP: PERIODS x 20 ms) */
 				say("sound: the amplifiers are up %llu ms after the first write that was not silence; that write reaches "
 				    "them %u ms after it was made, behind the periods queued at the DSP\n", (last_look - sounded) / 1000,
-				    PERIODS * PERIOD_FRAMES / 48);
+				    PERIODS * PERIOD_FRAMES * 1000 / rate);
 			}
-		} else if (on && now - sounded > QUIET_BEFORE_OFF_US) {
+		} else if (on && !keep_on && now - sounded > QUIET_BEFORE_OFF_US) {
 			say_when("three seconds of silence: the amplifiers are stopped");
 			say("sound: what iOS wrote while they were on peaked at %u%% of full scale (%u)\n", ios_peak * 100 / 32768,
 			    ios_peak);
@@ -1498,8 +1551,10 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		if (!hakios_speaker_prepare(acf, acf_size)) {
 			goto out;
 		}
-		hakios_adsp_fw_free(acf, acf_size);
-		acf = NULL;
+		if (acf != NULL) {
+			hakios_adsp_fw_free(acf, acf_size);
+			acf = NULL;
+		}
 		feeder_runs = true;
 		if (kernel_thread_start(feeder_thread, NULL, &feeder) != KERN_SUCCESS) {
 			feeder_runs = false;
@@ -1511,6 +1566,10 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		hakios_audio_set_sink("the speakers (the audio DSP, hakios.sound.c)", ios_sink);
 		say("sound: WHAT IOS PLAYS GOES TO THE SPEAKERS from here on, %u.%03u dB under Android's level, until the run ends\n",
 		    below / 8, below % 8 * 125);
+		if (renoir) {
+			say("sound: renoir: that is %u x 6 dB off the samples after the guard (the TFA9873s have no volume), then 48 -> 96 "
+			    "kHz\n", tone_shift);
+		}
 		say("sound: through the guard (hakios.guard.c): %u.%03u dB of gain first (sound_gain), then high-pass at 200 Hz; peaks "
 		    "3 dB, the 0.2 s/3 s/60 s power 6/9/12 dB under full scale at Android's level\n", gain / 8, gain % 8 * 125);
 		if (guard_as < below) {
@@ -1578,17 +1637,20 @@ hakios_sound_dsp_up(void)
 			audio_stream = RENOIR_AUDIO_STREAM;
 			/* sound_below in 6 dB steps off the samples; the TFA9873s have no volume, and nobody knows Android's level yet */
 			tone_shift = below / 48 > 15 ? 15 : below / 48;
-			if (level >= 4) {
-				say("sound: board=renoir: iOS's sound (level 4) needs 96 kHz from the plug-in: not yet; level 3 instead\n");
-				level = 3;
+			if (keep_on == UINT32_MAX) {
+				keep_on = 1;
 			}
 		}
 	}
 	PE_parse_boot_argn("sound_pause", &pause_ms, sizeof(pause_ms));
 	PE_parse_boot_argn("sound_guard_as", &guard_as, sizeof(guard_as));
+	PE_parse_boot_argn("sound_keep_on", &keep_on, sizeof(keep_on));
 	PE_parse_boot_argn("sound_gain", &gain, sizeof(gain));
 	if (gain > HAKIOS_GUARD_MAX_GAIN) {
 		gain = HAKIOS_GUARD_MAX_GAIN;
+	}
+	if (keep_on == UINT32_MAX) {
+		keep_on = 0;
 	}
 	hakios_guard_configure(true, gain);
 	if (level >= 2 && level <= 3 && seconds > 3) {

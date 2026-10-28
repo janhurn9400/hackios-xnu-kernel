@@ -1,5 +1,12 @@
 # Where the renoir port stands, and what to do next
 
+## Session 4 (2026-10-28 evening), in short
+
+Vibration in iOS (`haptic=5`), hangs land in fastboot, and **sound in iOS** (`sound=4`, two TFA9873s on
+TERT_MI2S, 96 kHz). The run command and the open items are at the top of `HANDOFF.md`; all of the sound
+in `SOUND.md`. Next: ringtone previews (silent), why stopping the amplifiers silences iOS, a volume for the
+TFA9873s; then tearing, Wi-Fi/BT, USB after the DSP.
+
 ## Session 2 (2026-10-28), in short
 
 Kernel built in the VM and booted; touch (FocalTech FT5652, `board=renoir`); iOS 16.5 to SpringBoard

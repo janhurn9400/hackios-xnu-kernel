@@ -1,7 +1,9 @@
 # renoir sound: what is known (2026-10-28, session 3) and what the port needs
 
-Status (2026-10-28, 20:17): **the first tone plays** (`sound=3`, both TFA9873s, TERT_MI2S at 96 kHz).
-iOS's sound (`sound=4`) is not there yet. The ADSP runs with its audio services up (`ADSP.md`).
+Status (2026-10-28, 20:52): **iOS's sound plays** (`sound=4`: the charging chime and the keyboard clicks,
+heard; haptics felt alongside, no hiss), with the amplifiers kept on once started (renoir's default
+`sound_keep_on=1`). Ringtone previews in Settings stay silent and the ringtone cannot be changed: an iOS
+side matter (the tone library), not the driver. The ADSP runs with its audio services up (`ADSP.md`).
 
 ## redwood (what `hakios.sound.c` / `hakios.speaker.c` do)
 
@@ -122,5 +124,29 @@ Runs (iOS from `system-fw.apfs` + `root-gl.apfs`, `bootcpu=7 cpus=8 ... board=re
   amplifier fault. The log lines survive only in the loader's per-second notes (`oem log` after the
   next start; USB is gone during a DSP run), so parts are missing.
 
-Next: `sound=4` (iOS writes 48 kHz: run the port at 48 kHz or resample), a level for the TFA9873s
+## iOS's sound (sound=4), session 4, 20:24-20:52
+
+Run: `fastboot oem ramdisk; fastboot stage prebuilt/sysimg/system-fw.apfs`, then kernel + `root-gl.apfs`,
+`loader_return_after=300 sb_delay=8 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 board=renoir gpu=1 haptic=5 adsp=1
+sound=4 sound_below=144`. USB goes when the DSP starts; leave by keys (power + volume down: fastboot), then boot
+`xnu-usb-renoir-crashlog.img` and `fastboot oem log` / `get_staged`: the loader's per-second notes.
+
+- iOS writes 48 kHz; the feeder takes 480 of its frames per 10 ms period, runs the guard at 48 kHz, takes
+  `sound_below` off in 6 dB steps (`tone_shift`), then doubles to 96 kHz (`upsample_96k()`, the first of each
+  pair halfway from the frame before).
+- **A status line** every 0.5 s (`sound: st on .. starts .. gave-up .. ios <frames> fed <frames> peak ..
+  trouble: ..`): the only thing that reliably survives in the notes among iOS's own lines.
+- What went wrong on the way, in order:
+  1. A fault read during play powered both down (`gave-up 1`); `last -` showed no status had been read as a
+     fault: **I2C transfers get lost now and then** with iOS running (6 retries in one run). Fix: every
+     transfer is tried three times (`register_read/write`), a status not read counts as a fault only 5 looks
+     in a row, a fault flag only if it is still there on a second look 2 ms later (the alarms are sticky).
+  2. Then no more fault, but after the chime **iOS wrote nothing more** (`ios` frozen at 150528 frames) and its
+     haptics stopped too, when the amplifiers were stopped after 3 s of silence and started again. With
+     `haptic=5 adsp=1` and no sound, haptics work; with `sound_keep_on=1` the keyboard clicks play and haptics
+     work. Why the stop/start silences iOS is not understood (the kernel's write path never waits) --
+     **renoir keeps the amplifiers on** (`sound_keep_on=0` brings the stop back, for a look).
+- Upstream runs `sound=4` with `haptic=5` on redwood (`docs/ru/notes.md`): this was renoir-specific.
+
+Next: why stopping the TFA9873s silences iOS (then stop them on silence again, for the battery), a level for the TFA9873s
 (TDMSPKG 0x5f[9:6] / AMPGAIN 0x52 are candidates), and the amplifiers' temperature/battery monitor.

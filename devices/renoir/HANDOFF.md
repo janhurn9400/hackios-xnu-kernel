@@ -1,5 +1,47 @@
 # Handoff for the next session
 
+## Session 4 (2026-10-28, ~19:00-20:55): vibration, crash -> fastboot, and SOUND in iOS
+
+Read first: this, then `SOUND.md` (all of the sound, with the run command and how to get the log after a
+DSP run), `WORKFLOW.md`, `ADSP.md`. Branch `renoir`, everything committed, **nothing pushed**.
+
+What works on the phone now (all with `board=renoir`):
+- iOS 16.5 to SpringBoard, touch, GPU 490 MHz (`gpu=1`), battery in the status bar (`adsp=1`).
+- **Vibration in iOS** (`haptic=5`, PM8350B haptics; `WIFI-BT-HAPTICS.md`), also together with sound.
+- **A hang lands in fastboot**, not MagicOS (reboot reason "bootloader" set at every run; `WORKFLOW.md`).
+- **Sound in iOS** (`sound=4`): charging chime and keyboard clicks from the two NXP TFA9873s on
+  TERT_MI2S at 96 kHz (`hakios.speaker.c` renoir section, `hakios.sound.c` RENOIR_*). Test tone `sound=3`.
+
+The full run used last (20:50, worked):
+```
+fastboot oem ramdisk; fastboot stage devices/renoir/prebuilt/sysimg/system-fw.apfs     # 80 s, has fw/adsp.*
+python3 xnuloader/mkpayload.py -o run-payload.bin kernel=devices/renoir/prebuilt/vm-kernel/mach.development.bcm2837 \
+  ramdisk=devices/renoir/prebuilt/sysimg/root-gl.apfs --cmdline "loader_return_after=300 epoch=$(date +%s) sb_delay=8 \
+  bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 board=renoir gpu=1 haptic=5 adsp=1 sound=4 sound_below=144"
+fastboot stage run-payload.bin; fastboot oem run
+```
+USB is gone ~3 s after the DSP starts (known, `ADSP.md`). After testing: the user goes to fastboot by keys
+(power long + volume down); then `fastboot boot devices/renoir/prebuilt/xnu-usb-renoir-crashlog.img`,
+`fastboot oem log; fastboot get_staged FILE` -> the loader's per-second notes of the run (grep `sound: st`).
+After every reset the system image has to be staged again.
+
+Kernel in `prebuilt/vm-kernel/` is from 20:54: renoir keeps the amplifiers on by default (`sound_keep_on=1`);
+that exact build was not run on the phone yet (the 20:48 one with `sound_keep_on=1` given was).
+
+Open, in order of what the user cares about:
+1. **Ringtone previews** in Settings -> Sounds & Haptics are silent and the ringtone cannot be changed (iOS
+   side: tone library / `tonelibraryd`?); compare with redwood upstream.
+2. **Why stopping the TFA9873s after 3 s of silence silences iOS** (iOS then writes nothing more to
+   `/dev/hakios-audio`, haptics stop too). Then stop them on silence again, for the battery.
+3. Volume: TFA9873 has no volume register used yet; `sound_below` is applied to the samples (6 dB steps).
+   Candidates TDMSPKG 0x5f[9:6], AMPGAIN 0x52. Which speaker plays (earpiece heard; bottom not confirmed).
+4. Older items: tearing, Wi-Fi/BT (QCA6490), USB after the DSP, status bar clock under the punch hole,
+   Metal (upstream's `oosexgang/hakios-metal` has blits, no shaders yet; UniXNU's Turnip route: `UNIXNU.md`).
+
+Upstream published new docs (2026-10-28): https://hackios-web.vercel.app/en, kernel branch `hakios` of
+`oosexgang/hakios-xnu-kernel` (`docs/driver-review/sound.md` lists known sound-code weaknesses S-01..S-16;
+S-15, a period whose submission fails is never resubmitted, is a candidate for silences later).
+
 ## Session 3 (2026-10-28, ~17:45-18:40): the ADSP is solved, USB after it is not
 
 - **iOS shows the battery** (home screen, status bar) with `adsp=1` and `system-fw.apfs` (ADSP.md).
