@@ -12,7 +12,10 @@ Open: **the serial engine is not used.** QUP0 SE2's clocks come on (S AHB is har
 `0x8000000a`, bit 1 -- now accepted as running), but `GENI_IF_DISABLE_RO` = 1: the FIFO interface is
 off, the engine is set up for GSI DMA only. The driver falls back to SPI on the pins by hand, which
 works (data in on gpio20) with ~15 % failed reads (205 of 1223 looks). Next: GSI DMA for the engine,
-or fewer failed reads by hand (timing). Axes not checked yet: tap the four corners, `touch_flip=1|2|3`.
+or fewer failed reads by hand (timing). Axes checked by tapping the corners (held upright): x grows to the right, y downwards, no
+`touch_flip` needed. The extent is **8640 x 19200** (1080 x 2400 in eighths), not redwood's 10800 x 24000:
+raw top left 585/854, top right 7817/674, bottom right 7784/18343, bottom left 985/18400, middle
+4192/10019 (48.5 % / 52 %). Now `focaltech_max_x/y` in the board profile.
 
 Collected before the driver change: Everything below was
 read off a real renoir (MIUI 14.0.7 vendor, rooted), its device tree, and renoir's own kernel source
@@ -50,7 +53,7 @@ From renoir's `focaltech_spi/focaltech_spi.c` and `focaltech_core.[ch]`:
 - report: 6 bytes per touch, point count at [2] & 0x0F, X_H 3, X_L 4, Y_H 5, Y_L 6, PRE 7, AREA 8,
   event = [3] >> 6, id = [5] >> 4, and the **15-bit coordinates**
   `x = (XH & 0x0F) << 11 | XL << 3 | (PRE & 0xE0) >> 5`, `y` likewise with `(PRE & 0x1C) >> 2` —
-  identical to redwood's `focaltech_report()`. Panel extent then 10800 × 24000.
+  identical to redwood's `focaltech_report()`. Panel extent on renoir: 8640 × 19200 (measured; see above).
 
 ## What `hakios.goodix.c` hard-codes for redwood, and renoir's value
 

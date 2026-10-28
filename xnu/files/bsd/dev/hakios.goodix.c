@@ -89,6 +89,7 @@ struct touch_board {
 	uint32_t m_ahb_cbcr, s_ahb_cbcr, se_cbcr, se_rcg;       /* offsets in the GCC */
 	uint8_t focaltech_id, focaltech_boot_id;        /* the low chip ID byte when running, and in the boot ROM */
 	bool focaltech_upload;                  /* the chip has no flash: its firmware goes into PRAM after reset */
+	uint32_t focaltech_max_x, focaltech_max_y;      /* the panel in the chip's 15-bit coordinates */
 };
 
 static const struct touch_board redwood = {
@@ -98,6 +99,7 @@ static const struct touch_board redwood = {
 	.vote_core_2x = 1u << 18, .vote_core = 1u << 19, .vote_m_ahb = 1u << 20, .vote_s_ahb = 1u << 21, .vote_se = 1u << 27,
 	.m_ahb_cbcr = 0x18004, .s_ahb_cbcr = 0x18008, .se_cbcr = 0x185fc, .se_rcg = 0x18600,
 	.focaltech_id = 0x62, .focaltech_boot_id = 0x62, .focaltech_upload = true,
+	.focaltech_max_x = 10800, .focaltech_max_y = 24000,
 };
 
 static const struct touch_board renoir = {
@@ -108,6 +110,7 @@ static const struct touch_board renoir = {
 	.vote_core_2x = 1u << 9, .vote_core = 1u << 8, .vote_m_ahb = 1u << 6, .vote_s_ahb = 1u << 7, .vote_se = 1u << 12,
 	.m_ahb_cbcr = 0x17004, .s_ahb_cbcr = 0x17008, .se_cbcr = 0x1726c, .se_rcg = 0x17270,
 	.focaltech_id = 0x52, .focaltech_boot_id = 0xb2, .focaltech_upload = false,      /* FT5652: its own flash */
+	.focaltech_max_x = 8640, .focaltech_max_y = 19200,      /* 1080 x 2400 in eighths: taps in the corners */
 };
 
 static const struct touch_board *board = &redwood;
@@ -1280,7 +1283,9 @@ static void
 focaltech_contact_update(uint32_t id, uint32_t event, uint32_t x, uint32_t y,
     uint32_t max_report_x, uint32_t max_report_y)
 {
-	static unsigned shown;
+	static unsigned shown, downs;
+	uint32_t raw_x = x, raw_y = y;
+	bool fresh;
 
 	if (id >= FOCALTECH_MAX_TOUCHES || max_report_x == 0 || max_report_y == 0) {
 		return;
@@ -1294,6 +1299,9 @@ focaltech_contact_update(uint32_t id, uint32_t event, uint32_t x, uint32_t y,
 		return;
 	}
 	seen.touches++;
+	fresh = !focaltech_contact[id].down;
+	x = x < max_report_x ? x : max_report_x - 1;
+	y = y < max_report_y ? y : max_report_y - 1;
 	switch (flip) {
 	case 1: x = max_report_x - 1 - x; break;
 	case 2: y = max_report_y - 1 - y; break;
@@ -1312,14 +1320,13 @@ focaltech_contact_update(uint32_t id, uint32_t event, uint32_t x, uint32_t y,
 	}
 	focaltech_contact[id].x = x;
 	focaltech_contact[id].y = y;
-	if (shown++ < 8) {
-		printf("focaltech: finger %u %s at %u, %u\n", id,
-		    event == FOCALTECH_EVENT_DOWN ? "down" : "move", x, y);
+	/* the first 8 positions, and every new finger (up to 40): enough to check the axes by tapping the corners */
+	if (shown++ < 8 || (fresh && downs++ < 40)) {
+		printf("focaltech: finger %u %s at %u, %u (raw %u, %u of %u x %u)\n", id,
+		    fresh ? "down" : "move", x, y, raw_x, raw_y, max_report_x, max_report_y);
 	}
 }
 
-/* Panel size in the FT3680 super-high-resolution reports (device tree x_max/y_max on redwood). */
-static uint32_t focaltech_max_x = 10800, focaltech_max_y = 24000;
 
 static void
 focaltech_report(const uint8_t *report)
@@ -1342,7 +1349,7 @@ focaltech_report(const uint8_t *report)
 		    ((uint32_t)touch[4] >> 5);
 		y = ((uint32_t)(touch[2] & 0x0f) << 11) | ((uint32_t)touch[3] << 3) |
 		    (((uint32_t)touch[4] & 0x1c) >> 2);
-		focaltech_contact_update(id, event, x, y, focaltech_max_x, focaltech_max_y);
+		focaltech_contact_update(id, event, x, y, board->focaltech_max_x, board->focaltech_max_y);
 	}
 	(void)count;
 	/* Fingers not in this report are up (vendor driver uses a bitmap; we remember explicitly). */
