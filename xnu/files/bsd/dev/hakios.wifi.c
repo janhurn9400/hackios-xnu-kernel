@@ -4362,6 +4362,7 @@ renoir_pcie_survey(uint32_t how)
  *      configuration space read through the iATU: 17cb:1103 is a QCA6490
  *   6  ... BAR0 placed and MHI's registers read (renoir_bar())
  *   7  ... the firmware's first 512 KB to the boot ROM through BHI (renoir_bhi())
+ *   8  ... and the whole of it to the SBL through BHIe (renoir_bhie())
  * Everything is taken back down at the end, in reverse, but for the supplies (see renoir_pcie_down()).
  * pcie_pause=MS (default 2200): a pause after each announcement, for the loader's notes if a write ends
  * the kernel (the hypervisor may keep some of this for itself).
@@ -4597,6 +4598,70 @@ static unsigned long long renoir_seen;   /* where the chip sees the image (renoi
 static uint32_t renoir_length;
 
 /*
+ * pcie=8: the whole of amss20.bin to the SBL through BHIe, the "full boot chain" (ath11k mhi.c: fbc_download,
+ * seg_len 512K): the image in pieces of 512 KB, each shown to the chip, and a vector table of them (per piece
+ * its address and size, 64 bits each) whose address and size go to BHIe's TXVEC registers with a sequence
+ * number to its doorbell; TXVECSTATUS[31:30] then says 2 (done) or 3 (refused) for that number.
+ */
+#define RENOIR_SEGMENTS         16
+#define BHIE_TXVECADDR_LOW      0x2c
+#define BHIE_TXVECADDR_HIGH     0x30
+#define BHIE_TXVECSIZE          0x34
+#define BHIE_TXVECDB            0x3c
+#define BHIE_TXVECSTATUS        0x44
+static unsigned long long renoir_vector_seen;
+static uint32_t renoir_vector_size;
+
+static bool
+renoir_bhie_prepare(const uint8_t *image, uint64_t size)
+{
+	uint64_t *vector;
+	vm_offset_t table = 0;
+	unsigned count = (unsigned)((size + RENOIR_SBL_SIZE - 1) / RENOIR_SBL_SIZE);
+
+	if (count > RENOIR_SEGMENTS || kmem_alloc_contig(kernel_map, &table, PAGE_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO |
+	    KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("wifi: pcie: 8: no room for the vector table (%u pieces)\n", count);
+		return false;
+	}
+	vector = (uint64_t *)table;
+	for (unsigned i = 0; i < count; i++) {
+		uint32_t length = size - (uint64_t)i * RENOIR_SBL_SIZE < RENOIR_SBL_SIZE ? (uint32_t)(size - (uint64_t)i *
+		    RENOIR_SBL_SIZE) : RENOIR_SBL_SIZE;
+		vm_offset_t piece = 0;
+		unsigned long long seen = 0;
+
+		if (kmem_alloc_contig(kernel_map, &piece, RENOIR_SBL_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			printf("wifi: pcie: 8: no 512 KB in one piece for piece %u\n", i);
+			return false;
+		}
+		memcpy((void *)piece, image + (uint64_t)i * RENOIR_SBL_SIZE, length);
+		for (vm_offset_t line = piece; line < piece + RENOIR_SBL_SIZE; line += 64) {
+			__asm__ volatile ("dc civac, %0" : : "r" (line));
+		}
+		__asm__ volatile ("dsb sy");
+		if (!hakios_wifi_radio_map(kvtophys(piece), RENOIR_SBL_SIZE, &seen)) {
+			printf("wifi: pcie: 8: piece %u cannot be shown to the chip\n", i);
+			return false;
+		}
+		vector[2 * i] = seen;
+		vector[2 * i + 1] = length;
+	}
+	renoir_vector_size = 16 * count;
+	for (vm_offset_t line = table; line < table + PAGE_SIZE; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	if (!hakios_wifi_radio_map(kvtophys(table), PAGE_SIZE, &renoir_vector_seen)) {
+		return false;
+	}
+	printf("wifi: pcie: 8: the whole image in %u pieces, the first at %#llx; the vector table (%u bytes) at %#llx\n", count,
+	    vector[0], renoir_vector_size, renoir_vector_seen);
+	return true;
+}
+
+/*
  * Before anything of PCIe is touched (pcie=7): the image into memory of one piece and shown to the chip
  * through the SMMU. The SMMU's writes are the hypervisor's to grant, and one of them reset the phone
  * once (stream 0x2401, 2026-10-28 23:38): they are made here with a pause after each, for the loader's
@@ -4658,7 +4723,44 @@ renoir_bhi_prepare(void)
 	pause_ms = 0;
 	fine = 0;
 	printf("wifi: pcie: 7: the chip is to see the image at %#llx\n", renoir_seen);
-	return true;
+	return renoir_level < 8 || renoir_bhie_prepare(image, size);
+}
+
+static void
+renoir_bhie(vm_offset_t mhi, vm_offset_t bhie)
+{
+	uint32_t status = 0, ee = 0;
+	vm_offset_t bhi = mhi + rd(mhi + 0x28);
+
+	printf("wifi: pcie: 8: BHIe at %#x: TXVEC status %#x; the vector table's address and size, sequence 0x55 to the doorbell\n",
+	    (uint32_t)(bhie - mhi), rd(bhie + BHIE_TXVECSTATUS));
+	wr(bhie + BHIE_TXVECADDR_HIGH, (uint32_t)(renoir_vector_seen >> 32));
+	wr(bhie + BHIE_TXVECADDR_LOW, (uint32_t)renoir_vector_seen);
+	wr(bhie + BHIE_TXVECSIZE, renoir_vector_size);
+	wr(bhie + BHIE_TXVECDB, 0x55);
+	for (int ms = 0; ms < 10000; ms += 10) {
+		status = rd(bhie + BHIE_TXVECSTATUS);
+		if ((status & 0x3fffffff) == 0x55 && (status >> 30) >= 2) {
+			printf("wifi: pcie: 8: after %d ms BHIe says %#x: %s\n", ms, status, (status >> 30) == 2 ?
+			    "THE SBL HAS TAKEN THE WHOLE IMAGE" : "REFUSED");
+			break;
+		}
+		if (ms % 1000 == 0) {
+			printf("wifi: pcie: 8: %d ms: TXVEC status %#x, EE %u, MHI status %#x\n", ms, status, rd(bhi + BHI_EXECENV),
+			    rd(mhi + 0x48));
+		}
+		sleep_ms(10);
+	}
+	for (int ms = 0; ms <= 5000; ms += 100) {
+		uint32_t now = rd(bhi + BHI_EXECENV);
+
+		if (now != ee || ms == 0 || ms == 5000) {
+			printf("wifi: pcie: 8: %d ms: EE %u (1 SBL, 2 AMSS), MHI status %#x, error %#x\n", ms, now, rd(mhi + 0x48),
+			    rd(mhi + 0x50));
+			ee = now;
+		}
+		sleep_ms(100);
+	}
 }
 
 static void
@@ -4708,6 +4810,9 @@ renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
 			ee = now;
 		}
 		sleep_ms(100);
+	}
+	if (renoir_level >= 8 && ee == 1) {
+		renoir_bhie(mhi, mhi + rd(mhi + 0x2c));
 	}
 	radio_space_faults();
 	/* (the chip is powered down with everything else; the copy is not freed: it might still be read) */
