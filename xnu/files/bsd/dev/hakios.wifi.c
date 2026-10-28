@@ -4358,6 +4358,7 @@ renoir_pcie_survey(uint32_t how)
  *   5  ... the controller as root port, PERST# released, the link trained (LTSSM), and the radio's
  *      configuration space read through the iATU: 17cb:1103 is a QCA6490
  *   6  ... BAR0 placed and MHI's registers read (renoir_bar())
+ *   7  ... the firmware's first 512 KB to the boot ROM through BHI (renoir_bhi())
  * Everything is taken back down at the end, in reverse, but for the supplies (see renoir_pcie_down()).
  * pcie_pause=MS (default 2200): a pause after each announcement, for the loader's notes if a write ends
  * the kernel (the hypervisor may keep some of this for itself).
@@ -4389,6 +4390,7 @@ static const struct {
 
 static vm_offset_t renoir_rsc, renoir_tlmm, renoir_gcc_vote, renoir_gcc_pcie, renoir_gcc_phy;
 static uint32_t renoir_pause = 2200;
+static unsigned renoir_level;
 
 static void
 renoir_say(const char *what)
@@ -4567,6 +4569,83 @@ renoir_pcie_down(unsigned level)
 #define RENOIR_PCIE_MEM         0x60300000u
 #define RENOIR_PCIE_MEM_SIZE    0x03d00000u
 
+/*
+ * pcie=7: the firmware's first part through BHI, the boot ROM's ("PBL") interface. The QCA6490 boots
+ * the "full boot chain" way (ath11k's mhi.c: fbc_download, sbl_size 512K): the PBL takes the first
+ * 512 KB of amss20.bin (an ELF; it finds the SBL in it) from host memory, whose address and size are
+ * written to BHI with a session number to its doorbell; BHI_STATUS[31:30] then says 2 (done) or 3
+ * (refused, with an error code); the execution environment goes 0 (PBL) -> 1 (SBL), and the SBL waits
+ * for the whole image through BHIe (next). The memory is one physical piece, written out of the cache;
+ * the chip reads it by its physical address, through whatever the SMMU does with stream 0x2400.
+ */
+#define BHI_IMGADDR_LOW         0x08
+#define BHI_IMGADDR_HIGH        0x0c
+#define BHI_IMGSIZE             0x10
+#define BHI_IMGTXDB             0x18
+#define BHI_INTVEC              0x20
+#define BHI_EXECENV             0x28
+#define BHI_STATUS              0x2c
+#define BHI_ERRCODE             0x30
+#define RENOIR_SBL_SIZE         (512u << 10)
+
+static void
+renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
+{
+	uint64_t size = 0, physical;
+	const uint8_t *image = image_file("amss20.bin", &size);
+	vm_offset_t copy = 0;
+	uint32_t length, status = 0, ee = 0;
+
+	if (image == NULL) {
+		return;
+	}
+	length = size < RENOIR_SBL_SIZE ? (uint32_t)size : RENOIR_SBL_SIZE;
+	if (kmem_alloc_contig(kernel_map, &copy, RENOIR_SBL_SIZE, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("wifi: pcie: 7: no 512 KB in one piece\n");
+		return;
+	}
+	memcpy((void *)copy, image, length);
+	for (vm_offset_t line = copy; line < copy + RENOIR_SBL_SIZE; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	physical = kvtophys(copy);
+	printf("wifi: pcie: 7: amss20.bin is %llu bytes; its first %u at physical %#llx; EE %u, BHI status %#x\n", size, length,
+	    physical, rd(bhi + BHI_EXECENV), rd(bhi + BHI_STATUS));
+	printf("wifi: pcie: 7: BHI: the image's address and size, session 0x1234 to the doorbell\n");
+	wr(bhi + BHI_STATUS, 0);
+	wr(bhi + BHI_IMGADDR_HIGH, (uint32_t)(physical >> 32));
+	wr(bhi + BHI_IMGADDR_LOW, (uint32_t)physical);
+	wr(bhi + BHI_IMGSIZE, length);
+	wr(bhi + BHI_IMGTXDB, 0x1234);
+	for (int ms = 0; ms < 5000; ms += 10) {
+		status = rd(bhi + BHI_STATUS);
+		if ((status >> 30) >= 2) {
+			printf("wifi: pcie: 7: after %d ms BHI says %#x: %s (error code %#x, %#x %#x %#x)\n", ms, status,
+			    (status >> 30) == 2 ? "THE PBL HAS TAKEN THE IMAGE" : "REFUSED", rd(bhi + BHI_ERRCODE), rd(bhi + 0x34),
+			    rd(bhi + 0x38), rd(bhi + 0x3c));
+			break;
+		}
+		sleep_ms(10);
+	}
+	if ((status >> 30) < 2) {
+		printf("wifi: pcie: 7: no answer from BHI in 5 s: status %#x, EE %u, MHI status %#x\n", status,
+		    rd(bhi + BHI_EXECENV), rd(mhi + 0x48));
+	}
+	for (int ms = 0; ms <= 2000; ms += 100) {
+		uint32_t now = rd(bhi + BHI_EXECENV);
+
+		if (now != ee || ms == 0 || ms == 2000) {
+			printf("wifi: pcie: 7: %d ms: EE %u (0 PBL, 1 SBL, 2 AMSS), MHI status %#x, BHI status %#x\n", ms, now,
+			    rd(mhi + 0x48), rd(bhi + BHI_STATUS));
+			ee = now;
+		}
+		sleep_ms(100);
+	}
+	/* (the chip is powered down with everything else; the copy is not freed: it might still be read) */
+}
+
 static void
 renoir_bar(vm_offset_t dbi, vm_offset_t iatu, vm_offset_t conf)
 {
@@ -4619,6 +4698,9 @@ renoir_bar(vm_offset_t dbi, vm_offset_t iatu, vm_offset_t conf)
 		    "serial %#x, hardware id %#x\n", rd(mhi + bhi + 0x00), rd(mhi + bhi + 0x04), rd(mhi + bhi + 0x28),
 		    rd(mhi + bhi + 0x2c), rd(mhi + bhi + 0x40), rd(mhi + bhi + 0x48));
 	}
+	if (renoir_level >= 7 && bhi != 0 && bhi < 0xf00) {
+		renoir_bhi(mhi, mhi + bhi);
+	}
 	wr(conf + 4, rd(conf + 4) & ~0x6u);
 }
 
@@ -4629,6 +4711,7 @@ renoir_pcie_link(unsigned level)
 	unsigned reached = 3;
 
 	PE_parse_boot_argn("pcie_pause", &renoir_pause, sizeof(renoir_pause));
+	renoir_level = level;
 	renoir_rsc = ml_io_map(RENOIR_RSC, 0x10000);
 	renoir_tlmm = ml_io_map(0x0f100000, 0x100000);
 	renoir_gcc_vote = ml_io_map(RENOIR_GCC_VOTE, 0x1000);
