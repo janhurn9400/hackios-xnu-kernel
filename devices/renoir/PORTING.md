@@ -12,7 +12,10 @@ it worked. This is a research bring-up: expect to live in boot logs.
 ## 1. UEFI (the biggest piece — mostly already done)
 - [x] Existing renoir UEFI found: Mu-Silicium **`renoirPkg`** exists + maintained (same CedrosPkg
       SoC package as redwood's base). See `devices/renoir/uefi/README.md`.
-- [ ] Build `renoirPkg` **stock** and `fastboot boot` it → confirm UEFI comes up on renoir.
+- [x] Build `renoirPkg` **stock** and `fastboot boot` it → confirm UEFI comes up on renoir.
+      Done 2026-10-28: built in an aarch64 Ubuntu VM (`uefi/build-renoirpkg.sh`), `fastboot boot
+      Mu-renoir.img` on a renoir with unlocked bootloader → Silicium logo, then "Failed to find an
+      operating system". Display via the UEFI framebuffer works.
 - [ ] Apply HakiOS to renoirPkg: **step-by-step guide in
       [`devices/renoir/uefi/APPLYING-HAKIOS.md`](uefi/APPLYING-HAKIOS.md)**
       (the one renoir-specific edit = reserve `0xF0000000` XNU-Payload region; first success signal
