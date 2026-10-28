@@ -173,7 +173,7 @@ cmdline: loader_return_after=300 sb_delay=8 bootcpu=7 cpus=8 cpufreq=1 touchscre
 `root-gl.apfs` has no room for the ADSP firmware (GL and ADSP do not fit the 64 MB together); with
 `adsp=1` the driver reads it from the system image once the root is mounted, and `system-fw.apfs` has
 it. USB went away 4 s after `oem run` (the DSP takes the port). **The user saw iOS's home screen with
-a battery level in the status bar**: the ADSP's battery manager, over GLINK, into iOS. No sound tried
+a battery level in the status bar**, about right by the user's check: the ADSP's battery manager, over GLINK, into iOS. No sound tried
 (`sound=4` is redwood's amplifier path; renoir has two NXP TFA98xx at 0x34/0x35).
 
 ## Next for the ADSP
