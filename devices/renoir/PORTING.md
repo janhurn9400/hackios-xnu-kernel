@@ -35,10 +35,16 @@ it worked. This is a research bring-up: expect to live in boot logs.
 - [ ] Note the actual file names (renoir's a6xx GPU blob name especially) and pin them.
 
 ## 4. First boot: display + CPU
-- [ ] No separate panel driver needed — the **UEFI framebuffer (GOP)** gives the picture; XNU just
+- [x] No separate panel driver needed — the **UEFI framebuffer (GOP)** gives the picture; XNU just
       consumes it. Driver details + renoir display facts:
       **[`devices/renoir/DRIVERS.md`](DRIVERS.md)**.
-- [ ] Success = XNU panics/logs on screen, all 8 cores up. **This is the "it boots" milestone.**
+- [x] **XNU boots on renoir with one core** (2026-10-28, `run-open.sh`: prebuilt kernel + `hello`,
+      `cpus=1 -v`). The loader takes renoir for redwood by its framebuffer address (`0xE1000000`),
+      which is right: GIC (`0x17A00000`/`0x17A60000`), PSCI over SMC and the eight cores (MPIDR
+      `0x000`-`0x700`, 0-3 small) are the same. Kernel log: `Darwin Kernel Version 22.5.0`,
+      `initialize_screen: b=E1000000, w=00000438, h=00000960`, `gic: v3`, `bsd_init`, then
+      `Hello from user space on Darwin! I am process 1`; returned after 20 s as asked.
+- [ ] All 8 cores (`cpus=8 bootcpu=7 cpufreq=1`).
 
 ## 5. Input + storage
 - [ ] `hakios_touch` for renoir's touch controller (confirm the part from DT first).
