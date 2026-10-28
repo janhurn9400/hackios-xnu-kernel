@@ -1,8 +1,10 @@
 /*
  * The touch screen of the POCO X5 Pro (redwood): either a Goodix GT9916 ("Berlin-D") or a
  * FocalTech FT3680 on the SPI bus of the SoC's serial engine 13, as a source of touches for
- * /dev/hakios-touch (sys/hakios.input.h). Only with boot-arg touchscreen=1: every address
- * below belongs to this phone.
+ * /dev/hakios-touch (sys/hakios.input.h). Only with boot-arg touchscreen=1. With touch_board=renoir
+ * the Xiaomi Mi 11 Lite 5G instead: a FocalTech FT5652 (or a Goodix GT9897) on serial engine 2 of
+ * the first QUP group; the addresses that differ are in struct touch_board. renoir's chip keeps its
+ * firmware in its own flash, and nothing is ever uploaded to it or flashed.
  *
  * There is no clock, pin, regulator or SPI framework in this kernel, so the driver does all of
  * it itself, in the order the vendor's Linux drivers do:
@@ -68,6 +70,48 @@ sleep_ms(uint32_t ms)
 	delay_for_interval(ms, NSEC_PER_MSEC);
 }
 
+/* ---- the boards ------------------------------------------------------------------------------------ */
+
+/*
+ * What differs between the phones (boot-arg touch_board=renoir; redwood otherwise). The register
+ * layouts are the same: renoir's SoC ("shima", SM7350) has the TLMM, the GCC vote register, RPMh
+ * and the command database where redwood's ("yupik") has them; see devices/renoir/TOUCH.md.
+ */
+struct touch_board {
+	const char *name;
+	vm_offset_t se_phys;                    /* the serial engine the touch chip is on */
+	unsigned miso, mosi, clk, cs, irq, reset, spi_function;
+	int avdd_pin;                           /* the analog supply's switch; -1: an RPMh regulator ... */
+	const char *avdd_regulator;             /* ... of this name, at avdd_mv */
+	uint32_t avdd_mv;
+	int focaltech_id_pin, goodix_id_pin;    /* -1: no straps, ask the chip */
+	uint32_t vote_core_2x, vote_core, vote_m_ahb, vote_s_ahb, vote_se;
+	uint32_t m_ahb_cbcr, s_ahb_cbcr, se_cbcr, se_rcg;       /* offsets in the GCC */
+	uint8_t focaltech_id, focaltech_boot_id;        /* the low chip ID byte when running, and in the boot ROM */
+	bool focaltech_upload;                  /* the chip has no flash: its firmware goes into PRAM after reset */
+};
+
+static const struct touch_board redwood = {
+	.name = "redwood", .se_phys = 0x00a94000UL,    /* QUP1 SE5 ("serial engine 13") */
+	.miso = 52, .mosi = 53, .clk = 54, .cs = 55, .irq = 81, .reset = 105, .spi_function = 1 /* "qup15" */,
+	.avdd_pin = 107, .focaltech_id_pin = 68, .goodix_id_pin = 96,
+	.vote_core_2x = 1u << 18, .vote_core = 1u << 19, .vote_m_ahb = 1u << 20, .vote_s_ahb = 1u << 21, .vote_se = 1u << 27,
+	.m_ahb_cbcr = 0x18004, .s_ahb_cbcr = 0x18008, .se_cbcr = 0x185fc, .se_rcg = 0x18600,
+	.focaltech_id = 0x62, .focaltech_boot_id = 0x62, .focaltech_upload = true,
+};
+
+static const struct touch_board renoir = {
+	.name = "renoir", .se_phys = 0x00988000UL,     /* QUP0 SE2 (Android's spi@988000) */
+	.miso = 20, .mosi = 21, .clk = 22, .cs = 23, .irq = 31, .reset = 30, .spi_function = 1 /* "qup10" */,
+	.avdd_pin = -1, .avdd_regulator = "ldoc7", .avdd_mv = 3000,
+	.focaltech_id_pin = -1, .goodix_id_pin = -1,
+	.vote_core_2x = 1u << 9, .vote_core = 1u << 8, .vote_m_ahb = 1u << 6, .vote_s_ahb = 1u << 7, .vote_se = 1u << 12,
+	.m_ahb_cbcr = 0x17004, .s_ahb_cbcr = 0x17008, .se_cbcr = 0x1726c, .se_rcg = 0x17270,
+	.focaltech_id = 0x52, .focaltech_boot_id = 0xb2, .focaltech_upload = false,      /* FT5652: its own flash */
+};
+
+static const struct touch_board *board = &redwood;
+
 /* ---- pins (TLMM) ------------------------------------------------------------------------------- */
 
 #define TLMM_PHYS               0x0f100000UL
@@ -77,16 +121,13 @@ sleep_ms(uint32_t ms)
 #define PULL_NONE               0
 #define PULL_UP                 3
 
-#define PIN_MISO                52
-#define PIN_MOSI                53
-#define PIN_CLK                 54
-#define PIN_CS                  55
-#define PIN_INT                 81      /* low = the chip has a report */
-#define PIN_RESET               105     /* low = in reset */
-#define PIN_AVDD                107     /* high = analog supply on */
-#define PIN_FOCALTECH_ID        68      /* FocalTech if this reads 0 ... */
-#define PIN_GOODIX_ID           96      /* ... and this reads 1 (sm8350-kernel-OKX convention) */
-#define PIN_FUNCTION_SPI        1       /* "qup15" */
+#define PIN_MISO                (board->miso)
+#define PIN_MOSI                (board->mosi)
+#define PIN_CLK                 (board->clk)
+#define PIN_CS                  (board->cs)
+#define PIN_INT                 (board->irq)            /* low = the chip has a report */
+#define PIN_RESET               (board->reset)          /* low = in reset */
+#define PIN_FUNCTION_SPI        (board->spi_function)
 
 static void
 gpio_configure(unsigned pin, unsigned function, unsigned pull, unsigned ma, bool output)
@@ -238,26 +279,33 @@ rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 	return done;
 }
 
-/* The chip's I/O supply: 1.8 V from LDO2 of the PM8350C ("ldoc2"). Nothing else is connected to it. */
+/* An LDO through RPMh, by its name in the command database, at `mv` millivolts. */
 static bool
-io_supply_on(void)
+regulator_on(const char *name, uint32_t mv)
 {
-	uint32_t base = rpmh_address("ldoc2");
+	uint32_t base = rpmh_address(name);
 	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_ENABLE, base + VRM_MODE };
-	uint32_t data[3] = { 1800, 1, VRM_MODE_LDO_HPM };
+	uint32_t data[3] = { mv, 1, VRM_MODE_LDO_HPM };
 
 	/* addresses of regulators ("VRM") have 4 in bits 19:16; anything else is not what we are looking for */
 	if (base == 0 || (base >> 16 & 0xf) != 4) {
-		printf("goodix: RPMh: no regulator \"ldoc2\" (address %#x)\n", base);
+		printf("goodix: RPMh: no regulator \"%s\" (address %#x)\n", name, base);
 		return false;
 	}
-	printf("goodix: RPMh: ldoc2 is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", base,
+	printf("goodix: RPMh: %s is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", name, base,
 	    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)), rd(TCS(TCS_IRQ_ENABLE)), rd(TCS(TCS_IRQ_STATUS)));
 	if (!rpmh_write(address, data, 3)) {
 		return false;
 	}
-	printf("goodix: I/O supply on (1.8 V)\n");
+	printf("goodix: %s on (%u mV)\n", name, mv);
 	return true;
+}
+
+/* The chip's I/O supply: 1.8 V from LDO2 of the PM8350C ("ldoc2"), on both phones. Nothing else is connected to it. */
+static bool
+io_supply_on(void)
+{
+	return regulator_on("ldoc2", 1800);
 }
 
 /* ---- clocks (GCC) -------------------------------------------------------------------------------- */
@@ -265,24 +313,29 @@ io_supply_on(void)
 #define GCC_PHYS                0x00100000UL
 #define GCC_SIZE                0x60000UL
 #define GCC_VOTE                (gcc + 0x52008)         /* the application processor's votes */
-#define VOTE_QUP1_CORE_2X       (1u << 18)
-#define VOTE_QUP1_CORE          (1u << 19)
-#define VOTE_QUP1_M_AHB         (1u << 20)
-#define VOTE_QUP1_S_AHB         (1u << 21)
-#define VOTE_QUP1_SE5           (1u << 27)             /* serial engine 13 is the 6th of the second group */
-#define GCC_QUP1_M_AHB_CBCR     (gcc + 0x18004)         /* bit 31: the clock is off */
-#define GCC_QUP1_S_AHB_CBCR     (gcc + 0x18008)
-#define GCC_QUP1_SE5_CBCR       (gcc + 0x185fc)
-#define GCC_QUP1_SE5_CMD        (gcc + 0x18600)         /* bit 0: take the new configuration */
-#define GCC_QUP1_SE5_CFG        (gcc + 0x18604)         /* [4:0] 2*divider-1, [10:8] source, [13:12] mode */
-#define GCC_QUP1_SE5_DFSR       (gcc + 0x18614)         /* bit 0: the engine chooses among preset rates itself */
-#define GCC_QUP1_SE5_PERF_CFG(l) (gcc + 0x1861c + 4 * (l))
-#define GCC_QUP1_SE5_PERF_M(l)  (gcc + 0x1865c + 4 * (l))
-#define GCC_QUP1_SE5_PERF_N(l)  (gcc + 0x1869c + 4 * (l))
+#define GCC_M_AHB_CBCR          (gcc + board->m_ahb_cbcr)       /* bit 31: the clock is off */
+#define GCC_S_AHB_CBCR          (gcc + board->s_ahb_cbcr)
+#define GCC_SE_CBCR             (gcc + board->se_cbcr)
+#define GCC_SE_CMD              (gcc + board->se_rcg)           /* bit 0: take the new configuration */
+#define GCC_SE_CFG              (gcc + board->se_rcg + 0x04)    /* [4:0] 2*divider-1, [10:8] source, [13:12] mode */
+#define GCC_SE_DFSR             (gcc + board->se_rcg + 0x14)    /* bit 0: the engine chooses among preset rates itself */
+#define GCC_SE_PERF_CFG(l)      (gcc + board->se_rcg + 0x1c + 4 * (l))
+#define GCC_SE_PERF_M(l)        (gcc + board->se_rcg + 0x5c + 4 * (l))
+#define GCC_SE_PERF_N(l)        (gcc + board->se_rcg + 0x9c + 4 * (l))
 #define CLOCK_OFF               (1u << 31)
+#define CLOCK_HW_CONTROL        (1u << 1)       /* gated by the hardware: may read "off" while idle */
 #define XO_HZ                   19200000
 
 static uint32_t se_source_hz, se_clock_select;
+
+/* Running, or under hardware gating, where Linux does not look at the off bit either (clk-branch.c) */
+static bool
+clock_running(vm_offset_t cbcr)
+{
+	uint32_t value = rd(cbcr);
+
+	return !(value & CLOCK_OFF) || (value & CLOCK_HW_CONTROL);
+}
 
 static uint32_t
 rcg_rate(uint32_t cfg, uint32_t m, uint32_t not_n_minus_m)
@@ -307,12 +360,12 @@ rcg_rate(uint32_t cfg, uint32_t m, uint32_t not_n_minus_m)
 static bool
 clocks_on(void)
 {
-	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP1_CORE_2X | VOTE_QUP1_CORE | VOTE_QUP1_M_AHB | VOTE_QUP1_S_AHB);
-	if (rd(GCC_QUP1_SE5_DFSR) & 1) {
+	wr(GCC_VOTE, rd(GCC_VOTE) | board->vote_core_2x | board->vote_core | board->vote_m_ahb | board->vote_s_ahb);
+	if (rd(GCC_SE_DFSR) & 1) {
 		/* preset rates: the lowest that is at least 4 MHz */
 		for (uint32_t level = 0; level < 8; level++) {
-			uint32_t hz = rcg_rate(rd(GCC_QUP1_SE5_PERF_CFG(level)), rd(GCC_QUP1_SE5_PERF_M(level)),
-			    rd(GCC_QUP1_SE5_PERF_N(level)));
+			uint32_t hz = rcg_rate(rd(GCC_SE_PERF_CFG(level)), rd(GCC_SE_PERF_M(level)),
+			    rd(GCC_SE_PERF_N(level)));
 
 			if (hz >= 4000000 && (se_source_hz == 0 || hz < se_source_hz)) {
 				se_source_hz = hz;
@@ -325,33 +378,33 @@ clocks_on(void)
 		}
 	} else {
 		/* the crystal, undivided: nothing else has to be running */
-		wr(GCC_QUP1_SE5_CFG, (rd(GCC_QUP1_SE5_CFG) & ~0x371fu) | 1);
-		wr(GCC_QUP1_SE5_CMD, rd(GCC_QUP1_SE5_CMD) | 1);
-		for (int i = 0; i < 500 && (rd(GCC_QUP1_SE5_CMD) & 1); i++) {
+		wr(GCC_SE_CFG, (rd(GCC_SE_CFG) & ~0x371fu) | 1);
+		wr(GCC_SE_CMD, rd(GCC_SE_CMD) | 1);
+		for (int i = 0; i < 500 && (rd(GCC_SE_CMD) & 1); i++) {
 			sleep_us(10);
 		}
-		if (rd(GCC_QUP1_SE5_CMD) & 1) {
-			printf("goodix: the serial engine's clock does not take its configuration (%#x)\n", rd(GCC_QUP1_SE5_CMD));
+		if (rd(GCC_SE_CMD) & 1) {
+			printf("goodix: the serial engine's clock does not take its configuration (%#x)\n", rd(GCC_SE_CMD));
 			return false;
 		}
 		se_source_hz = XO_HZ;
 		se_clock_select = 0;
 	}
-	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP1_SE5);
+	wr(GCC_VOTE, rd(GCC_VOTE) | board->vote_se);
 	for (int i = 0; i < 1000; i++) {
-		if (!((rd(GCC_QUP1_M_AHB_CBCR) | rd(GCC_QUP1_S_AHB_CBCR) | rd(GCC_QUP1_SE5_CBCR)) & CLOCK_OFF)) {
+		if (clock_running(GCC_M_AHB_CBCR) && clock_running(GCC_S_AHB_CBCR) && clock_running(GCC_SE_CBCR)) {
 			return true;
 		}
 		sleep_us(10);
 	}
-	printf("goodix: clocks stay off: %#x %#x %#x\n", rd(GCC_QUP1_M_AHB_CBCR), rd(GCC_QUP1_S_AHB_CBCR),
-	    rd(GCC_QUP1_SE5_CBCR));
+	printf("goodix: clocks stay off: %#x %#x %#x\n", rd(GCC_M_AHB_CBCR), rd(GCC_S_AHB_CBCR),
+	    rd(GCC_SE_CBCR));
 	return false;
 }
 
 /* ---- SPI through the serial engine (GENI) ---------------------------------------------------------- */
 
-#define SE_PHYS                 0x00a94000UL
+#define SE_PHYS                 (board->se_phys)
 #define SE_SIZE                 0x4000UL
 #define GENI_FORCE_DEFAULT      (se + 0x020)
 #define GENI_OUTPUT_CTRL        (se + 0x024)
@@ -557,7 +610,7 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 
 /* ---- SPI by hand, on the same pins ----------------------------------------------------------------- */
 
-static unsigned bitbang_in = PIN_MISO, bitbang_out = PIN_MOSI;
+static unsigned bitbang_in, bitbang_out;    /* set before use: which is which is tried both ways */
 
 static void
 bitbang_init(void)
@@ -1052,15 +1105,18 @@ focaltech_read_boot_id(uint8_t *high, uint8_t *low)
 	return ok;
 }
 
-/* Vendor fts_wait_tp_to_valid: poll chip ID for up to TIMEOUT_READ_REG (1 s) at 200 ms steps. */
+/*
+ * Vendor fts_wait_tp_to_valid: poll chip ID for up to TIMEOUT_READ_REG (1 s) at 200 ms steps.
+ * The running firmware answers 0x56 and the board's low byte (FT3680: 0x62, renoir's FT5652: 0x52).
+ */
 static bool
 focaltech_wait_valid(uint8_t *high, uint8_t *low)
 {
 	for (int attempt = 0; attempt < 5; attempt++) {
 		if (focaltech_read(FOCALTECH_CHIP_ID_H, high, 1) &&
 		    focaltech_read(FOCALTECH_CHIP_ID_L, low, 1) &&
-		    *high == 0x56 && *low == 0x62) {
-			printf("focaltech: FT3680 runtime ID valid after %d attempt(s)\n", attempt + 1);
+		    *high == 0x56 && *low == board->focaltech_id) {
+			printf("focaltech: runtime ID %02x %02x valid after %d attempt(s)\n", *high, *low, attempt + 1);
 			return true;
 		}
 		sleep_ms(200);			/* vendor INTERVAL_READ_REG */
@@ -1139,6 +1195,26 @@ static bool
 focaltech_probe(bool verbose)
 {
 	uint8_t high = 0, low = 0;
+
+	if (!board->focaltech_upload) {
+		/*
+		 * A chip with its own flash (renoir's FT5652): out of reset it starts the firmware in its
+		 * flash by itself. Nothing is ever written to its boot ROM, PRAM or flash here -- writing
+		 * the flash is permanent -- so a chip that stays in its boot ROM is left alone.
+		 */
+		touch_reset();
+		if (focaltech_wait_valid(&high, &low)) {
+			return true;
+		}
+		if (high == 0x56 && low == board->focaltech_boot_id) {
+			printf("focaltech: the chip is in its boot ROM (ID %02x %02x): no firmware running in its flash; "
+			    "NOT uploading or flashing anything\n", high, low);
+		} else if (verbose) {
+			printf("focaltech: no FocalTech chip answers (ID %02x %02x, expected 56 %02x)\n", high, low,
+			    board->focaltech_id);
+		}
+		return false;
+	}
 
 	/* Maybe firmware is already running (previous session, warm boot). */
 	if (focaltech_wait_valid(&high, &low)) {
@@ -1300,12 +1376,16 @@ focaltech_poll(void)
 enum touch_chip { TOUCH_GOODIX, TOUCH_FOCALTECH };
 static enum touch_chip touch_chip;
 
+/* By the board's two strap pins; a board without them (renoir) is asked: FocalTech first, then Goodix. */
 static enum touch_chip
 touch_chip_detect(void)
 {
-	gpio_configure(PIN_FOCALTECH_ID, 0, PULL_NONE, 2, false);
-	gpio_configure(PIN_GOODIX_ID, 0, PULL_NONE, 2, false);
-	if (gpio_get(PIN_GOODIX_ID) && !gpio_get(PIN_FOCALTECH_ID)) {
+	if (board->focaltech_id_pin < 0 || board->goodix_id_pin < 0) {
+		return TOUCH_FOCALTECH;
+	}
+	gpio_configure(board->focaltech_id_pin, 0, PULL_NONE, 2, false);
+	gpio_configure(board->goodix_id_pin, 0, PULL_NONE, 2, false);
+	if (gpio_get(board->goodix_id_pin) && !gpio_get(board->focaltech_id_pin)) {
 		return TOUCH_FOCALTECH;
 	}
 	return TOUCH_GOODIX;
@@ -1315,7 +1395,19 @@ static bool
 chip_probe(bool verbose)
 {
 	if (touch_chip == TOUCH_FOCALTECH) {
-		return focaltech_probe(verbose);
+		if (focaltech_probe(verbose)) {
+			return true;
+		}
+		if (board->focaltech_id_pin >= 0) {
+			return false;
+		}
+		/* no straps: maybe a Goodix unit (some renoirs have a GT9897); its probe only reads */
+		touch_reset();
+		if (goodix_probe(verbose)) {
+			touch_chip = TOUCH_GOODIX;
+			return true;
+		}
+		return false;
 	}
 	touch_reset();
 	return goodix_probe(verbose);
@@ -1337,11 +1429,17 @@ static void
 show_state(const char *when)
 {
 	printf("goodix: %s: votes %#x, clocks %#x %#x %#x, rate cfg %#x dfs %#x; pins cs/clk/mosi/miso cfg %#x %#x %#x %#x,"
-	    " reset %#x/%u, int %#x/%u, avdd %#x/%u, straps %u %u\n", when, rd(GCC_VOTE), rd(GCC_QUP1_M_AHB_CBCR),
-	    rd(GCC_QUP1_S_AHB_CBCR), rd(GCC_QUP1_SE5_CBCR), rd(GCC_QUP1_SE5_CFG), rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(PIN_CS)),
+	    " reset %#x/%u, int %#x/%u", when, rd(GCC_VOTE), rd(GCC_M_AHB_CBCR),
+	    rd(GCC_S_AHB_CBCR), rd(GCC_SE_CBCR), rd(GCC_SE_CFG), rd(GCC_SE_DFSR), rd(GPIO_CFG(PIN_CS)),
 	    rd(GPIO_CFG(PIN_CLK)), rd(GPIO_CFG(PIN_MOSI)), rd(GPIO_CFG(PIN_MISO)), rd(GPIO_CFG(PIN_RESET)),
-	    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)), rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_IO(PIN_AVDD)),
-	    gpio_get(68), gpio_get(96));
+	    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)));
+	if (board->avdd_pin >= 0) {
+		printf(", avdd %#x/%u", rd(GPIO_CFG(board->avdd_pin)), rd(GPIO_IO(board->avdd_pin)));
+	}
+	if (board->focaltech_id_pin >= 0 && board->goodix_id_pin >= 0) {
+		printf(", straps %u %u", gpio_get(board->focaltech_id_pin), gpio_get(board->goodix_id_pin));
+	}
+	printf("\n");
 }
 
 /* Power the chip up from nothing, in the vendor driver's order. */
@@ -1352,7 +1450,11 @@ power_on(void)
 	gpio_configure(PIN_INT, 0, PULL_UP, 8, false);
 	io_supply_on();
 	sleep_ms(3);
-	gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+	if (board->avdd_pin >= 0) {
+		gpio_output(board->avdd_pin, true, PULL_NONE, 2);
+	} else {
+		regulator_on(board->avdd_regulator, board->avdd_mv);
+	}
 	sleep_ms(15);
 }
 
@@ -1378,8 +1480,12 @@ bring_up(void)
 
 	show_state("as found");
 	touch_chip = touch_chip_detect();
-	printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(PIN_GOODIX_ID),
-	    gpio_get(PIN_FOCALTECH_ID), chip_name());
+	if (board->focaltech_id_pin >= 0 && board->goodix_id_pin >= 0) {
+		printf("goodix: %s: ID gpio%d=%u gpio%d=%u: selected %s\n", board->name, board->goodix_id_pin,
+		    gpio_get(board->goodix_id_pin), board->focaltech_id_pin, gpio_get(board->focaltech_id_pin), chip_name());
+	} else {
+		printf("goodix: %s: no ID straps, asking the chip (FocalTech first)\n", board->name);
+	}
 	power_on();
 
 	if (clocks_on()) {
@@ -1505,8 +1611,14 @@ hakios_goodix_init(void)
 	uint32_t enabled = 0;
 	thread_t thread;
 
+	char board_name[16] = "";
+
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
+	}
+	/* boot-arg touch_board=renoir: the Xiaomi Mi 11 Lite 5G; the POCO X5 Pro (redwood) otherwise */
+	if (PE_parse_boot_argn("touch_board", board_name, sizeof(board_name)) && strcmp(board_name, "renoir") == 0) {
+		board = &renoir;
 	}
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	if (kernel_thread_start(goodix_thread, NULL, &thread) == KERN_SUCCESS) {

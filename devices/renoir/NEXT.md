@@ -19,7 +19,8 @@ all seven kernel cores (`small_cores_after=0`), cpufreq 1900/2208/2400 MHz; UFS 
    devices/renoir/run-open.sh 20 cpus=1 -v` -> `Darwin Kernel Version 22.5.0: Wed Oct 28 12:14:55
    CET 2026`, `I am process 1`. The iOS 16.5 disk images (`rootfs.dmg`, `cryptex-os.dmg`,
    `cryptex-app.dmg`) are already downloaded into the Mac's `sysimage/` (for step 3).
-2. **Touch driver** (`xnu/files/bsd/dev/hakios.goodix.c`, edit in `xnu-src/` then `xnu/export.sh`
+2. ~~Touch driver~~ **works** (session 2, see `TOUCH.md` for the run and what is open: SPI by hand, the
+   engine has its FIFO off). Was: (`xnu/files/bsd/dev/hakios.goodix.c`, edit in `xnu-src/` then `xnu/export.sh`
    per `xnu/README.md`): a renoir board profile chosen by boot-arg `touch_board=renoir`, redwood stays
    the default. All constants are in the table in `TOUCH.md` (SE 0x988000 = QUP0 SE2, pins 20-23
    function 1, reset 30, int 31, avdd = RPMh `ldoc7` 3.0 V instead of gpio 107, iovdd `ldoc2` as on

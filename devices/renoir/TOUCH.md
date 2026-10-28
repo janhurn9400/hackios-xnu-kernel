@@ -1,6 +1,20 @@
 # renoir touch: what is known (2026-10-28), for adapting `hakios.goodix.c`
 
-Status: **facts collected, driver not changed yet, kernel not rebuilt yet.** Everything below was
+Status (2026-10-28, session 2): **touch works on renoir.** `hakios.goodix.c` has a renoir board
+profile (`touch_board=renoir`); run with `KERNEL=devices/renoir/prebuilt/vm-kernel/mach.development.bcm2837
+RAMDISK=devices/renoir/prebuilt/vm-kernel/hold devices/renoir/run-open.sh 90 cpus=1 touchscreen=1
+touch_board=renoir -v` (`hold` = `hello.c -DHOLD`: process 1 must not exit, or the kernel panics
+before the touch thread gets anywhere). Log: ldoc2 1.8 V and ldoc7 3.0 V on through RPMh, `runtime ID
+56 52 valid`, finger down/move lines while swiping, about 240 reports a second. Nothing uploaded or
+flashed. Only the first 8 finger positions are printed; after that one summary line a minute.
+
+Open: **the serial engine is not used.** QUP0 SE2's clocks come on (S AHB is hardware-gated:
+`0x8000000a`, bit 1 -- now accepted as running), but `GENI_IF_DISABLE_RO` = 1: the FIFO interface is
+off, the engine is set up for GSI DMA only. The driver falls back to SPI on the pins by hand, which
+works (data in on gpio20) with ~15 % failed reads (205 of 1223 looks). Next: GSI DMA for the engine,
+or fewer failed reads by hand (timing). Axes not checked yet: tap the four corners, `touch_flip=1|2|3`.
+
+Collected before the driver change: Everything below was
 read off a real renoir (MIUI 14.0.7 vendor, rooted), its device tree, and renoir's own kernel source
 (LineageOS `android_kernel_xiaomi_sm8350`, branch `lineage-21`: `drivers/clk/qcom/gcc-shima.c`,
 `drivers/pinctrl/qcom/pinctrl-shima.c`, `include/dt-bindings/clock/qcom,gcc-shima.h`,
