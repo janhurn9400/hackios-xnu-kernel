@@ -144,8 +144,11 @@ wait_ms(uint32_t ms)
 #define CFG_PULL_UP             3
 #define CFG_OUTPUT              (1u << 9)
 
-#define PIN_SDA                 12      /* the serial engine's first pin is the data line, the second the clock */
-#define PIN_SCL                 13
+/* the serial engine's first pin is the data line, the second the clock: redwood's SE 3, or renoir's QUP1 SE1 */
+static unsigned pin_sda = 12, pin_scl = 13;
+static bool renoir;                     /* boot-arg board=renoir: renoir's pins and its NXP TFA9873 amplifiers */
+#define PIN_SDA                 pin_sda
+#define PIN_SCL                 pin_scl
 
 static const struct {
 	unsigned pin;
@@ -156,9 +159,29 @@ static const struct {
 	{ 45, "the amplifier 0x34's interrupt" },
 };
 
+/* renoir (devices/renoir/SOUND.md): I2C on gpio36/37, TERT_MI2S on 120-124, the TFA9873s' own pins */
+static const struct {
+	unsigned pin;
+	const char *what;
+} renoir_pins[] = {
+	{ 36, "I2C data" }, { 37, "I2C clock" }, { 120, "TERT MI2S bit clock" }, { 122, "TERT MI2S word select" },
+	{ 121, "TERT MI2S data 0 (in)" }, { 124, "TERT MI2S data 1 (out)" }, { 15, "the amplifier 0x34's reset" },
+	{ 47, "the amplifier 0x34's interrupt" }, { 84, "the amplifier 0x35's interrupt" }, { 24, "the speaker switch" },
+};
+
 static void
 show_pins(void)
 {
+	if (renoir) {
+		for (unsigned i = 0; i < sizeof(renoir_pins) / sizeof(renoir_pins[0]); i++) {
+			uint32_t cfg = rd(GPIO_CFG(renoir_pins[i].pin)), io = rd(GPIO_IO(renoir_pins[i].pin));
+
+			say("speaker: gpio%u (%s): function %u, pull %u, %u mA, %s, reads %u\n", renoir_pins[i].pin, renoir_pins[i].what,
+			    (cfg >> 2) & 15, cfg & 3, (((cfg >> 6) & 7) + 1) * 2, (cfg & CFG_OUTPUT) ? (io & 2 ? "drives high" :
+			    "drives low") : "input", io & 1);
+		}
+		return;
+	}
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
 		uint32_t cfg = rd(GPIO_CFG(pins[i].pin)), io = rd(GPIO_IO(pins[i].pin));
 
@@ -1081,9 +1104,45 @@ hakios_speaker_quiesce(void)
 
 /* ---- speaker_probe=N: a look ------------------------------------------------------------------------ */
 
+/*
+ * renoir's amplifiers, NXP TFA9873 (TFA2 family; NXP's tfa98xx driver, tfa2_tfafieldnames): 8-bit
+ * register addresses, 16-bit values most significant byte first, as the Awinic ones. Read only:
+ * 0x03 the revision (0x?a73 for a TFA9873), 0x00 the system control (power-down, enables), 0x10
+ * the status flags (clocks stable, PLL locked, faults).
+ */
+static void
+show_tfa(void)
+{
+	static const struct {
+		uint8_t reg;
+		const char *name;
+	} regs[] = { { 0x03, "revision" }, { 0x00, "system control 0" }, { 0x01, "system control 1" }, { 0x10, "status 0" },
+		     { 0x11, "status 1" }, { 0x13, "status 3" } };
+
+	for (unsigned i = 0; i < 2; i++) {
+		uint16_t value = 0;
+
+		if (!register_read(amplifiers[i].address, regs[0].reg, &value)) {
+			say("speaker: nobody at I2C address %#x: not powered, held in reset, or not there\n", amplifiers[i].address);
+			continue;
+		}
+		say("speaker: an amplifier answers at %#x: revision %#06x%s\n", amplifiers[i].address, value,
+		    (value & 0xff) == 0x73 ? " (a TFA9873)" : "");
+		for (unsigned r = 1; r < sizeof(regs) / sizeof(regs[0]); r++) {
+			if (register_read(amplifiers[i].address, regs[r].reg, &value)) {
+				say("speaker:   register %#04x (%s) = %#06x\n", regs[r].reg, regs[r].name, value);
+			}
+		}
+	}
+}
+
 static void
 show_amplifiers(void)
 {
+	if (renoir) {
+		show_tfa();
+		return;
+	}
 	/* the chip ID, then registers that every chip of the family has at the same place and that reading does not change */
 	static const struct {
 		uint8_t reg;
@@ -1204,6 +1263,15 @@ hakios_speaker_init(void)
 
 	if (!PE_parse_boot_argn("speaker_probe", &probe_level, sizeof(probe_level)) || probe_level == 0) {
 		return;
+	}
+	{
+		char board[16] = "";
+
+		if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
+			renoir = true;
+			pin_sda = 36;
+			pin_scl = 37;
+		}
 	}
 	if (kernel_thread_start(probe_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

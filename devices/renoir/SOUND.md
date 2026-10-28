@@ -52,6 +52,15 @@ group 0x9100; pins 97-100, function mi2s0), 2 slots of 32 bits at 48 kHz. `sound
   has `sound/soc/codecs/tfa9879.c` (a different, simple chip).
 - NXP's TFA98xx Linux driver (tfa98xx: container `.cnt` loaded over I2C, then the profile/vstep).
 
+## First probe (session 4, 2026-10-28 19:51): both amplifiers answer
+
+`board=renoir speaker_probe=2` (`hakios.speaker.c`: I2C by hand on gpio36/37, read only): **0x35 and
+0x34 each answer with revision 0x0b73, a TFA9873**; 0x35: system control 0 `0x4201`, control 1 `0x8000`,
+status 0 `0x0017`, status 1 `0`, status 3 `0x010f` (powered down, as the firmware leaves them). The bus
+is at rest (both lines high). The TERT_MI2S pins 120/121/122/124 are GPIOs (function 0, inputs) until
+the sound path sets them to their MI2S functions; reset gpio15 reads 0 (not in reset), speaker switch
+gpio24 an input reading 0.
+
 ## What the port needs, in order
 
 1. From renoir in MagicOS (adb; `su` if Magisk works): `/vendor/etc/mixer_paths*.xml` (the speaker
