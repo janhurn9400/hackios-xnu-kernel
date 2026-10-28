@@ -89,5 +89,13 @@ it. `adsp_step=6` returns cleanly, so it is something step 7 leaves behind.
   manager on the ADSP over GLINK: the reset at ~5 s fits); (c) the kernel's panic / return path.
   Cheap tests: the same run with the loader's charger polling off; with the DSP left running (no
   stop/shutdown at the end of the steps); the kernel's console mirrored into the live log.
+- (b) is unlikely: the loader's charger stack is not active on renoir (no "battery: ChargerEx=" line
+  in any run, the kernel reports SOC -1).
+- **(c) is ruled out**: `adsp_step=7 adsp_pause=0 adsp_return=1` (back to the loader right after the
+  steps, no root mount, no panic) **resets the phone as well** (session 3, 18:05; it came up in MagicOS,
+  which overwrites the kept log). Left: the stop / TrustZone shutdown / AOP "off" sequence, or the way
+  back to the loader with a DSP that has run.
+- Watch out: when the phone comes up in MagicOS after a crash, the kept log is gone (Linux uses that
+  RAM). Go to fastboot by keys while it is still resetting.
 
 - Speaker amplifiers, for the sound later: two NXP TFA98xx at 0x34/0x35 (MagicOS dmesg).
