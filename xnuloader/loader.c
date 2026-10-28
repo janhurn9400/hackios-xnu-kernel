@@ -3885,6 +3885,8 @@ usb_wait(uint8_t endpoint)
 		USB->handle_event(&msg, &size, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_connected = (data.device_state == UsbDeviceStateConnected);
+			print("usb: state %d (connected %d)%s\n", (uint64_t)data.device_state, (uint64_t)usb_connected,
+			    running_live != NULL ? ", while a kernel runs" : "");
 			return -1;
 		}
 		/* with a kernel running, a host that went away must not keep this core from watching it */
@@ -3908,7 +3910,14 @@ usb_rx(uint8_t *buf, uint64_t len)
 {
 	if (usb_rx_queued) {
 		usb_rx_queued = 0;      /* (every command is received the same way, into the same buffer) */
-	} else if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {
+		return usb_wait(USB_EP_OUT);
+	}
+	if (READ_SYSREG(CNTVCT_EL0) < after_run_until) {
+		/* (renoir resets on the way back after its audio DSP has run: is it here?) */
+		print("usb: a receive is about to be queued (connected %d), %d ms after the run\n", (uint64_t)usb_connected,
+		    (READ_SYSREG(CNTVCT_EL0) - after_run_from) * 1000 / READ_SYSREG(CNTFRQ_EL0));
+	}
+	if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {
 		return -1;
 	}
 	return usb_wait(USB_EP_OUT);
