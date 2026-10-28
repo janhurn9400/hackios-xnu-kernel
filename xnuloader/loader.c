@@ -2666,6 +2666,34 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	return status;
 }
 
+/*
+ * Which shared interrupts are pending and which are enabled in the distributor, as the kernel left
+ * them: UEFI takes over the interrupt controller again when a run is back, and on renoir the phone
+ * resets within 100 ms of that after the audio DSP has run (not after runs without it).
+ */
+static void
+gic_pending_report(const char *when)
+{
+	uint64_t d = PLAT->gic_dist;
+	int any = 0;
+
+	print("gic %s: pending interrupt %x, daif %x; distributor ctlr %x\n", when, READ_SYSREG(S3_0_C12_C12_2) & 0xffffff,
+	    READ_SYSREG(DAIF), (uint64_t)*(volatile uint32_t *)(d + 0x000));
+	for (unsigned w = 1; w < 32; w++) {             /* SPIs 32..1023 */
+		uint32_t pend = *(volatile uint32_t *)(d + 0x200 + 4 * w);
+		uint32_t en = *(volatile uint32_t *)(d + 0x100 + 4 * w);
+
+		if (pend != 0) {
+			print("  SPIs %d..%d: pending %x, enabled %x, pending and enabled %x\n", (uint64_t)w * 32,
+			    (uint64_t)w * 32 + 31, (uint64_t)pend, (uint64_t)en, (uint64_t)(pend & en));
+			any = 1;
+		}
+	}
+	if (!any) {
+		print("  no shared interrupt pending\n");
+	}
+}
+
 /* ------------------------------------------------------------------------ */
 /* Hypervisor watchdog (Qualcomm "Haven" virtual watchdog, SMC interface as  */
 /* used by Linux drivers/virt/haven/hh_virt_wdt.c). Armed for the whole stay */
@@ -3687,9 +3715,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			set_result("returned", klog_len, 0);
 		}
 	}
+	gic_pending_report("the run is back");
 	write_logs(klog, klog_len);
+	gic_pending_report("the logs are written");
 	crash_log_clear();              /* the run is over and its logs are out: nothing to keep */
-	after_run_from = after_run_last = READ_SYSREG(CNTVCT_EL0);
+	after_run_from = READ_SYSREG(CNTVCT_EL0);
+	after_run_last = after_run_from - READ_SYSREG(CNTFRQ_EL0);
 	after_run_until = after_run_from + 10 * READ_SYSREG(CNTFRQ_EL0);
 	return 1;
 }
@@ -3806,8 +3837,10 @@ usb_wait(uint8_t endpoint)
 		usb_device_event_data data;
 		uint64_t now = READ_SYSREG(CNTVCT_EL0);
 
-		/* for a while after a run: signs of life, into the log that survives a reset (renoir's ADSP) */
-		if (now < after_run_until && now - after_run_last >= freq / 10) {
+		/* for a while after a run: signs of life, into the log that survives a reset (renoir's ADSP);
+		 * every 10 ms in the first second, then every 100 ms */
+		if (now < after_run_until &&
+		    now - after_run_last >= (now - after_run_from < freq ? freq / 100 : freq / 10)) {
 			after_run_last = now;
 			print("alive %d ms after the run: pending interrupt %x, daif %x\n", (now - after_run_from) * 1000 / freq,
 			    READ_SYSREG(S3_0_C12_C12_2) & 0xffffff, READ_SYSREG(DAIF));
