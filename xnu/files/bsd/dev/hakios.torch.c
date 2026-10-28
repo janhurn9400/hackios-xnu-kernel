@@ -723,11 +723,15 @@ out:
 	thread_terminate(current_thread());
 }
 
+static void reboot_reason_set(void);
+static void reboot_reason_clear(void);
+
 void
 hakios_torch_init(void)
 {
 	thread_t thread;
 
+	reboot_reason_set();
 	if (!PE_parse_boot_argn("torch", &level, sizeof(level)) || level == 0) {
 		return;
 	}
@@ -742,6 +746,8 @@ void
 hakios_torch_quiesce(void)
 {
 	uint8_t module = 0xff, channels = 0xff, target = 0xff;
+
+	reboot_reason_clear();
 
 	if (level < 2 || flash.write == 0) {
 		return;
@@ -760,4 +766,124 @@ hakios_torch_quiesce(void)
 	(void)spmi_read(&flash, FLASH_ITARGET0, &target, 1);
 	say("torch: at the run's end the module reads: enable %#04x, channels %#04x, target %#04x%s\n", module, channels, target,
 	    module == 0 && (channels & 0x01) == 0 && target == 0 ? " (dark)" : " (NOT DARK)");
+}
+
+/* ---- renoir: a run that hangs the phone restarts it into fastboot, not into Android ---------------- */
+
+/*
+ * When the phone hangs in a run, the watchdog restarts it, and Xiaomi's boot loader starts Android: then
+ * the phone has to be taken to fastboot by hand, and the RAM the loader keeps logs in is gone. What
+ * "reboot bootloader" does on Linux is done here at the run's start: the reboot reason in the
+ * always-on memory (IMEM restart_reason, dt qcom,msm-imem@146aa000 restart_reason@65c: 0x77665500)
+ * and in the PMIC (dt qcom,reboot-reason: the PMK8350's SDAM at 0x7100, register 0x48, bits 7:1;
+ * 2 = bootloader, 1 = recovery as in Linux's qcom-pon), as Linux's msm-poweroff / qcom-reboot-reason
+ * write them. At a run's orderly end
+ * (and on a panic's way back to the loader) both are put back as they were, so that "fastboot reboot"
+ * from the loader goes to Android as before. Only a hang leaves them set.
+ *
+ * With board=renoir; boot-arg crash_fastboot=0 leaves both alone. The PMIC is written only if the
+ * arbiter's channel for the SDAM is ours, one register, read back.
+ */
+#define RR_IMEM_PHYS            0x146aa000UL
+#define RR_IMEM_OFFSET          0x65c
+#define RR_IMEM_BOOTLOADER      0x77665500u
+#define RR_SDAM_REG             0x48
+#define RR_SDAM_BOOTLOADER      (2u << 1)       /* 2 = bootloader, 1 = recovery: 1 took the phone into MIUI's recovery */
+
+static struct peripheral rr_sdam = { .name = "the PMK8350's SDAM (the reboot reason)", .id = 0x071 };
+static vm_offset_t rr_imem;
+static uint32_t rr_imem_was;
+static uint8_t rr_sdam_was;
+static bool rr_imem_set, rr_sdam_set;
+
+static bool
+rr_sdam_write(uint8_t value)
+{
+	const char *problem = NULL;
+	uint8_t back = 0xff;
+
+	if (!rr_sdam.writable || rr_sdam.write == 0 ||
+	    ((rd(arb_core + ARB_CHANNEL(rr_sdam.channel)) >> 8) & 0xfff) != rr_sdam.id) {
+		return false;
+	}
+	for (int tries = 0; tries < 3; tries++) {
+		lock();
+		wr(rr_sdam.write + CHANNEL_WDATA0, value);
+		wr(rr_sdam.write + CHANNEL_COMMAND, COMMAND_WRITE | (uint32_t)RR_SDAM_REG << 4);
+		problem = wait_done(rr_sdam.write);
+		unlock();
+		if (problem == NULL || strcmp(problem, DROPPED) != 0) {
+			break;
+		}
+	}
+	if (problem == NULL) {
+		problem = spmi_read(&rr_sdam, RR_SDAM_REG, &back, 1);
+	}
+	if (problem != NULL || back != value) {
+		say("reboot reason: the PMIC's register %#x <- %#04x: %s (reads %#04x)\n", RR_SDAM_REG, value,
+		    problem ? problem : "not as written", back);
+		return false;
+	}
+	return true;
+}
+
+static void
+reboot_reason_set(void)
+{
+	char board[16] = "";
+	uint32_t on = 0;
+
+	if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
+		on = 1;
+	}
+	PE_parse_boot_argn("crash_fastboot", &on, sizeof(on));
+	if (!on) {
+		return;
+	}
+	rr_imem = ml_io_map(RR_IMEM_PHYS, 0x1000);
+	rr_imem_was = rd(rr_imem + RR_IMEM_OFFSET);
+	wr(rr_imem + RR_IMEM_OFFSET, RR_IMEM_BOOTLOADER);
+	rr_imem_set = rd(rr_imem + RR_IMEM_OFFSET) == RR_IMEM_BOOTLOADER;
+
+	if (arb_core == 0) {
+		arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+		arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
+		arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+	}
+	find_channel(&rr_sdam, ARB_MAX_CHANNELS);
+	if (rr_sdam.found && rr_sdam.writable && spmi_read(&rr_sdam, RR_SDAM_REG, &rr_sdam_was, 1) == NULL) {
+		rr_sdam.write = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * rr_sdam.channel, 0x1000);
+		rr_sdam_set = rr_sdam_write((uint8_t)((rr_sdam_was & 0x01) | RR_SDAM_BOOTLOADER));
+	}
+	say("reboot reason: a hang restarts into fastboot: IMEM %#x -> %#x%s, PMIC %#04x -> %#04x%s\n", rr_imem_was,
+	    RR_IMEM_BOOTLOADER, rr_imem_set ? "" : " (NOT TAKEN)", rr_sdam_was, (rr_sdam_was & 0x01) | RR_SDAM_BOOTLOADER,
+	    rr_sdam_set ? "" : " (not written)");
+	/* boot-arg crash_fastboot_test=1 (with cpus=1): hang here on purpose, the watchdog restarts the phone */
+	{
+		uint32_t test = 0;
+
+		if (PE_parse_boot_argn("crash_fastboot_test", &test, sizeof(test)) && test) {
+			say("reboot reason: crash_fastboot_test=1: hanging on purpose now, interrupts off\n");
+			(void)ml_set_interrupts_enabled(FALSE);
+			for (;;) {
+			}
+		}
+	}
+}
+
+static void
+reboot_reason_clear(void)
+{
+	if (rr_imem_set) {
+		wr(rr_imem + RR_IMEM_OFFSET, rr_imem_was);
+		rr_imem_set = false;
+	}
+	if (rr_sdam_set) {
+		bool saved = leaving;
+
+		leaving = true;                 /* (the others are stopped: no lock to wait for) */
+		(void)rr_sdam_write(rr_sdam_was);
+		leaving = saved;
+		rr_sdam_set = false;
+	}
 }

@@ -49,3 +49,15 @@ In the VM: `bash devices/renoir/setup-kernel-vm.sh` (packages, cctools, SDK, `xn
 so no exec session stays open. Ends with errors in `check_all_exports`, `IOKit.symbolset` and the
 lldbmacros copy: harmless, judge by the kernel's date. Copy the kernel to
 `devices/renoir/prebuilt/vm-kernel/` and run it with `KERNEL=... devices/renoir/run-open.sh`.
+
+## A run that hangs the phone comes back in fastboot
+
+With `board=renoir` the kernel writes the "bootloader" reboot reason at the start of every run (PMIC
+PMK8350 SDAM 0x7100 register 0x48 = 2 << 1, and IMEM 0x146aa000 + 0x65c = 0x77665500) and puts both
+back at an orderly end or a panic's way back. A hang lets the watchdog restart the phone (~40 s), and
+Xiaomi's ABL then starts **fastboot**, not MagicOS (tested 2026-10-28 with `crash_fastboot_test=1`,
+which hangs the kernel on purpose; with `cpus=1`). The ABL clears the PMIC field after use, so a normal
+`fastboot reboot` still goes to MagicOS. `crash_fastboot=0` leaves both alone. Value 1 is "recovery":
+it took the phone into MIUI's recovery. A hang in the loader after the kernel came back (the reason
+already cleared) still ends in MagicOS. Code: the end of `xnu/files/bsd/dev/hakios.torch.c`.
+
