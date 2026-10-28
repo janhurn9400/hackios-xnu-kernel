@@ -4920,7 +4920,7 @@ renoir_mhi(vm_offset_t mhi)
 
 		c->word[0] = 0;
 		c->word[1] = 1;
-		c->word[2] = i;
+		c->word[2] = i + 1;             /* MSI vector: 0 is BHI's, as in ath11k's configuration */
 		c->base = c->read = MHI_AT(0x4000 + 0x1000 * i);
 		c->length = 16 * MHI_RING_ELEMENTS;
 		c->write = MHI_AT(0x4000 + 0x1000 * i + 16 * (MHI_RING_ELEMENTS - 1));
@@ -4997,6 +4997,13 @@ renoir_mhi(vm_offset_t mhi)
 		printf("wifi: pcie: 9: QRTR HELLO SENT on channel 20 (%u bytes)\n", (unsigned)sizeof(hello));
 	}
 	for (int ms = 0; ms < 3000; ms++) {
+		if (ms == 500 || ms == 1500) {
+			mhi_wr64(mhi + rd(mhi + 0x18) + 8 * 20, MHI_AT(0x6000 + ch_wp[0]));
+			mhi_wr64(mhi + rd(mhi + 0x18) + 8 * 21, MHI_AT(0x7000 + ch_wp[1]));
+			mhi_event_doorbell(mhi, 1);
+			printf("wifi: pcie: 9: %d ms: the doorbells of channels 20, 21 and event ring 1 rung again; MHI status %#x\n",
+			    ms, rd(mhi + MHI_STATUS));
+		}
 		while (mhi_event(1, e)) {
 			mhi_say_event("channel event", e);
 			if (((e[3] >> 16) & 0xff) == 0x22 && (e[3] >> 24) == 21) {
