@@ -130,6 +130,18 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    given, soc id 0x400c0200, firmware 0x110a004f "2021-05-20 10:30", build WLAN.HSP.1.1.c2-00079-...402775.4
    (Android's exactly); **`bd_k9gl.elf` (from the phone's firmware_mnt, in the small image) accepted in 10 pieces**;
    `m3.bin` (266684 bytes) shown at 0xa1398000 and its place sent; **"firmware init done" 4.8 s after the start.**
+   **ATH11K RUNS ON RENOIR AND SCANS, 2026-10-29 13:30 (`wifi_lx=2 wifi_scan=1 pcie_pause=0 wifi_mac=...`,
+   `logs/132955-scan.log`).** `lx_bus.c` has a renoir bus (`renoir_ops`: BAR0 with pcic.c's moving window at
+   0x310c, power_up = the kernel's chain to QRTR over MHI, `hakios_wifi_renoir_up()`, kept running); ath11k's own
+   qmi.c does the whole exchange (memory on 4 MB, board.bin = bd_k9gl.elf, m3.bin, init done, wlan cfg with its
+   shadow registers, mission), then HTC (Control, HTT Data, WMI), "service ready", "unified ready" 7.9 s after its
+   start: one radio, 2.4 and 5 GHz, 2x2, HT/VHT/HE, firmware country "CN" (13 + 13 channels). **The scan: 26
+   channels in 4 s, 5 access points heard at 2.4 GHz (-61 to -82 dBm).** What it took: QMI's transport and the
+   SMMU context set before ath11k starts; SMMU tables for 128 MB (66 tables); the DMA pool 64 MB with 32 MB of
+   rings (pieces of 1 MB and more on 4 MB); PERST# left released for the kept radio; the MHI pump stops on a chip
+   that reads all ones. The radio has no address of its own (the firmware says zeros; Android gets it from the
+   modem's DMS, "use-nv-mac"): give it with boot-arg `wifi_mac=` (the phone's, from MagicOS; not in these files).
+   Next: join a network (`wifi_join=1`, `fw/network`, as redwood), then `wifi=1` for iOS (hakios.apple80211.c).
    **MISSION MODE, 2026-10-29 12:55 (`pcie=11`, `logs/125435-mission.log`):** logging on (3 ms), the configuration
    from ath11k's "wcn6855 hw2.1" tables (9 pipes, 14 services: the same `qca6390` tables as the WCN6750's; no shadow
    registers, which ath11k does send for this chip) taken after 1148 ms, **mode MISSION taken in 17 ms.** No "firmware

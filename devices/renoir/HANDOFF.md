@@ -33,8 +33,10 @@
   type 4), as on Android.** **12:50: memory given (on 4 MB), "memory ready", target capabilities, the board
   data `bd_k9gl.elf` and M3 accepted: "FIRMWARE INIT DONE"** -- the whole of cnss' bring-up up to there.
   Small image `prebuilt/sysimg/root-wifi.apfs` = hold + fw/{amss20.bin, bd_k9gl.elf, m3.bin}. **12:55
-  (`pcie=11`): configuration and MODE MISSION taken: the firmware runs as for Android's Wi-Fi.** Next: ath11k
-  over PCI on `wifi/lx` (its pci.c/mhi.c on our MHI and PCIe), the copy engines and the radio's registers.
+  (`pcie=11`): configuration and MODE MISSION taken: the firmware runs as for Android's Wi-Fi.**
+  **13:30: ATH11K RUNS ON RENOIR AND SCANS: 5 networks heard** (`devices/renoir/wifi-run.sh scan 240 wifi_lx=2
+  wifi_scan=1 wifi_quiet=1 pcie_pause=0 wifi_mac=<the phone's>`; the kernel needs `tools/mk-ath11k.sh` and
+  `tools/mk-wlfw.sh` run in the VM before its build). Next: join a network, then Wi-Fi in iOS (`WIFI.md`).
 - **The loader now sets the restart reason "bootloader" for every `board=renoir` run** (before the kernel
   starts; `xnuloader/loader.c` `renoir_fastboot_on_reset()`; image `prebuilt/xnu-usb-renoir-crashlog.img`
   09:00): a run that dies early also lands in fastboot. The user wants that always: never MagicOS.
