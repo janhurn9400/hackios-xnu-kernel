@@ -123,7 +123,17 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    (The header with ath11k's message tables: `tools/mk-ath11k.sh fetch; tools/mk-wlfw.sh` in the VM, after a
    kernel build; done.) Odd: our first two datagrams (the hellos) got no transfer event within 1 s although
    the chip acted on them; everything after came back in milliseconds.
-   **Next: give the firmware its memory** (two pieces in one physical piece each, shown through the SMMU,
+   **FIRMWARE INIT DONE, 2026-10-29 12:50 (`pcie=10`, `logs/124931-mem2.log`):** the two pieces in one physical
+   piece each (`lx_os_radio_memory()`), shown on 4 MB-aligned addresses 0xa0800000 / 0xa1000000 (unaligned ones,
+   0xa05a4000 / 0xa0a84000, sent the chip into MHI SYS_ERR at once; dt cnss_wlan_region alignment 0x400000) ->
+   respond memory success in 2 ms, **"memory ready"**; target capabilities: chip id 0, family 0xb, board id not
+   given, soc id 0x400c0200, firmware 0x110a004f "2021-05-20 10:30", build WLAN.HSP.1.1.c2-00079-...402775.4
+   (Android's exactly); **`bd_k9gl.elf` (from the phone's firmware_mnt, in the small image) accepted in 10 pieces**;
+   `m3.bin` (266684 bytes) shown at 0xa1398000 and its place sent; **"firmware init done" 4.8 s after the start.**
+   Next: the configuration and mode MISSION (ath11k_qmi_firmware_start: wlan_cfg with the copy engine and
+   service tables for the QCA6390 family, mode 0), Android's "Setup S3E TCS Addr: 42204 Data: 1" before M3 (the
+   power amplifier's supply through the `tcs_cmd` region: dt `qcom,tcs_offset_int_pow_amp_vreg` 0x4b0), then
+   ath11k_pci. Done before that: **give the firmware its memory** (two pieces in one physical piece each, shown through the SMMU,
    QMI_WLANFW_RESPOND_MEM), then FW_MEM_READY, target capabilities, BDF (`bdwlan.*` / `regdb`), M3
    (`m3.bin`), mode. Earlier plan: **QMI with WLFW over this** (`hakios.wlfw.c` speaks it for redwood over GLINK/QRTR: give it an
    MHI transport, `hakios_qmi_set_transport()`), then ath11k_pci. Originally planned as: the context arrays (channels, event rings, command ring) in shown memory, their

@@ -30,7 +30,10 @@
   (`pcie_ch=0`): MHI works. **SOLVED 01:30: with MHI started in the SBL (before BHIe; now the default)
   the WLAN firmware says QRTR hello on IPCR and announces WLFW (service 0x45) at node 7 port 1.**
   **`pcie=10` (09:05): QMI with WLFW works over MHI; the firmware asks for memory (0x4e0000 type 1, 0x398000
-  type 4), as on Android.** Next: answer that (`WIFI.md` step 6), then BDF, M3, mode, ath11k_pci.
+  type 4), as on Android.** **12:50: memory given (on 4 MB), "memory ready", target capabilities, the board
+  data `bd_k9gl.elf` and M3 accepted: "FIRMWARE INIT DONE"** -- the whole of cnss' bring-up up to there.
+  Small image `prebuilt/sysimg/root-wifi.apfs` = hold + fw/{amss20.bin, bd_k9gl.elf, m3.bin}. Next: mode
+  MISSION (the configuration), then ath11k_pci (`WIFI.md` step 6).
 - **The loader now sets the restart reason "bootloader" for every `board=renoir` run** (before the kernel
   starts; `xnuloader/loader.c` `renoir_fastboot_on_reset()`; image `prebuilt/xnu-usb-renoir-crashlog.img`
   09:00): a run that dies early also lands in fastboot. The user wants that always: never MagicOS.
