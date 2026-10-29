@@ -1,5 +1,13 @@
 # renoir touch: what is known (2026-10-28), for adapting `hakios.goodix.c`
 
+**2026-10-29: taps were lost on the keyboard -- fixed.** The FocalTech chip says "a report waits" with a short
+low pulse on its interrupt line, not a level; the driver looked at the level every 8 ms, saw it high nearly every
+time, and while a finger was down only its 80 ms fallback read a report (~12 a second; a quick tap fell between
+two). Statistics before: 7779 reports in 10480 looks, **2701 bad** (26 %). Now (`hakios.goodix.c`, renoir only):
+the pin's own falling-edge latch (`GPIO_INTR_CFG` raw status, the interrupt itself left off; `GPIO_INTR_STATUS`
+read and cleared) is looked at every 4 ms, and every look reads while a finger is down. The user: "totale
+Verbesserung", typing works. `touch_latch=0` brings the old behaviour back. The bad reads by hand are still open.
+
 Status (2026-10-28, session 2): **touch works on renoir.** `hakios.goodix.c` has a renoir board
 profile (`touch_board=renoir`); run with `KERNEL=devices/renoir/prebuilt/vm-kernel/mach.development.bcm2837
 RAMDISK=devices/renoir/prebuilt/vm-kernel/hold devices/renoir/run-open.sh 90 cpus=1 touchscreen=1

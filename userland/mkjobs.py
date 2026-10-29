@@ -222,7 +222,10 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
         # iOS 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
-        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced')
+        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced',
+        # visual voicemail, with no cellular service to ask: it spins one core at 97% for as long as iOS runs
+        # (renoir, 2026-10-29: 7 min 50 s of processor in the first 9 minutes; stopped, the screen was smooth again)
+        'com.apple.voicemail.vmd')
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())

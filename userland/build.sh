@@ -411,6 +411,16 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
+# renoir's radio instead, a QCA6490 on PCIe (devices/renoir/WIFI.md): its firmware, board data and M3
+# image, which the kernel sends it (wifi=1, board=renoir); and the network to join, as above
+if [ -f ../fw-wifi/amss20.bin ]; then
+	mkdir -p root/fw
+	for f in amss20.bin bd_k9gl.elf m3.bin; do
+		install -m 0644 ../fw-wifi/$f root/fw/
+	done
+	rm -f root/fw/network
+	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
+fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (bsd/dev/hakios.haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
 if [ -f ../fw-haptic/aw8697_haptic.bin ]; then

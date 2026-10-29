@@ -1,5 +1,30 @@
 # Handoff for the next session
 
+## Session 6 (2026-10-29, ~20:30-22:10): iOS from the flash, smooth, typing works, Metal's core runs
+
+Read `FLASH.md` first (partition `darwin`, the images, the boot command). Everything below is on the phone now:
+- **iOS boots from the flash** (`root_apfs=ufs_darwin`): partition `darwin` (sda35, 20 GiB) cut off `userdata`
+  from MagicOS (backup of both GPT copies in `fw-backup/renoir-userdata/`), iOS's root volume and both cryptexes
+  written and read back. The cause of "sound and haptics stop with Safari" was memory (`SOUND.md`).
+- **Smooth**: `vmd` (visual voicemail) spun one core at 97 % for the whole run; now in `mkjobs.py`'s DENY.
+  The GPU is not the limit: a frame costs 1.0-1.7 ms in hakios-gl.
+- **Typing works**: the touch driver missed the FocalTech's interrupt pulses (`TOUCH.md`); edge latch, 4 ms.
+  Kernel `prebuilt/vm-kernel/mach.development.bcm2837.touch` (21:44).
+- **Metal**: upstream's `oosexgang/hakios-metal` probe passes every check on renoir's Adreno 642 (built on the
+  Mac with Xcode's iOS SDK, `make ios SDK=... IOS_CXX="xcrun --sdk iphoneos clang++ ... -miphoneos-version-min=16.0"`
+  with `DEVELOPER_DIR=/Applications/Xcode-27.1.app/...`; the VM's theos SDK has no libc++ headers; copied over SSH,
+  run as root): 500 KB copy, fills, 40 command buffers in order, 16 MB in 235 ms. Upstream's Metal plug-in
+  (`userland/src/HakiosMetal.m`, `docs/metal-plan.md`, branch `hakios` of `oosexgang/hakios-xnu-kernel`) is not in
+  this fork yet; nothing draws through Metal anywhere yet (no shaders; iOS 16.5 lacks QuartzCore's default.metallib).
+- Wi-Fi away from home: `wifi_file=0`, iOS joins the iPhone hotspot (`FLASH.md`). Sileo with Procursus, Havoc,
+  Chariz (register with `prep.sh` over SSH after each boot).
+- Frame rate: the framebuffer's beat is a 60 Hz timer; idle reports show 28-65 ms between frames; not measured
+  while scrolling yet. 90 Hz needs the panel switched (DSI), not just `fb_hz=90`.
+
+Next: sound from the flash (`adsp=1 sound=4`, SSH instead of USB), `var_store=1 ufs_write=1` so iOS keeps its
+data, the touch driver's 26 % bad reads, frame times while scrolling, upstream's Metal plug-in.
+
+
 ## Session 5 (2026-10-28, ~22:30-23:05): ringtones, the endless vibration, Wi-Fi started
 
 - **Ringtones play** in Settings and can be chosen: `sysimage/select-system.py` had left `Library/Ringtones/`

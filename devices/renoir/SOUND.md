@@ -163,3 +163,12 @@ a while. No audio daemon exits or is killed. Not the clocks either: one clock fo
 (audio_plugin.c, also a fix in its own right) changed nothing. Upstream has nothing on it (no commit, no review).
 It is a decision inside mediaserverd (a session WebKit makes muting system haptics and sounds?); next: mediaserverd's
 own log (over SSH now that Wi-Fi works, `log stream`), or WebKit's audio session category.
+
+## Sound and haptics stop once Safari starts: it was memory (2026-10-29, evening)
+
+`mediaserverd`'s log (`oslog` from Procursus, over SSH): `HALB_IOBufferManager_Server::AllocateBuffer: failed to
+lock the buffer ... errno 35`, `IOWorkLoop: failed to start the hardware`, `DoStartIO failed (1852797029 = 'nope')`:
+the kernel refused to wire the 64 KB I/O buffer of the Actuator/Speaker device. `vm_stat`: 3.66 GB wired, 20 MB
+free of ~4.3 GB (the 2.5 GB system image in RAM). Not our plug-in, not the drivers. **Fixed by booting from the
+flash** (`FLASH.md`): 1.6 GB wired, haptics stay with Safari (user, 21:38). Sound not tried there yet (that run had
+no `adsp=1`).

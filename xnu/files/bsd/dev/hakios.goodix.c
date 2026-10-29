@@ -121,6 +121,10 @@ static const struct touch_board *board = &redwood;
 #define TLMM_SIZE               0x100000UL
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
+#define GPIO_INTR_CFG(n)        (tlmm + 0x1000UL * (n) + 8)     /* [0] enable, [1] polarity, [3:2] detection, [4] raw status */
+#define GPIO_INTR_STATUS(n)     (tlmm + 0x1000UL * (n) + 0xc)   /* bit 0: the edge was seen; written 0 to clear */
+/* a falling edge latched in the pin's status even with the interrupt itself off (pinctrl-msm.c's encoding) */
+#define INTR_CFG_FALLING_LATCH  (1u << 4 | 2u << 2 | 1u << 1)
 #define PULL_NONE               0
 #define PULL_UP                 3
 
@@ -1361,6 +1365,17 @@ focaltech_report(const uint8_t *report)
 	}
 }
 
+static bool
+focaltech_any_down(void)
+{
+	for (uint32_t i = 0; i < FOCALTECH_MAX_TOUCHES; i++) {
+		if (focaltech_contact[i].down) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 focaltech_poll(void)
 {
@@ -1548,11 +1563,23 @@ static void
 goodix_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	unsigned idle = 0, idle_looks;
-	uint32_t poll_us = 8000, latency = 0, reads = 0;
+	uint32_t poll_us = 8000, latency = 0, reads = 0, latch = 0, latched_reads = 0, held_reads = 0;
 	uint64_t before = 0, reading = 0;
 
+	/*
+	 * renoir's FocalTech chip says "a report waits" with a short low pulse on the interrupt line, not a level:
+	 * looked at every 8 ms the line is high nearly every time, and while a finger was on the glass only the
+	 * 80 ms look got a report -- about 12 a second, and a quick tap on the keyboard fell between two of them.
+	 * There the pin's own edge latch (its interrupt status, the interrupt itself left off) is looked at
+	 * instead, every 4 ms, and while a finger is down every look reads (boot-arg touch_latch=0: as before).
+	 */
+	if (board == &renoir) {
+		poll_us = 4000;
+		latch = 1;
+	}
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
 	PE_parse_boot_argn("touch_lat", &latency, sizeof(latency));
+	PE_parse_boot_argn("touch_latch", &latch, sizeof(latch));
 	if (poll_us < 250 || poll_us > 100000) {
 		poll_us = 8000;
 	}
@@ -1569,7 +1596,15 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 		return;
 	}
-	printf("goodix: %s touch screen ready; the interrupt line is looked at every %u us\n", chip_name(), poll_us);
+	if (latch) {
+		wr(GPIO_INTR_CFG(PIN_INT), INTR_CFG_FALLING_LATCH);
+		wr(GPIO_INTR_STATUS(PIN_INT), 0);
+	}
+	printf("goodix: %s touch screen ready; the interrupt line is looked at every %u us%s\n", chip_name(), poll_us,
+	    latch ? " through its edge latch (gpio intr_cfg " : "");
+	if (latch) {
+		printf("goodix: ... intr_cfg %#x), and every look reads while a finger is down\n", rd(GPIO_INTR_CFG(PIN_INT)));
+	}
 	{
 		uint32_t rate = 0;
 
@@ -1586,7 +1621,18 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		uint64_t looked = micros_now(), read_at;
 
 		/* the interrupt line is low while a report waits; look anyway every 80 ms in case it is missed */
-		if (!gpio_get(PIN_INT)) {
+		bool edge = false, held = false;
+
+		if (latch) {
+			edge = (rd(GPIO_INTR_STATUS(PIN_INT)) & 1) != 0;
+			if (edge) {
+				wr(GPIO_INTR_STATUS(PIN_INT), 0);       /* (before the read: a report after it latches again) */
+			}
+			held = touch_chip == TOUCH_FOCALTECH && focaltech_any_down();
+			latched_reads += edge;
+			held_reads += held && !edge;
+		}
+		if (edge || held || !gpio_get(PIN_INT)) {
 			idle = 0;
 			chip_poll();
 			read_at = micros_now();
@@ -1604,9 +1650,11 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		before = looked;
 		if (tick % (60 * (1000000 / poll_us)) == 0) {
 			printf("%s: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
-			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us, reports %s a second\n",
+			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us, reports %s a second; "
+			    "%u reads for a latched edge, %u for a finger held\n",
 			    chip_name(), seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
-			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate);
+			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate, latched_reads,
+			    held_reads);
 		}
 		sleep_us(poll_us);
 	}
