@@ -148,6 +148,16 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    Then the access point disassociated us (reason 33, QoS/bandwidth) within the 20 s, with nothing sent (no
    iOS, no DHCP in this run). Next: `wifi=1` in a full iOS run (hakios.apple80211.c, en0, DHCP); look at reason
    33 (block ack / QoS setup, or idle) if it comes back with traffic.
+   **WI-FI IN iOS WORKS, 2026-10-29 14:15:** `wifi=1` (renoir: `renoir_whole_thread()`; small image
+   `prebuilt/sysimg/root-gl-wifi.apfs` = root-gl's tree + fw/{amss20.bin, bd_k9gl.elf, m3.bin, network}, local only,
+   network is the user's) with `wifi_mac=` -- the radio up 14.9 s after the kernel began on it, the FRITZ!Box
+   joined at 17.0 s, iOS shows Wi-Fi, **Safari loads pages** (user). What it took after the scan: renoir's radio
+   memory cached and shown to the radio cacheable (`RADIO_PTE_CACHED`, PCIe 0 is dma-coherent; no uncached second
+   mapping), the firmware's 9 MB as pieces of their own (`lx_os_radio_memory_device()`), the pool 64 MB (32 MB of
+   rings) on renoir only, the big mappings (pins, BAR0, RPMh, command DB) outside the kernel's 8 MB io_map room
+   (`IO_MAP_SIZE`: full, iOS's start panicked in io_map for the speaker's pins, three times), and RPMh under
+   `hakios_rsc_lock` (with wifi=1 there was no sound and no vibration; the ADSP's driver uses the same slots).
+   Without adsp/sound, Wi-Fi + vibration work together (14:20).
    **MISSION MODE, 2026-10-29 12:55 (`pcie=11`, `logs/125435-mission.log`):** logging on (3 ms), the configuration
    from ath11k's "wcn6855 hw2.1" tables (9 pipes, 14 services: the same `qca6390` tables as the WCN6750's; no shadow
    registers, which ath11k does send for this chip) taken after 1148 ms, **mode MISSION taken in 17 ms.** No "firmware
