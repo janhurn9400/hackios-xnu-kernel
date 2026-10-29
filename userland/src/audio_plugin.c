@@ -207,11 +207,18 @@ struct device {
 	CFStringRef uid;                /* the name the virtual audio device knows it by */
 	AudioObjectID output, input;    /* its streams; 0 = none */
 	UInt32 output_channels, input_channels;
-	/* its clock, running while anybody does I/O */
 	unsigned running;               /* how many clients have started I/O */
-	UInt64 anchor;                  /* mach_absolute_time() when the first of them did */
-	UInt64 periods;                 /* whole timestamp periods since */
 };
+
+/*
+ * One clock for all four devices, started with the first I/O and never set back, in one clock domain:
+ * the virtual audio device runs the speaker and the actuator together, and with a clock of each that went
+ * back to zero whenever that device's I/O started again (WebKit's audio stream did that to the speaker
+ * when Safari loaded a page) the two drifted apart and iOS played nothing more on either -- no sound, no
+ * haptics (renoir, 2026-10-29). Real hardware has one clock that runs on.
+ */
+#define CLOCK_DOMAIN            0x686b696fu     /* 'hkio' */
+static UInt64 clock_anchor;             /* mach_absolute_time() when the first I/O began */
 
 static struct device devices[] = {
 	{ .object = OBJECT_SPEAKER, .uid = CFSTR("Speaker"), .output = OBJECT_SPEAKER_OUTPUT, .input = OBJECT_SPEAKER_INPUT,
@@ -543,6 +550,8 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			WORD(d->object);
 			break;
 		case kAudioDevicePropertyClockDomain:
+			WORD(CLOCK_DOMAIN);
+			break;
 		case kAudioDevicePropertyLatency:
 		case kAudioDevicePropertySafetyOffset:
 		case kAudioDevicePropertyIsHidden:
@@ -888,9 +897,10 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 		return kAudioHardwareBadObjectError;
 	}
 	pthread_mutex_lock(&lock);
+	if (clock_anchor == 0) {
+		clock_anchor = mach_absolute_time();
+	}
 	if (d->running++ == 0) {
-		d->anchor = mach_absolute_time();
-		d->periods = 0;
 		if (d->output != 0) {
 			written = refused = 0;
 			say("hakios: audio: playing\n");
@@ -930,18 +940,19 @@ get_zero_time_stamp(__unused AudioServerPlugInDriverRef driver, AudioObjectID ob
     Float64 *sample_time, UInt64 *host_time, UInt64 *seed)
 {
 	Float64 ticks_per_period = ticks_per_frame * TIMESTAMP_PERIOD;
-	UInt64 now = mach_absolute_time();
+	UInt64 now = mach_absolute_time(), periods;
 	struct device *d = device_of(object);
 
 	if (d == NULL) {
 		return kAudioHardwareBadObjectError;
 	}
 	pthread_mutex_lock(&lock);
-	while (now >= d->anchor + (UInt64)((Float64)(d->periods + 1) * ticks_per_period)) {
-		d->periods++;
+	if (clock_anchor == 0) {
+		clock_anchor = now;
 	}
-	*sample_time = (Float64)d->periods * TIMESTAMP_PERIOD;
-	*host_time = d->anchor + (UInt64)((Float64)d->periods * ticks_per_period);
+	periods = (UInt64)((Float64)(now - clock_anchor) / ticks_per_period);
+	*sample_time = (Float64)periods * TIMESTAMP_PERIOD;
+	*host_time = clock_anchor + (UInt64)((Float64)periods * ticks_per_period);
 	*seed = 1;
 	pthread_mutex_unlock(&lock);
 	return 0;
