@@ -4963,6 +4963,13 @@ renoir_mhi_pump(__unused void *parameter, __unused wait_result_t result)
 
 	link_thread_is = current_thread();
 	while (mhi_pumping) {
+		if (rd(mhi_regs + MHI_STATUS) == 0xffffffffu) {
+			/* the chip answers no more (reset, link down): nothing of it may be written from here on */
+			printf("wifi: mhi: THE CHIP READS ALL ONES: the link is gone; MHI is given up\n");
+			mhi_pumping = false;
+			mhi_regs = 0;
+			break;
+		}
 		while (mhi_event(1, e)) {
 			unsigned type = (e[3] >> 16) & 0xff, channel = e[3] >> 24;
 
@@ -5542,6 +5549,9 @@ renoir_pcie_link(unsigned level)
 	    rd(conf + 4), rd(conf + 8), rd(conf + 0x10));
 	if (level >= 6 && rd(conf) == 0x110317cb) {
 		renoir_bar(dbi, iatu, conf);
+	}
+	if (renoir_kept) {
+		return;                                 /* (left running for ath11k: PERST# stays released) */
 	}
 	renoir_pin(94, 0, 1, 2, 0);
 	sleep_ms(1);
