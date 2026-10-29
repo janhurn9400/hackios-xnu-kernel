@@ -4727,7 +4727,7 @@ renoir_bhi_prepare(void)
 	 * with mask 1 (both of PCIe 0's) was not taken: the hypervisor left the match register as it was.
 	 */
 	need(&apps_smmu);
-	for (uint32_t n = 0; n < (rd(apps_smmu.base + SMMU_IDR0) & 0xff); n++) {
+	for (uint32_t n = 0; n < (rd(apps_smmu.base + SMMU_IDR0) & 0xff) && !radio_space.on; n++) {
 		uint32_t smr = rd(apps_smmu.base + SMMU_SMR(n));
 
 		if (smr >> 31 && (((smr & 0x7fff) ^ 0x2400) & ~((smr >> 16 & 0x7fff) | 1)) == 0) {
@@ -5603,6 +5603,16 @@ hakios_wifi_init(void)
 		if (PE_parse_boot_argn("wifi_lx", &back, sizeof(back)) && back) {
 			/* ath11k on renoir's bus (wifi/lx/src/lx_bus.c: lx_os_renoir_*), as wifi_step=N's step 15 on redwood */
 			hakios_reboot_reason_set();
+			/*
+			 * Before the driver: its QMI goes to QRTR (over MHI once the radio is up; until then ports and
+			 * lookups only), and the SMMU shows the radio what it is given from the start -- the driver's
+			 * pool of 56 MB is taken before the radio is powered (lx_prepare()).
+			 */
+			hakios_qmi_set_transport(&qrtr_ops);
+			radio_stream = 0x2400;
+			radio_stream_mask = 0;
+			radio_space.wanted = 2;
+			pause_ms = 0;
 			printf("wifi: renoir: ath11k's start returns %d\n", hakios_lx_start());
 			back = 0;
 			if (PE_parse_boot_argn("wifi_return", &back, sizeof(back)) && back) {
