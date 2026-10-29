@@ -104,12 +104,19 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    0x201, no SMMU fault. The channel contexts' read field holds (type, event ring) -- the chip's own use.
    **Android for comparison** (`fw-collect-renoir/dmesg-full.txt` 14.29-15.13 s): WLAN_EN, link (Gen 2 x1
    there, Gen 3 x1 here), MHI INIT/POWER_ON, amss20.bin, "MISSION_MODE" at 15.075, "Disable ADSP power
-   collapse", **WLFW server (node 7 port 1) at 15.13: 55 ms after mission mode.** Ideas left: what the chip wants in the channel
+   collapse", **WLFW server (node 7 port 1) at 15.13: 55 ms after mission mode.**
+   **SOLVED 01:30 (`logs/013003-m0sbl.log`): MHI has to be started in the SBL, before BHIe** (as Linux's
+   MHI does: READY -> M0 in the SBL, then the full image). Then in AMSS: EE event 2, channels 20/21
+   started, our hello taken (transfer event on 20), and on 21 **the chip's QRTR HELLO from node 7**, then
+   **NEW_SERVER: service 0x45 (WLFW), version 1 instance 1, node 7, port 1** -- what Android logs. Default
+   now (`pcie_m0sbl=0` for the old order). The MSI page got vector 2 (event ring 1) too.
+   Ideas that had been left: what the chip wants in the channel
    context before START (Linux's MHI init for "enabled" channels; pollcfg; the read pointer it overwrote),
    the doorbell value's form, whether channel 20 is IPCR on this firmware (ath11k's QCA6390 table: 20/21),
    MSI being needed for the data path (no interrupts are set up: the chip may wait for MSI enable in its
    configuration space before it moves data).
-   Originally planned as: the context arrays (channels, event rings, command ring) in shown memory, their
+   **Next: QMI with WLFW over this** (`hakios.wlfw.c` speaks it for redwood over GLINK/QRTR: give it an
+   MHI transport, `hakios_qmi_set_transport()`), then ath11k_pci. Originally planned as: the context arrays (channels, event rings, command ring) in shown memory, their
    addresses in MHI's registers (CCABAP 0x58, ECABAP 0x60, CRCBAP 0x68, CRDB, and the data/control limits),
    MHICTRL to M0, then the channels IPCR 20/21 for QRTR -- polling event rings at first (no MSI). Then: Linux's MHI core is GPL-2.0, so it cannot be taken; ath11k's own `pci.c`/`mhi.c`
    are BSD-3-Clause-Clear and can. Needed: BHI/BHIe image download (`amss20.bin`), the MHI state machine

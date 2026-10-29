@@ -5161,9 +5161,13 @@ renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
 		sleep_ms(100);
 	}
 	{
-		uint32_t m0sbl = 0;
+		uint32_t m0sbl = 1;
 
-		/* pcie_m0sbl=1: MHI started (contexts, M0) in the SBL, before BHIe, as Linux does it */
+		/*
+		 * MHI started (contexts, M0) in the SBL, before BHIe, as Linux does it. Started only in AMSS
+		 * (pcie_m0sbl=0) the LOOPBACK channels worked but IPCR never did; started here, the WLAN firmware
+		 * says hello on IPCR and announces WLFW (service 0x45) at node 7 port 1 (2026-10-29 01:30).
+		 */
 		PE_parse_boot_argn("pcie_m0sbl", &m0sbl, sizeof(m0sbl));
 		if (renoir_level >= 9 && ee == 1 && m0sbl) {
 			renoir_mhi(mhi, true, false);
