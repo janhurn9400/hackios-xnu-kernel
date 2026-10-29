@@ -41,6 +41,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.lx.h>
 #include <sys/hakios.qmi.h>
 #include <sys/systm.h>
 
@@ -167,6 +168,17 @@ wlfw_request_mem(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr 
 	wlfw_memory_request = true;
 }
 
+static volatile bool wlfw_memory_ready;
+
+static void
+wlfw_mem_ready(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq, __unused struct qmi_txn *txn,
+    __unused const void *decoded)
+{
+	uint64_t when;
+
+	wlfw_indication(&wlfw_memory_ready, &when, "the memory is ready", QMI_WLFW_FW_MEM_READY_IND_V01);
+}
+
 static const struct qmi_ops wlfw_ops = { .new_server = wlfw_new_server, .del_server = wlfw_del_server };
 /* (qmi.c's own table has two more, for memory the firmware asks for: this chip's does not) */
 static const struct qmi_msg_handler wlfw_handlers[] = {
@@ -178,6 +190,8 @@ static const struct qmi_msg_handler wlfw_handlers[] = {
 	  sizeof(struct qmi_wlfw_fw_init_done_ind_msg_v01), wlfw_init_done },
 	{ QMI_INDICATION, QMI_WLFW_REQUEST_MEM_IND_V01, qmi_wlanfw_request_mem_ind_msg_v01_ei,
 	  sizeof(struct qmi_wlanfw_request_mem_ind_msg_v01), wlfw_request_mem },
+	{ QMI_INDICATION, QMI_WLFW_FW_MEM_READY_IND_V01, qmi_wlanfw_mem_ready_ind_msg_v01_ei,
+	  sizeof(struct qmi_wlanfw_fw_mem_ready_ind_msg_v01), wlfw_mem_ready },
 	{ 0 },
 };
 
@@ -467,13 +481,99 @@ hakios_wlfw_renoir(uint32_t step)
 	}
 	if (!wait_for(&wlfw_memory_request, 3000)) {
 		say("wifi: %u: the firmware has not asked for memory within 3 s\n", step);
+		goto out;
+	}
+
+	/*
+	 * ath11k_qmi_respond_fw_mem_request(): each piece in one physical piece of ours, shown to the chip through
+	 * the SMMU (lx_os_radio_memory(), as ath11k's own memory is), its address as the chip sees it.
+	 */
+	{
+		static struct qmi_wlanfw_respond_mem_req_msg_v01 memory;
+		struct qmi_wlanfw_respond_mem_resp_msg_v01 memory_reply;
+
+		bzero(&memory, sizeof(memory));
+		bzero(&memory_reply, sizeof(memory_reply));
+		memory.mem_seg_len = wlfw_memory_asked.mem_seg_len;
+		for (uint32_t i = 0; i < memory.mem_seg_len && i < ATH11K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01; i++) {
+			unsigned long long seen = 0;
+
+			if (lx_os_radio_memory(wlfw_memory_asked.mem_seg[i].size, &seen) == NULL) {
+				say("wifi: %u: no %#x bytes in one piece for the firmware's piece %u\n", step,
+				    wlfw_memory_asked.mem_seg[i].size, i);
+				goto out;
+			}
+			memory.mem_seg[i].addr = seen;
+			memory.mem_seg[i].size = wlfw_memory_asked.mem_seg[i].size;
+			memory.mem_seg[i].type = wlfw_memory_asked.mem_seg[i].type;
+			say("wifi: %u:   piece %u (%#x bytes, type %u) at %#llx for the chip\n", step, i, memory.mem_seg[i].size,
+			    memory.mem_seg[i].type, seen);
+		}
+		if (!ask("the firmware's memory", QMI_WLANFW_RESPOND_MEM_REQ_V01, QMI_WLANFW_RESPOND_MEM_REQ_MSG_V01_MAX_LEN,
+		    qmi_wlanfw_respond_mem_req_msg_v01_ei, &memory, qmi_wlanfw_respond_mem_resp_msg_v01_ei, &memory_reply, false)) {
+			goto out;
+		}
+	}
+	if (!wait_for(&wlfw_memory_ready, 3000)) {
+		say("wifi: %u: NO \"MEMORY READY\" within 3 s\n", step);
+		goto out;
+	}
+
+	/* ath11k_qmi_request_target_cap() */
+	{
+		struct qmi_wlanfw_cap_req_msg_v01 what = { 0 };
+		static struct qmi_wlanfw_cap_resp_msg_v01 target;
+
+		bzero(&target, sizeof(target));
+		if (!ask("what the firmware and the chip are", QMI_WLANFW_CAP_REQ_V01, QMI_WLANFW_CAP_REQ_MSG_V01_MAX_LEN,
+		    qmi_wlanfw_cap_req_msg_v01_ei, &what, qmi_wlanfw_cap_resp_msg_v01_ei, &target, false)) {
+			goto out;
+		}
+		say("wifi: %u:   chip id %#x, family %#x; board id %#x (%s); soc id %#x; firmware %#x built \"%s\"\n", step,
+		    target.chip_info.chip_id, target.chip_info.chip_family, target.board_info.board_id,
+		    target.board_info_valid ? "given" : "not given", target.soc_info.soc_id, target.fw_version_info.fw_version,
+		    target.fw_version_info.fw_build_timestamp);
+		say("wifi: %u:   build \"%s\"\n", step, target.fw_build_id);
+	}
+
+	/* the board's data as Android sends it (bd_k9gl.elf, type 1: ELF), then the M3 image's place */
+	if (!send_file("the board's data", "bd_k9gl.elf", ATH11K_QMI_BDF_TYPE_ELF, 0xff)) {
+		goto out;
+	}
+	{
+		uint64_t size = 0;
+		const uint8_t *m3 = hakios_wifi_file("m3.bin", &size);
+		unsigned long long seen = 0;
+		volatile uint8_t *copy = m3 == NULL ? NULL : lx_os_radio_memory(size, &seen);
+		struct qmi_wlanfw_m3_info_req_msg_v01 m3_info = { 0 };
+		struct qmi_wlanfw_m3_info_resp_msg_v01 m3_reply;
+
+		if (copy == NULL) {
+			say("wifi: %u: no m3.bin in the small image, or no memory for it\n", step);
+			goto out;
+		}
+		for (uint64_t b = 0; b < size; b++) {
+			copy[b] = m3[b];
+		}
+		m3_info.addr = seen;
+		m3_info.size = (uint32_t)size;
+		bzero(&m3_reply, sizeof(m3_reply));
+		say("wifi: %u: m3.bin, %llu bytes, at %#llx for the chip\n", step, size, seen);
+		if (!ask("where the M3 image is", QMI_WLANFW_M3_INFO_REQ_V01, QMI_WLANFW_M3_INFO_REQ_MSG_V01_MAX_MSG_LEN,
+		    qmi_wlanfw_m3_info_req_msg_v01_ei, &m3_info, qmi_wlanfw_m3_info_resp_msg_v01_ei, &m3_reply, false)) {
+			goto out;
+		}
+	}
+	if (!wait_for(&wlfw.init_done, 5000)) {
+		say("wifi: %u: NO \"FIRMWARE INIT DONE\" within 5 s of the M3 image\n", step);
 	}
 out:
-	say("wifi: %u: renoir's exchange ends %llu ms after it began: the service %s, memory %s\n", step, now_ms() - wlfw.began,
-	    wlfw.server ? "FOUND" : "not found", wlfw_memory_request ? "ASKED FOR" : "not asked for");
+	say("wifi: %u: renoir's exchange ends %llu ms after it began: the service %s, memory %s%s, \"init done\" %s\n", step,
+	    now_ms() - wlfw.began, wlfw.server ? "FOUND" : "not found", wlfw_memory_request ? "ASKED FOR" : "not asked for",
+	    wlfw_memory_ready ? " AND READY" : "", wlfw.init_done ? "YES" : "no");
 	qmi_handle_release(&handle);
 	handle_open = false;
-	return wlfw_memory_request;
+	return wlfw.init_done;
 }
 
 bool

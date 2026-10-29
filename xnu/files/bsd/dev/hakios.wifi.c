@@ -5154,7 +5154,7 @@ channels:
 		hakios_qmi_set_transport(&qrtr_ops);
 		printf("wifi: pcie: 10: QRTR over MHI: our hello %s\n", qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, 0xffffffffu,
 		    QRTR_CONTROL, &hello, sizeof(hello)) == 0 ? "TAKEN" : "NOT TAKEN");
-		printf("wifi: pcie: 10: the WLFW exchange %s\n", hakios_wlfw_renoir(10) ? "GOT AS FAR AS THE MEMORY REQUEST" :
+		printf("wifi: pcie: 10: the WLFW exchange %s\n", hakios_wlfw_renoir(10) ? "REACHED \"FIRMWARE INIT DONE\"" :
 		    "STOPPED EARLY");
 		mhi_pumping = false;
 		sleep_ms(20);
