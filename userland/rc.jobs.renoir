@@ -1,0 +1,12 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist) on renoir with Wi-Fi
+# (RC_JOBS=rc.jobs.renoir, with a JB image and ssh/ keys; kernel boot-args wifi=1): rc.jobs' checks, without
+# its 240 s of processor load, and a way in over the network to ask the running iOS questions -- OpenSSH from
+# the package manager's prefix, as rc.jobs.ssh starts it, for the root key in ssh/authorized_keys.
+# First use: mediaserverd's own log while Safari silences the haptics (`log stream --process mediaserverd`,
+# devices/renoir/SOUND.md).
+/redwood/bin/hello_dyn started by launchd
+/redwood/bin/svc_test
+/redwood/bin/mg_test
+/redwood/bin/cpu_test
+/var/jb/usr/sbin/sshd -D -e -h /var/root/.ssh/ssh_host_ed25519_key -o UsePAM=no -o PasswordAuthentication=no -o PermitRootLogin=prohibit-password -o AuthorizedKeysFile=/var/root/.ssh/authorized_keys &
+/redwood/bin/net_test show
