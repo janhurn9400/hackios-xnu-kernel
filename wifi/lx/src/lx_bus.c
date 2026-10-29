@@ -641,6 +641,139 @@ static const struct ath11k_hif_ops bus_ops_irq = {
 	.get_ce_msi_idx = bus_get_ce_msi_idx,
 };
 
+/* ---- renoir: the QCA6490 behind PCIe ------------------------------------------------------------------ */
+
+/*
+ * renoir's radio (board=renoir) is a QCA6490 -- ath11k's "wcn6855 hw2.1", PCI 17cb:1103 -- on the first
+ * PCIe controller. The kernel brings it up (bsd/dev/hakios.wifi.c, pcie=10): power, the link, the firmware
+ * through BHI/BHIe, MHI in M0, QRTR over the IPCR channels; ath11k's qmi.c then has its exchange over that,
+ * as on redwood over GLINK. Its registers are BAR0: the first 512K as they are, the rest through a window of
+ * 512K at 512K that a register of the first part (0x310c) moves, as pcic.c does it for this chip (no static
+ * window map). The rest of the bus -- the copy engines looked at by a thread, the services' pipes -- is
+ * redwood's above.
+ */
+#define RENOIR_WINDOW_START	0x80000u
+#define RENOIR_WINDOW_REG	0x310cu
+#define RENOIR_WINDOW_ENABLE	0x40000000u
+
+static struct {
+	u8 *bar;
+	u32 window;				/* the one the register says, ~0: not known */
+} renoir;
+
+static u32
+renoir_access(struct ath11k_base *ab, u32 offset, bool write, u32 value)
+{
+	u32 got = 0;
+
+	lx_os_lock();
+	if (offset < RENOIR_WINDOW_START) {
+		if (write) {
+			iowrite32(value, renoir.bar + offset);
+		} else {
+			got = ioread32(renoir.bar + offset);
+		}
+	} else {
+		u32 window = (offset >> 19) & 0x3f;
+
+		if (window != renoir.window) {
+			iowrite32(RENOIR_WINDOW_ENABLE | window, renoir.bar + RENOIR_WINDOW_REG);
+			(void)ioread32(renoir.bar + RENOIR_WINDOW_REG);	/* (the window has moved before the access) */
+			renoir.window = window;
+		}
+		if (write) {
+			iowrite32(value, renoir.bar + RENOIR_WINDOW_START + (offset & (RENOIR_WINDOW_START - 1)));
+		} else {
+			got = ioread32(renoir.bar + RENOIR_WINDOW_START + (offset & (RENOIR_WINDOW_START - 1)));
+		}
+	}
+	lx_os_unlock();
+	return (got);
+}
+
+static bool
+renoir_refused(u32 offset)
+{
+	if (renoir.bar != NULL && bus.mission && !bus.closed && offset < 0x4000000u) {
+		return (false);
+	}
+	if (bus.refused++ < 8) {
+		lx_tell("lx: renoir: the chip's %#x is reached %s: NOT DONE\n", offset, renoir.bar == NULL ? "before the bus is up" :
+		    bus.closed ? "after the bus was stopped" : !bus.mission ? "while the firmware is not in mission mode" :
+		    "beyond its registers");
+	}
+	return (true);
+}
+
+static u32
+renoir_read32(struct ath11k_base *ab, u32 offset)
+{
+	u32 value;
+
+	if (renoir_refused(offset)) {
+		return (0);
+	}
+	bus.reads++;
+	value = renoir_access(ab, offset, false, 0);
+	if (bus.said < SAID_FIRST) {
+		say_repeats();
+		bus.last = ~0u;
+		bus.said++;
+		printf("lx: the chip's %#x reads %#x\n", offset, value);
+	}
+	return (value);
+}
+
+static void
+renoir_write32(struct ath11k_base *ab, u32 offset, u32 value)
+{
+	if (renoir_refused(offset)) {
+		return;
+	}
+	bus.writes++;
+	if (said_write(offset, value)) {
+		bus.said++;
+		printf("lx: about to write the chip's %#x: %#x\n", offset, value);
+	}
+	__asm __volatile("dsb sy");		/* (what was written to a ring is in memory before the radio is told of it) */
+	renoir_access(ab, offset, true, value);
+}
+
+static int
+renoir_power_up(struct ath11k_base *ab)
+{
+	void *bar = NULL;
+	int error = lx_os_renoir_up(&bar);
+
+	if (error == 0) {
+		renoir.bar = bar;
+		renoir.window = ~0u;
+		ab->mem = bar;
+		ab->mem_len = 0x100000;
+		lx_tell("lx: renoir: the radio is up to QRTR over MHI; its registers (BAR0) at %p\n", bar);
+	}
+	return (-error);
+}
+
+static void
+renoir_power_down(struct ath11k_base *ab, bool is_suspend)
+{
+	renoir.bar = NULL;
+	lx_os_renoir_down();
+}
+
+static const struct ath11k_hif_ops renoir_ops = {
+	.read32 = renoir_read32,
+	.write32 = renoir_write32,
+	.irq_enable = bus_irq_enable,
+	.irq_disable = bus_irq_disable,
+	.start = bus_start,
+	.stop = bus_stop,
+	.map_service_to_pipe = bus_map_service_to_pipe,
+	.power_up = renoir_power_up,
+	.power_down = renoir_power_down,
+};
+
 /* ---- the device tree, of which there is none ------------------------------------------------------ */
 
 int
@@ -746,6 +879,17 @@ lx_start(void)
 	device.of_node = &node;
 	device.kobj.name = "wifi";
 
+	if (lx_os_renoir()) {
+		/* renoir's QCA6490 on PCIe (see above): pci.c's probe, as far as the kernel has not done it already */
+		ab = ath11k_core_alloc(&device, 0, ATH11K_BUS_PCI);
+		if (ab == NULL) {
+			return (ENOMEM);
+		}
+		ab->hif.ops = &renoir_ops;
+		bus.irq = false;
+		ab->hw_rev = ATH11K_HW_WCN6855_HW21;
+		goto set_up;
+	}
 	/* ahb.c: ath11k_ahb_probe(), for this chip */
 	ab = ath11k_core_alloc(&device, 0, ATH11K_BUS_AHB);
 	if (ab == NULL) {
@@ -772,6 +916,7 @@ lx_start(void)
 		}
 	}
 	ab->hw_rev = ATH11K_HW_WCN6750_HW10;
+set_up:
 	ab->fw_mode = ATH11K_FIRMWARE_MODE_NORMAL;
 	if ((ret = ath11k_core_pre_init(ab)) != 0 || (ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {
 		lx_tell("lx: the driver does not get as far as its exchange with the firmware: %d\n", ret);

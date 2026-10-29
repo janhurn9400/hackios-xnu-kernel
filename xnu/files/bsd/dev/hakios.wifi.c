@@ -4001,15 +4001,29 @@ const uint8_t *
 hakios_wifi_driver_file(const char *name, uint64_t *size)
 {
 	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	/* renoir: its own board file (Android sends it, from firmware_mnt), the M3 image; no regulatory database (Android has none) */
+	static const char *const renoir_files[][2] = { { "board.bin", "bd_k9gl.elf" }, { "m3.bin", "m3.bin" } };
 	const char *last = strrchr(name, '/');
+	bool renoir = hakios_wifi_is_renoir();
+	unsigned count = renoir ? sizeof(renoir_files) / sizeof(renoir_files[0]) : sizeof(files) / sizeof(files[0]);
 
 	last = last == NULL ? name : last + 1;
-	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
-		if (strcmp(last, files[i][0]) == 0) {
-			return image_file(files[i][1], size);
+	for (unsigned i = 0; i < count; i++) {
+		const char *const *pair = renoir ? renoir_files[i] : files[i];
+
+		if (strcmp(last, pair[0]) == 0) {
+			return image_file(pair[1], size);
 		}
 	}
 	return NULL;
+}
+
+bool
+hakios_wifi_is_renoir(void)
+{
+	char board[16] = "";
+
+	return PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0;
 }
 
 /*
@@ -4408,6 +4422,9 @@ static const struct {
 static vm_offset_t renoir_rsc, renoir_tlmm, renoir_gcc_vote, renoir_gcc_pcie, renoir_gcc_phy;
 static uint32_t renoir_pause = 2200;
 static unsigned renoir_level;
+/* hakios_wifi_renoir_up() (ath11k's bus on renoir): bring everything up to QRTR over MHI and leave it so */
+static bool renoir_keep, renoir_kept;
+static vm_offset_t renoir_bar_va;            /* the QCA6490's BAR0, its first megabyte (ath11k's windows) */
 static vm_offset_t renoir_dbi;            /* the root port's registers, once mapped (pcie=5 on) */
 static vm_offset_t renoir_conf;           /* the QCA6490's configuration space (pcie=5 on) */
 
@@ -5161,6 +5178,10 @@ channels:
 		hakios_qmi_set_transport(&qrtr_ops);
 		printf("wifi: pcie: 10: QRTR over MHI: our hello %s\n", qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, 0xffffffffu,
 		    QRTR_CONTROL, &hello, sizeof(hello)) == 0 ? "TAKEN" : "NOT TAKEN");
+		if (renoir_keep) {
+			renoir_kept = true;             /* (ath11k's qmi.c has the exchange: everything stays up) */
+			return;
+		}
 		printf("wifi: pcie: 10: the WLFW exchange %s\n", hakios_wlfw_renoir(10) ? "REACHED \"FIRMWARE INIT DONE\"" :
 		    "STOPPED EARLY");
 		mhi_pumping = false;
@@ -5353,7 +5374,8 @@ renoir_bar(vm_offset_t dbi, vm_offset_t iatu, vm_offset_t conf)
 	printf("wifi: pcie: BAR0 at %#x; the radio's command %#x, root port window %#x\n", rd(conf + 0x10), rd(conf + 4),
 	    rd(dbi + 0x20));
 	renoir_say("6: MHI's registers read at BAR0");
-	mhi = ml_io_map(base, 0x80000);                 /* (the first 512 KB: MHI's registers, PCIE_SOC_WAKE at 0x3004) */
+	/* (the first megabyte: MHI's registers, PCIE_SOC_WAKE at 0x3004, and ath11k's window at 512 KB) */
+	renoir_bar_va = mhi = ml_io_map(base, 0x100000);
 	printf("wifi: pcie: MHI: length %#x, version %#x, config %#x, channel doorbells at %#x, event doorbells at %#x\n",
 	    rd(mhi + 0x00), rd(mhi + 0x08), rd(mhi + 0x10), rd(mhi + 0x18), rd(mhi + 0x20));
 	printf("wifi: pcie: MHI: BHI at %#x, BHIe at %#x, control %#x, status %#x (state %u%s), error %#x\n", rd(mhi + 0x28),
@@ -5368,7 +5390,9 @@ renoir_bar(vm_offset_t dbi, vm_offset_t iatu, vm_offset_t conf)
 	if (renoir_level >= 7 && bhi != 0 && bhi < 0xf00) {
 		renoir_bhi(mhi, mhi + bhi);
 	}
-	wr(conf + 4, rd(conf + 4) & ~0x6u);
+	if (!renoir_kept) {
+		wr(conf + 4, rd(conf + 4) & ~0x6u);
+	}
 }
 
 static void
@@ -5522,7 +5546,45 @@ renoir_pcie_link(unsigned level)
 	renoir_pin(94, 0, 1, 2, 0);
 	sleep_ms(1);
 down:
+	if (renoir_kept) {
+		return;                                 /* (hakios_wifi_renoir_down() takes it down) */
+	}
 	renoir_pcie_down(reached);
+}
+
+/*
+ * For ath11k's bus on renoir (wifi/lx, hakios.lx.c): the radio powered, its firmware loaded and running,
+ * MHI in M0 and QRTR over its IPCR channels for ath11k's qmi.c -- everything of pcie=10 but the exchange,
+ * which ath11k's qmi.c has itself -- and left so; the first megabyte of BAR0 for its registers. 0, or an errno.
+ */
+int
+hakios_wifi_renoir_up(vm_offset_t *bar)
+{
+	if (!renoir_kept) {
+		renoir_keep = true;
+		renoir_pcie_link(10);
+	}
+	if (!renoir_kept || renoir_bar_va == 0) {
+		printf("wifi: renoir: the radio did not come up for ath11k\n");
+		return EIO;
+	}
+	*bar = renoir_bar_va;
+	return 0;
+}
+
+/* ... and taken down again: QRTR stopped, the PCIe link, the radio's power */
+void
+hakios_wifi_renoir_down(void)
+{
+	if (!renoir_kept) {
+		return;
+	}
+	mhi_pumping = false;
+	sleep_ms(20);
+	qrtr_over_mhi = false;
+	renoir_kept = false;
+	renoir_keep = false;
+	renoir_pcie_down(10);
 }
 
 /*
@@ -5538,6 +5600,17 @@ hakios_wifi_init(void)
 	char board[16] = "";
 
 	if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
+		if (PE_parse_boot_argn("wifi_lx", &back, sizeof(back)) && back) {
+			/* ath11k on renoir's bus (wifi/lx/src/lx_bus.c: lx_os_renoir_*), as wifi_step=N's step 15 on redwood */
+			hakios_reboot_reason_set();
+			printf("wifi: renoir: ath11k's start returns %d\n", hakios_lx_start());
+			back = 0;
+			if (PE_parse_boot_argn("wifi_return", &back, sizeof(back)) && back) {
+				printf("wifi: back to the loader (wifi_return)\n");
+				loader_return();
+			}
+			return;
+		}
 		if (PE_parse_boot_argn("pcie", &on, sizeof(on)) && on) {
 			if (on >= 3) {
 				hakios_reboot_reason_set();     /* a hang or reset of these tests lands in fastboot (hakios.torch.c) */

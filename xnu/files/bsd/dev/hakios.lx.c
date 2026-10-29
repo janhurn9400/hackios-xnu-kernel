@@ -226,6 +226,28 @@ lx_os_firmware(const char *name, const void **data, unsigned long *size)
 }
 
 int
+lx_os_renoir(void)
+{
+	return hakios_wifi_is_renoir() ? 1 : 0;
+}
+
+int
+lx_os_renoir_up(void **bar)
+{
+	vm_offset_t mapped = 0;
+	int error = hakios_wifi_renoir_up(&mapped);
+
+	*bar = (void *)mapped;
+	return error;
+}
+
+void
+lx_os_renoir_down(void)
+{
+	hakios_wifi_renoir_down();
+}
+
+int
 lx_os_rproc_boot(void)
 {
 	return hakios_wifi_dsp_is_up() ? 0 : ENXIO;
