@@ -130,7 +130,12 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    given, soc id 0x400c0200, firmware 0x110a004f "2021-05-20 10:30", build WLAN.HSP.1.1.c2-00079-...402775.4
    (Android's exactly); **`bd_k9gl.elf` (from the phone's firmware_mnt, in the small image) accepted in 10 pieces**;
    `m3.bin` (266684 bytes) shown at 0xa1398000 and its place sent; **"firmware init done" 4.8 s after the start.**
-   Next: the configuration and mode MISSION (ath11k_qmi_firmware_start: wlan_cfg with the copy engine and
+   **MISSION MODE, 2026-10-29 12:55 (`pcie=11`, `logs/125435-mission.log`):** logging on (3 ms), the configuration
+   from ath11k's "wcn6855 hw2.1" tables (9 pipes, 14 services: the same `qca6390` tables as the WCN6750's; no shadow
+   registers, which ath11k does send for this chip) taken after 1148 ms, **mode MISSION taken in 17 ms.** No "firmware
+   ready" indication after it in 3 s -- Android shows none there either (cnss calls "init done" FW_READY); it gets a
+   "pin connect result" 20 ms after the mode. (`tools/mk-wlfw.sh` now emits `WLFW_HSP_*` for this chip.)
+   Was next before: the configuration and mode MISSION (ath11k_qmi_firmware_start: wlan_cfg with the copy engine and
    service tables for the QCA6390 family, mode 0), Android's "Setup S3E TCS Addr: 42204 Data: 1" before M3 (the
    power amplifier's supply through the `tcs_cmd` region: dt `qcom,tcs_offset_int_pow_amp_vreg` 0x4b0), then
    ath11k_pci. Done before that: **give the firmware its memory** (two pieces in one physical piece each, shown through the SMMU,
