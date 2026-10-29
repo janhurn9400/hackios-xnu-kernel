@@ -21,8 +21,14 @@ Read `FLASH.md` first (partition `darwin`, the images, the boot command). Everyt
 - Frame rate: the framebuffer's beat is a 60 Hz timer; idle reports show 28-65 ms between frames; not measured
   while scrolling yet. 90 Hz needs the panel switched (DSI), not just `fb_hz=90`.
 
-Next: sound from the flash (`adsp=1 sound=4`, SSH instead of USB), `var_store=1 ufs_write=1` so iOS keeps its
-data, the touch driver's 26 % bad reads, frame times while scrolling, upstream's Metal plug-in.
+Later the same evening (22:00-22:55): **sound works from the flash**; **iOS keeps its data** (`var_store`, loader
+takes renoir's darwin GUID, `var_store_secs=300`); **frame rate while scrolling 44-49 fps** (most frames on the 60 Hz
+beat, some late); **torch** works, but with the DSP up the battery was at 46 C (charging at 100 %) and the torch's
+45 C guard kept it off. The full everyday run is in `FLASH.md`.
+
+Next: thermal management (charging current, CPU/GPU clocks by temperature), the camera (renoir's own sensors:
+pull `/vendor/lib64/camera/com.qti.sensormodule.*.bin` from MagicOS; the DT has four sensors on CSIPHY 1/5/0/3,
+PM8008i/j), the touch driver's 26 % bad reads, upstream's Metal plug-in.
 
 
 ## Session 5 (2026-10-28, ~22:30-23:05): ringtones, the endless vibration, Wi-Fi started

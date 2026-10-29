@@ -1813,6 +1813,9 @@ ufs_survey(void)
 #define BLOCK_DARWIN_LAST  30617594ULL
 #define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
 #define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
+/* renoir's darwin, cut the same way at the same LBAs on the same size of flash, has a GUID of its own
+ * (devices/renoir/FLASH.md); everything else about it has to be the same */
+#define BLOCK_DARWIN_UNIQ_RENOIR { 0xe101c5e9, 0x5052, 0x4d8a, { 0xb2, 0x46, 0xeb, 0xf4, 0x72, 0x39, 0x78, 0xbb } }
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -2152,7 +2155,7 @@ block_tables(void)
 static int
 block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
-	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ;
+	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ, uniq_renoir = BLOCK_DARWIN_UNIQ_RENOIR;
 	static const char name[] = "darwin";
 	const char *why = NULL;
 
@@ -2163,7 +2166,8 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 	}
 	if (memcmp(&info->type_guid, &type, sizeof(type)) != 0) {
 		why = "its type GUID is not the one it had";
-	} else if (memcmp(&info->unique_guid, &uniq, sizeof(uniq)) != 0) {
+	} else if (memcmp(&info->unique_guid, &uniq, sizeof(uniq)) != 0 &&
+	    memcmp(&info->unique_guid, &uniq_renoir, sizeof(uniq_renoir)) != 0) {
 		why = "its unique GUID is not the one it had";
 	} else if (info->start_lba != BLOCK_DARWIN_FIRST || info->end_lba != BLOCK_DARWIN_LAST) {
 		why = "it does not begin and end where it did";

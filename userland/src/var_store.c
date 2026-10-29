@@ -113,6 +113,40 @@ struct entry {
 #define VAR_SAVE_WANTED 2
 #define VAR_SAVE_DONE   3
 
+/* The value of NAME=VALUE among the kernel's arguments, as a number; 0 if it is not there */
+static long parse_number(const char *text);
+
+static long
+boot_arg_number(const char *name)
+{
+	static char args[1024];
+	size_t len = sizeof(args) - 1, n = strlen(name);
+
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
+		return 0;
+	}
+	args[len < sizeof(args) ? len : sizeof(args) - 1] = 0;
+	for (char *p = args; *p;) {
+		while (*p == ' ') {
+			p++;
+		}
+		if (strncmp(p, name, n) == 0 && p[n] == '=') {
+			char value[24];
+			size_t v = 0;
+
+			for (p += n + 1; *p && *p != ' ' && v < sizeof(value) - 1; p++) {
+				value[v++] = *p;
+			}
+			value[v] = 0;
+			return parse_number(value);
+		}
+		while (*p && *p != ' ') {
+			p++;
+		}
+	}
+	return 0;
+}
+
 /* Is NAME=VALUE among the kernel's arguments? (as init.c reads them) */
 static int
 boot_arg_is(const char *name, const char *value)
@@ -1381,7 +1415,9 @@ main(int argc, char **argv, char **envp)
 			printf("var_store: not asked to keep the data volume (var_store=1): nothing to watch\n");
 			return 0;
 		}
-		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
+		/* the seconds between saves: an argument of the job's, or boot-arg var_store_secs=N (a run whose
+		 * end cannot be asked for -- renoir with its audio DSP up has no USB -- saves as it goes) */
+		return watch(argc > 2 ? (int)parse_number(argv[2]) : (int)boot_arg_number("var_store_secs")) ? 0 : 1;
 	}
 	fd = open(DEVICE, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
 	if (fd < 0) {

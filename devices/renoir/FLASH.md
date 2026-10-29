@@ -78,7 +78,19 @@ loader (`ufs_native` not tried on renoir yet).
 - SSH: `ssh -i ssh/id_ed25519 root@<address>` (the phone's hotspot, Mac in the same network).
 - Sileo: register it after each boot with `/var/jb/bin/sh /var/jb/prep.sh` over SSH (rc.jobs.renoir does not run
   it). Sources: Procursus, Havoc, Chariz.
-- `/private/var` is still in RAM: nothing iOS keeps survives a boot. Next: upstream's `var_store=1 ufs_write=1`
-  (an archive of the data volume in darwin from block 2097152).
+- **iOS keeps its data** (`var_store=1 ufs_write=1`, 2026-10-29 22:45): `/private/var` is packed into darwin from
+  block 2097152 (two 2 GiB slots, written in turn; `userland/src/var_store.c`) when the run ends in order
+  (`fastboot oem stop`, ~8 s, ~160 MB), and unpacked by init at the next boot. Checked by the user: dark mode,
+  a moved icon and the hotspot came back. The loader serves writes only to a darwin it recognises: it had
+  redwood's unique GUID alone; `xnuloader/loader.c` now also takes renoir's (`BLOCK_DARWIN_UNIQ_RENOIR`), the
+  name, type, LBAs, size and unit still checked; image `prebuilt/xnu-usb-renoir-crashlog.img` (22:28; the one
+  before as `.before-renoir-guid`). The log: `ufs: darwin (LBA 25374720..30617594 of unit 0): its blocks from
+  2042368 on may be written this run`.
+- `var_store_secs=N` (new): saves every N seconds as well. Needed with `adsp=1`, where USB is gone and the run
+  cannot be ended in order. The everyday run:
+  `... var_store=1 ufs_write=1 var_store_secs=300 ... haptic=5 torch=3 adsp=1 sound=4 sound_below=144 wifi=1 wifi_file=0 ...`
+- **Torch** (`torch=3`): works (`torch=2` test, and in iOS without the DSP). With `adsp=1` it stays off while the
+  battery is at 45 C or more (the driver's guard): renoir charged at 1.5 A at 100 % and the battery reached 46 C
+  (22:50). Nothing manages heat yet (no thermal throttling of the charger, CPU or GPU): the next thing to do.
 - After `fastboot oem stop` the phone sometimes resets into Xiaomi's fastboot a little later: boot the loader and
   stage the boot volume again before the next run.
