@@ -25,6 +25,7 @@ void	 lx_os_free(void *memory, unsigned long size);
  * reading it slow. NULL when there is none; never given back.
  */
 void	*lx_os_radio_memory(unsigned long size, unsigned long long *address);
+void	*lx_os_radio_memory_device(unsigned long size, unsigned long long *address);	/* the radio's only: not mapped uncached */
 /* renoir (board=renoir): its QCA6490 on PCIe, brought up to QRTR over MHI by the kernel for ath11k's qmi.c */
 int	lx_os_renoir(void);					/* 1 on renoir */
 int	lx_os_renoir_up(void **bar);				/* 0, and the first MB of BAR0; or an errno */

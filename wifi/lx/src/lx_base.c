@@ -755,9 +755,9 @@ iounmap(void *address)
  * or the other way round. The first part of it is handed out for good, a stretch at a time
  * (rings); the rest is slots of one size, taken and given back (buffers).
  */
-#define POOL_SIZE	(64u << 20)
-#define POOL_RINGS	(32u << 20)		/* (the data path's rings and link descriptors come to about 6 MB; renoir's
-						 * QCA6490 asks for 9 MB more for its firmware, in two pieces on 4 MB) */
+#define POOL_SIZE	(44u << 20)
+#define POOL_RINGS	(16u << 20)		/* (the data path's rings and link descriptors come to about 6 MB; renoir's
+						 * QCA6490's 9 MB for its firmware are pieces of their own, see below) */
 #define POOL_SLOT	4096u
 #define POOL_SLOTS	((POOL_SIZE - POOL_RINGS) / POOL_SLOT)
 
@@ -798,6 +798,18 @@ linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle
 	uint32_t at;
 
 	size = roundup2(size, 64);
+	/*
+	 * A megabyte or more, on renoir: the firmware's memory (qmi.c, 0x4e0000 and 0x398000), which only the radio
+	 * touches: a piece of its own, not in the pool and not mapped uncached (lx_os_radio_memory_device()).
+	 */
+	if (size >= (1u << 20) && lx_os_renoir()) {
+		void *memory = lx_os_radio_memory_device(size, dma_handle);
+
+		if (memory == NULL) {
+			printf("lx: no %zu bytes for the radio's own use\n", size);
+		}
+		return (memory);
+	}
 	lx_os_lock();
 	at = pool.rings_used;
 	/* a megabyte or more on 4 MB (renoir's firmware went into SYS_ERR with its pieces elsewhere; dt cnss_wlan_region) */

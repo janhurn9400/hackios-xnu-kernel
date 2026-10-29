@@ -85,6 +85,35 @@ lx_os_radio_memory(unsigned long size, unsigned long long *address)
 	return (void *)uncached;
 }
 
+/*
+ * Memory only the radio uses, the processor never (renoir's firmware asks for 9 MB of it): one physical piece,
+ * written out of the cache once and shown to the radio, but not mapped a second time -- that second, uncached
+ * view takes the kernel's room for device mappings, and 64 MB of them left too little for iOS's own (a
+ * panic in io_map at the system's start, 2026-10-29). The cached address comes back, for the driver's
+ * bookkeeping only.
+ */
+void *
+lx_os_radio_memory_device(unsigned long size, unsigned long long *address)
+{
+	vm_offset_t cached = 0;
+
+	size = round_page(size);
+	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS) {
+		say("lx: no %lu bytes of memory in one piece\n", size);
+		return NULL;
+	}
+	bzero((void *)cached, size);
+	for (vm_offset_t line = cached; line < cached + size; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	if (!hakios_wifi_radio_map(kvtophys(cached), size, address)) {
+		return NULL;
+	}
+	return (void *)cached;
+}
+
 void *
 lx_os_map_registers(unsigned long long physical, unsigned long size)
 {
