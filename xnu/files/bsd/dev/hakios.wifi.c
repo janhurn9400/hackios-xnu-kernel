@@ -4488,9 +4488,26 @@ renoir_rpmh_address(const char *name)
 	return 0;
 }
 
-/* Up to three writes to RPMh through command slot set 0, waited for (hakios.goodix.c's rpmh_write()) */
+/*
+ * Up to three writes to RPMh through command slot set 0, waited for (hakios.goodix.c's rpmh_write()), under the
+ * sequencer's lock: the audio DSP's driver uses the same slots while the system starts, and finding them busy
+ * it gave up on the DSP's rails -- with wifi=1 there was no sound and no vibration (2026-10-29).
+ */
+static bool renoir_rpmh_write_locked(const uint32_t *address, const uint32_t *data, unsigned count);
+
 static bool
 renoir_rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
+{
+	bool done;
+
+	lck_mtx_lock(&hakios_rsc_lock);
+	done = renoir_rpmh_write_locked(address, data, count);
+	lck_mtx_unlock(&hakios_rsc_lock);
+	return done;
+}
+
+static bool
+renoir_rpmh_write_locked(const uint32_t *address, const uint32_t *data, unsigned count)
 {
 	uint32_t irq_enable = rd(R_TCS(0x00));
 	bool done = false;
