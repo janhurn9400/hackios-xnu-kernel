@@ -4884,7 +4884,7 @@ mhi_command(vm_offset_t mhi, unsigned type, unsigned channel)
 }
 
 static void
-renoir_mhi(vm_offset_t mhi)
+renoir_mhi(vm_offset_t mhi, bool init, bool run)
 {
 	vm_offset_t cached = 0;
 	uint64_t physical;
@@ -4893,6 +4893,9 @@ renoir_mhi(vm_offset_t mhi)
 	/* pcie_ch=0: the LOOPBACK pair 0/1 instead of IPCR's 20/21 (what goes out on 0 comes back on 1) */
 	PE_parse_boot_argn("pcie_ch", &out, sizeof(out));
 	PE_parse_boot_argn("pcie_rings", &rings, sizeof(rings));
+	if (!init) {
+		goto channels;
+	}
 
 	printf("wifi: pcie: 9: MHI: status %#x, config %#x (%u channels, %u event rings)\n", rd(mhi + MHI_STATUS), cfg, channels,
 	    (cfg >> 16) & 0xff);
@@ -4983,8 +4986,30 @@ renoir_mhi(vm_offset_t mhi)
 	mhi_event_doorbell(mhi, 0);
 	printf("wifi: pcie: 9: MHI status %#x (state 2 is M0), control %#x, error %#x\n", rd(mhi + MHI_STATUS), rd(mhi + MHI_CTRL),
 	    rd(mhi + 0x50));
-	if (((rd(mhi + MHI_STATUS) >> 8) & 0xff) != 2) {
+	if (((rd(mhi + MHI_STATUS) >> 8) & 0xff) != 2 || !run) {
 		return;
+	}
+channels:
+	if (!init) {
+		/* (MHI was started in the SBL, pcie_m0sbl=1: what the chip has said since, the EE event above all) */
+		for (int ms = 0; ms < 1000; ms++) {
+			while (mhi_event(0, e)) {
+				mhi_say_event("since the SBL", e);
+			}
+			sleep_ms(1);
+		}
+		mhi_event_doorbell(mhi, 0);
+		printf("wifi: pcie: 9: in AMSS: MHI status %#x\n", rd(mhi + MHI_STATUS));
+	}
+	{
+		uint32_t wake = 0;
+
+		/* pcie_socwake=1: ath11k's PCIE_SOC_WAKE (BAR0 + 0x3004) written 1, as before its register accesses */
+		if (PE_parse_boot_argn("pcie_socwake", &wake, sizeof(wake)) && wake) {
+			wr(mhi + 0x3004, 1);
+			sleep_ms(5);
+			printf("wifi: pcie: 9: PCIE_SOC_WAKE written 1: reads %#x\n", rd(mhi + 0x3004));
+		}
 	}
 	/*
 	 * Device wake: the doorbell of channel 127 written 1, as Linux's MHI asserts it before it moves data; the
@@ -5135,8 +5160,17 @@ renoir_bhi(vm_offset_t mhi, vm_offset_t bhi)
 		}
 		sleep_ms(100);
 	}
-	if (renoir_level >= 8 && ee == 1 && renoir_bhie(mhi, mhi + rd(mhi + 0x2c)) == 2 && renoir_level >= 9) {
-		renoir_mhi(mhi);
+	{
+		uint32_t m0sbl = 0;
+
+		/* pcie_m0sbl=1: MHI started (contexts, M0) in the SBL, before BHIe, as Linux does it */
+		PE_parse_boot_argn("pcie_m0sbl", &m0sbl, sizeof(m0sbl));
+		if (renoir_level >= 9 && ee == 1 && m0sbl) {
+			renoir_mhi(mhi, true, false);
+		}
+		if (renoir_level >= 8 && ee == 1 && renoir_bhie(mhi, mhi + rd(mhi + 0x2c)) == 2 && renoir_level >= 9) {
+			renoir_mhi(mhi, !m0sbl, true);
+		}
 	}
 	radio_space_faults();
 	/* (the chip is powered down with everything else; the copy is not freed: it might still be read) */
@@ -5182,7 +5216,7 @@ renoir_bar(vm_offset_t dbi, vm_offset_t iatu, vm_offset_t conf)
 	printf("wifi: pcie: BAR0 at %#x; the radio's command %#x, root port window %#x\n", rd(conf + 0x10), rd(conf + 4),
 	    rd(dbi + 0x20));
 	renoir_say("6: MHI's registers read at BAR0");
-	mhi = ml_io_map(base, 0x1000);
+	mhi = ml_io_map(base, 0x80000);                 /* (the first 512 KB: MHI's registers, PCIE_SOC_WAKE at 0x3004) */
 	printf("wifi: pcie: MHI: length %#x, version %#x, config %#x, channel doorbells at %#x, event doorbells at %#x\n",
 	    rd(mhi + 0x00), rd(mhi + 0x08), rd(mhi + 0x10), rd(mhi + 0x18), rd(mhi + 0x20));
 	printf("wifi: pcie: MHI: BHI at %#x, BHIe at %#x, control %#x, status %#x (state %u%s), error %#x\n", rd(mhi + 0x28),
