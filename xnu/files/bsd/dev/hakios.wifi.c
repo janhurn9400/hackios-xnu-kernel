@@ -3936,6 +3936,20 @@ hakios_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *addr
 }
 
 /*
+ * renoir: memory the processor keeps in its cache, shown to the radio as cacheable and inner shareable (MAIR
+ * entry 1, write-back): Linux's mapping for a coherent device (IOMMU_CACHE; dt: PCIe 0 is "dma-coherent"), so
+ * that the radio's reads and writes go through the caches and no second, uncached view of the memory is needed.
+ * Those views took the kernel's room for device mappings: iOS's start panicked in io_map with the driver's pool.
+ */
+#define RADIO_PTE_CACHED        ((RADIO_PTE & ~(3ull << 8)) | 1ull << 2 | 3ull << 8)
+
+bool
+hakios_wifi_radio_map_cached(uint64_t physical, uint64_t size, unsigned long long *address)
+{
+	return radio_map(physical, size, RADIO_PTE_CACHED, address);
+}
+
+/*
  * What the radio is to write, and where, to raise its interrupt vector 0 (vector v: data + v): the
  * GIC's register that raises an SPI, shown to the radio in its SMMU context as a device's page.
  * Once; the GIC's number of the SPI of vector 0 goes to *first_spi.

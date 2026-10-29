@@ -78,6 +78,10 @@ lx_os_radio_memory(unsigned long size, unsigned long long *address)
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
 	}
 	__asm__ volatile ("dsb sy");
+	if (hakios_wifi_is_renoir()) {
+		/* renoir's radio is coherent (PCIe 0): the cached view, shown to it cacheable (hakios_wifi_radio_map_cached()) */
+		return hakios_wifi_radio_map_cached(physical, size, address) ? (void *)cached : NULL;
+	}
 	uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB);
 	if (uncached == 0 || !hakios_wifi_radio_map(physical, size, address)) {
 		return NULL;
@@ -108,7 +112,8 @@ lx_os_radio_memory_device(unsigned long size, unsigned long long *address)
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
 	}
 	__asm__ volatile ("dsb sy");
-	if (!hakios_wifi_radio_map(kvtophys(cached), size, address)) {
+	if (!(hakios_wifi_is_renoir() ? hakios_wifi_radio_map_cached(kvtophys(cached), size, address) :
+	    hakios_wifi_radio_map(kvtophys(cached), size, address))) {
 		return NULL;
 	}
 	return (void *)cached;

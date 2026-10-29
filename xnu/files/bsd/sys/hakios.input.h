@@ -95,6 +95,7 @@ int hakios_lx_start(void);             /* the driver brought up on the radio as 
 void hakios_lx_stop(void);             /* ... and down again, if it stayed up (a network joined) */
 int hakios_lx_prepare(void);           /* before all that: the memory the radio will be shown, taken; 0 or an errno */
 void hakios_lx_net_early(void);        /* ... and en0 made on the radio now, if the kernel was given its address */
+bool hakios_wifi_radio_map_cached(uint64_t physical, uint64_t size, unsigned long long *address);   /* renoir: coherent */
 bool hakios_wifi_is_renoir(void);      /* board=renoir: its QCA6490 on PCIe, not a WCN6750 */
 int hakios_wifi_renoir_up(vm_offset_t *bar);   /* renoir's radio up to QRTR over MHI, for ath11k; 0 or an errno */
 void hakios_wifi_renoir_down(void);
