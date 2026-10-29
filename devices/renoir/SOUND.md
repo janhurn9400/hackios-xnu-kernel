@@ -150,3 +150,16 @@ sound=4 sound_below=144`. USB goes when the DSP starts; leave by keys (power + v
 
 Next: why stopping the TFA9873s silences iOS (then stop them on silence again, for the battery), a level for the TFA9873s
 (TDMSPKG 0x5f[9:6] / AMPGAIN 0x52 are candidates), and the amplifiers' temperature/battery monitor.
+
+## Sound and haptics stop once Safari starts (2026-10-29, with Wi-Fi)
+
+Seen with the audio plug-in's new trace (properties set, starts/stops per device, I/O counts every 5 s;
+`logs/trace-live*.log`, run without the DSP so that USB stays up): before Safari every haptic is a start of the
+Actuator (client 71) and the Speaker (client 95), the waveform, and a stop of both -- all clean. Once Safari starts,
+**iOS starts no device of ours any more**: no haptics, no system sounds; nothing fails below (plug-in, kernel,
+drivers get no request at all). The first time WebKit's GPU process played 5 s on the Speaker before that; the
+second time it played nothing and haptics stopped all the same. Closing Safari brings them back only sometimes, after
+a while. No audio daemon exits or is killed. Not the clocks either: one clock for all devices in one clock domain
+(audio_plugin.c, also a fix in its own right) changed nothing. Upstream has nothing on it (no commit, no review).
+It is a decision inside mediaserverd (a session WebKit makes muting system haptics and sounds?); next: mediaserverd's
+own log (over SSH now that Wi-Fi works, `log stream`), or WebKit's audio session category.
