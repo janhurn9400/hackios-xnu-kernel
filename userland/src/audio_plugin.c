@@ -248,6 +248,25 @@ static int sink = -1;                   /* /dev/hakios-audio */
 static Float64 ticks_per_frame;
 static UInt64 written, refused;         /* frames since the speaker's I/O started */
 static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
+
+/*
+ * What the HAL does with our devices, said as it happens (renoir, 2026-10-29: sound and haptics stopped
+ * for good once Safari's WebKit opened its audio stream, and nothing showed why): every property set on
+ * them, every start and stop, and every 5 s how many I/O operations each stream had since the last time.
+ */
+static UInt64 io_count[OBJECT_LAST + 1], io_said_at;
+
+static const char *
+fourcc(UInt32 code, char text[5])
+{
+	for (int i = 0; i < 4; i++) {
+		char c = (char)(code >> (24 - 8 * i));
+
+		text[i] = c >= 32 && c < 127 ? c : '?';
+	}
+	text[4] = 0;
+	return text;
+}
 static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
 
 static void
@@ -771,8 +790,26 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	return 0;
 }
 
+static OSStatus set_property_data_as_is(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t client,
+    const AudioObjectPropertyAddress *address, UInt32 qualifier_size, const void *qualifier, UInt32 size, const void *data);
+
 static OSStatus
 set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t client,
+    const AudioObjectPropertyAddress *address, UInt32 qualifier_size, const void *qualifier, UInt32 size, const void *data)
+{
+	OSStatus result = set_property_data_as_is(driver, object, client, address, qualifier_size, qualifier, size, data);
+	char text[5];
+
+	if (address != NULL && object != OBJECT_SPEAKER_VOLUME) {
+		say("hakios: audio: pid %d sets '%s' of object %u (%u bytes%s%.0f): %s %d\n", (int)client,
+		    fourcc(address->mSelector, text), (unsigned)object, (unsigned)size, size == 8 && data != NULL ? ", as a number " : "",
+		    size == 8 && data != NULL ? *(const Float64 *)data : 0.0, result == 0 ? "taken" : "REFUSED", (int)result);
+	}
+	return result;
+}
+
+static OSStatus
+set_property_data_as_is(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t client,
     const AudioObjectPropertyAddress *address, __unused UInt32 qualifier_size, __unused const void *qualifier, UInt32 size,
     const void *data)
 {
@@ -889,7 +926,7 @@ codec_read(int16_t *samples, UInt32 frames)
 }
 
 static OSStatus
-start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client)
+start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, UInt32 client)
 {
 	struct device *d = device_of(object);
 
@@ -900,6 +937,8 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 	if (clock_anchor == 0) {
 		clock_anchor = mach_absolute_time();
 	}
+	say("hakios: audio: start of %s by client %u (it now has %u)\n", CFStringGetCStringPtr(d->uid, kCFStringEncodingUTF8),
+	    (unsigned)client, d->running + 1);
 	if (d->running++ == 0) {
 		if (d->output != 0) {
 			written = refused = 0;
@@ -914,7 +953,7 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 }
 
 static OSStatus
-stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client)
+stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, UInt32 client)
 {
 	struct device *d = device_of(object);
 
@@ -922,6 +961,8 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 		return kAudioHardwareBadObjectError;
 	}
 	pthread_mutex_lock(&lock);
+	say("hakios: audio: stop of %s by client %u (it had %u)\n", CFStringGetCStringPtr(d->uid, kCFStringEncodingUTF8),
+	    (unsigned)client, d->running);
 	if (d->running != 0 && --d->running == 0) {
 		if (d->object == OBJECT_CODEC) {
 			codec_close();
@@ -1018,6 +1059,20 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 
 	if (d == NULL) {
 		return kAudioHardwareBadObjectError;
+	}
+	if (stream <= OBJECT_LAST) {
+		UInt64 now = mach_absolute_time();
+
+		io_count[stream]++;
+		if (io_said_at == 0 || (Float64)(now - io_said_at) * ticks_per_frame > 0 &&
+		    (Float64)(now - io_said_at) / ticks_per_frame > 5.0 * HAKIOS_AUDIO_RATE) {
+			io_said_at = now;
+			say("hakios: audio: I/O in the last 5 s: speaker out %llu, speaker in %llu, hawking %llu, actuator %llu, codec %llu"
+			    "; inactive: speaker out %d, actuator %d\n", io_count[OBJECT_SPEAKER_OUTPUT], io_count[OBJECT_SPEAKER_INPUT],
+			    io_count[OBJECT_HAWKING_INPUT], io_count[OBJECT_ACTUATOR_OUTPUT], io_count[OBJECT_CODEC_INPUT],
+			    inactive[OBJECT_SPEAKER_OUTPUT], inactive[OBJECT_ACTUATOR_OUTPUT]);
+			memset(io_count, 0, sizeof(io_count));
+		}
 	}
 	if (operation == kAudioServerPlugInIOOperationReadInput && stream == OBJECT_CODEC_INPUT) {
 		codec_read(buffer, frames);
