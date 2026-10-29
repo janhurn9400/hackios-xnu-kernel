@@ -67,12 +67,21 @@ print(re.search(r'enum ath11k_htc_svc_gid \{.*?\n\};\n', htc, re.S).group(0))
 print(re.search(r'#define SVC\(group, idx\).*?\n.*?\n', htc).group(0))
 print(re.search(r'enum ath11k_htc_svc_id \{.*?\n\};\n', htc, re.S).group(0))
 print('#undef SVC')
-for kind, field in (('ce_pipe_config', 'target_ce_config'), ('service_to_pipe', 'svc_to_ce_map')):
-    print('static ' + re.search(r'const struct %s %s\[\] = \{.*?\n\};\n' % (kind, of(field)), hw, re.S).group(0))
-print('#define WLFW_PIPES\t\t%s\n#define WLFW_PIPE_COUNT\t\t%s' % (of('target_ce_config'), of('target_ce_count')))
-print('#define WLFW_SERVICES\t\t%s\n#define WLFW_SERVICE_COUNT\t%s' % (of('svc_to_ce_map'), of('svc_to_ce_map_len')))
-print('#define WLFW_SENDS_INI\t\t%d\t/* fw_wmi_diag_event */' % (of('fw_wmi_diag_event') == 'true'))
-print('#define WLFW_SHADOW_REGISTERS\t%d\t/* supports_shadow_regs */' % (of('supports_shadow_regs') == 'true'))
+# the WCN6750 (redwood) as WLFW_*, and renoir's QCA6490 -- ath11k's "wcn6855 hw2.1", PCI 17cb:1103 -- as WLFW_HSP_*
+printed = set()
+for chip, suffix in (('"wcn6750 hw1.0"', ''), ('"wcn6855 hw2.1"', '_HSP')):
+    entry = core[core.index(chip):]
+    entry = entry[:entry.index('\n\t},')]
+    for kind, field in (('ce_pipe_config', 'target_ce_config'), ('service_to_pipe', 'svc_to_ce_map')):
+        if of(field) not in printed:
+            printed.add(of(field))
+            print('static ' + re.search(r'const struct %s %s\[\] = \{.*?\n\};\n' % (kind, of(field)), hw, re.S).group(0))
+    print('#define WLFW%s_PIPES\t\t%s\n#define WLFW%s_PIPE_COUNT\t%s' % (suffix, of('target_ce_config'), suffix,
+          of('target_ce_count')))
+    print('#define WLFW%s_SERVICES\t\t%s\n#define WLFW%s_SERVICE_COUNT\t%s' % (suffix, of('svc_to_ce_map'), suffix,
+          of('svc_to_ce_map_len')))
+    print('#define WLFW%s_SENDS_INI\t\t%d\t/* fw_wmi_diag_event */' % (suffix, of('fw_wmi_diag_event') == 'true'))
+    print('#define WLFW%s_SHADOW_REGISTERS\t%d\t/* supports_shadow_regs */' % (suffix, of('supports_shadow_regs') == 'true'))
 PY
 cmp -s "$OUT/hakios.wlfw_ath11k.h.new" "$OUT/hakios.wlfw_ath11k.h" 2>/dev/null && rm "$OUT/hakios.wlfw_ath11k.h.new" ||
 	mv "$OUT/hakios.wlfw_ath11k.h.new" "$OUT/hakios.wlfw_ath11k.h"

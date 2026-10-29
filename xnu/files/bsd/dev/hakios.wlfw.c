@@ -343,8 +343,17 @@ hakios_wlfw_stop(uint32_t step)
  * ath11k_qmi_firmware_start(), mode "mission": the firmware's logging on (this chip's entry
  * says so), the configuration, the mode. True: the firmware took the mode.
  */
+static bool mission_for(bool hsp);
+
 static bool
 mission(void)
+{
+	return mission_for(false);
+}
+
+/* hsp: renoir's QCA6490 (ath11k's "wcn6855 hw2.1" tables), else redwood's WCN6750 */
+static bool
+mission_for(bool hsp)
 {
 	static struct qmi_wlanfw_wlan_cfg_req_msg_v01 cfg;
 	struct qmi_wlanfw_wlan_cfg_resp_msg_v01 cfg_reply;
@@ -353,7 +362,7 @@ mission(void)
 	struct qmi_wlanfw_wlan_mode_req_msg_v01 mode;
 	struct qmi_wlanfw_wlan_mode_resp_msg_v01 mode_reply;
 
-	if (WLFW_SENDS_INI) {
+	if (hsp ? WLFW_HSP_SENDS_INI : WLFW_SENDS_INI) {
 		bzero(&ini, sizeof(ini));
 		bzero(&ini_reply, sizeof(ini_reply));
 		ini.enablefwlog_valid = 1;
@@ -369,23 +378,28 @@ mission(void)
 	cfg.host_version_valid = 1;
 	strlcpy(cfg.host_version, ATH11K_HOST_VERSION_STRING, sizeof(cfg.host_version));
 	cfg.tgt_cfg_valid = 1;
-	cfg.tgt_cfg_len = WLFW_PIPE_COUNT;
+	cfg.tgt_cfg_len = hsp ? WLFW_HSP_PIPE_COUNT : WLFW_PIPE_COUNT;
 	for (uint32_t i = 0; i < cfg.tgt_cfg_len; i++) {
-		cfg.tgt_cfg[i].pipe_num = WLFW_PIPES[i].pipenum;
-		cfg.tgt_cfg[i].pipe_dir = WLFW_PIPES[i].pipedir;
-		cfg.tgt_cfg[i].nentries = WLFW_PIPES[i].nentries;
-		cfg.tgt_cfg[i].nbytes_max = WLFW_PIPES[i].nbytes_max;
-		cfg.tgt_cfg[i].flags = WLFW_PIPES[i].flags;
+		const struct ce_pipe_config *pipe = hsp ? &WLFW_HSP_PIPES[i] : &WLFW_PIPES[i];
+
+		cfg.tgt_cfg[i].pipe_num = pipe->pipenum;
+		cfg.tgt_cfg[i].pipe_dir = pipe->pipedir;
+		cfg.tgt_cfg[i].nentries = pipe->nentries;
+		cfg.tgt_cfg[i].nbytes_max = pipe->nbytes_max;
+		cfg.tgt_cfg[i].flags = pipe->flags;
 	}
 	cfg.svc_cfg_valid = 1;
-	cfg.svc_cfg_len = WLFW_SERVICE_COUNT;
+	cfg.svc_cfg_len = hsp ? WLFW_HSP_SERVICE_COUNT : WLFW_SERVICE_COUNT;
 	for (uint32_t i = 0; i < cfg.svc_cfg_len; i++) {
-		cfg.svc_cfg[i].service_id = WLFW_SERVICES[i].service_id;
-		cfg.svc_cfg[i].pipe_dir = WLFW_SERVICES[i].pipedir;
-		cfg.svc_cfg[i].pipe_num = WLFW_SERVICES[i].pipenum;
+		const struct service_to_pipe *service = hsp ? &WLFW_HSP_SERVICES[i] : &WLFW_SERVICES[i];
+
+		cfg.svc_cfg[i].service_id = service->service_id;
+		cfg.svc_cfg[i].pipe_dir = service->pipedir;
+		cfg.svc_cfg[i].pipe_num = service->pipenum;
 	}
 	say("wifi: %u: the configuration: host version \"%s\", %u pipes and %u services from ath11k's tables for this chip; "
-	    "shadow registers: none%s\n", wlfw.step, cfg.host_version, cfg.tgt_cfg_len, cfg.svc_cfg_len, WLFW_SHADOW_REGISTERS ?
+	    "shadow registers: none%s\n", wlfw.step, cfg.host_version, cfg.tgt_cfg_len, cfg.svc_cfg_len,
+	    (hsp ? WLFW_HSP_SHADOW_REGISTERS : WLFW_SHADOW_REGISTERS) ?
 	    " (ath11k SENDS A LIST of up to 36 here)" : "");
 	if (!ask("the configuration", QMI_WLANFW_WLAN_CFG_REQ_V01, QMI_WLANFW_WLAN_CFG_REQ_MSG_V01_MAX_LEN,
 	    qmi_wlanfw_wlan_cfg_req_msg_v01_ei, &cfg, qmi_wlanfw_wlan_cfg_resp_msg_v01_ei, &cfg_reply, false)) {
@@ -566,6 +580,20 @@ hakios_wlfw_renoir(uint32_t step)
 	}
 	if (!wait_for(&wlfw.init_done, 5000)) {
 		say("wifi: %u: NO \"FIRMWARE INIT DONE\" within 5 s of the M3 image\n", step);
+		goto out;
+	}
+	{
+		uint32_t level = 0;
+
+		/* pcie=11: on to ath11k's ath11k_qmi_firmware_start(): logging, the configuration, the mode "mission" */
+		PE_parse_boot_argn("pcie", &level, sizeof(level));
+		if (level >= 11) {
+			in_mission = mission_for(true);
+			if (in_mission) {
+				wait_for(&wlfw.ready, 3000);
+				say("wifi: %u: after the mode: \"firmware ready\" %s\n", step, wlfw.ready ? "CAME" : "did not come in 3 s");
+			}
+		}
 	}
 out:
 	say("wifi: %u: renoir's exchange ends %llu ms after it began: the service %s, memory %s%s, \"init done\" %s\n", step,
