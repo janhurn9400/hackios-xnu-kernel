@@ -157,7 +157,14 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    rings) on renoir only, the big mappings (pins, BAR0, RPMh, command DB) outside the kernel's 8 MB io_map room
    (`IO_MAP_SIZE`: full, iOS's start panicked in io_map for the speaker's pins, three times), and RPMh under
    `hakios_rsc_lock` (with wifi=1 there was no sound and no vibration; the ADSP's driver uses the same slots).
-   Without adsp/sound, Wi-Fi + vibration work together (14:20).
+   Without adsp/sound, Wi-Fi + vibration work together (14:20). With the RPMh lock (kernel 14:24) sound, vibration
+   and Wi-Fi all work together after the start (user, 14:28) -- **until Safari loads a page: then sound and vibration
+   stop together.** Seen live without the DSP (`logs/hw-live2.log`, 14:33): taps 1-5 reach the motor, Safari starts
+   WebKit's GPU process, "hakios: audio: playing" (WebKit opens an audio stream and keeps it), and from then on iOS
+   writes nothing to /dev/hakios-haptic; the haptic driver reports no error. Not Wi-Fi's: before Wi-Fi no page ever
+   loaded. Next: the virtual audio device / mediaserverd with a second client (userland's audio plug-in,
+   bsd/dev/hakios.audio.c), see SOUND.md. Also seen: joining a network from iOS's Settings works (the user's iPhone
+   hotspot, passphrase typed in iOS), while the kernel's own join of fw/network is not shown in Settings.
    **MISSION MODE, 2026-10-29 12:55 (`pcie=11`, `logs/125435-mission.log`):** logging on (3 ms), the configuration
    from ath11k's "wcn6855 hw2.1" tables (9 pipes, 14 services: the same `qca6390` tables as the WCN6750's; no shadow
    registers, which ath11k does send for this chip) taken after 1148 ms, **mode MISSION taken in 17 ms.** No "firmware

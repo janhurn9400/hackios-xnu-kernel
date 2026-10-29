@@ -39,7 +39,9 @@
   `tools/mk-wlfw.sh` run in the VM before its build). **13:40: JOINED the user's FRITZ!Box (WPA2 handshake
   done)**, then disassociated with reason 33 (no traffic in that run). **14:15: WI-FI IN iOS WORKS, Safari loads
   pages** (`wifi=1 wifi_mac=...` with ramdisk `root-gl-wifi.apfs`, `WIFI.md` has what it took). Sound and vibration
-  were gone in that run: fixed (RPMh lock) in kernel 14:24, being tested.
+  were gone in that run: fixed (RPMh lock) in kernel 14:24: all three work together, **until Safari loads a page:
+  WebKit opens an audio stream and from then on iOS sends no sound and no haptics** (not Wi-Fi's; `WIFI.md`).
+  Next: that audio problem (iOS's audio stack with a second client), then reason 33 / Settings' Wi-Fi display.
 - **The loader now sets the restart reason "bootloader" for every `board=renoir` run** (before the kernel
   starts; `xnuloader/loader.c` `renoir_fastboot_on_reset()`; image `prebuilt/xnu-usb-renoir-crashlog.img`
   09:00): a run that dies early also lands in fastboot. The user wants that always: never MagicOS.
