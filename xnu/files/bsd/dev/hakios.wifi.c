@@ -4459,7 +4459,7 @@ renoir_rpmh_address(const char *name)
 	char id[8] = { 0 };
 
 	if (db == NULL) {
-		db = (const volatile uint8_t *)ml_io_map_wcomb(RENOIR_CMD_DB, 0x20000);
+		db = (const volatile uint8_t *)ml_io_map_unmappable(RENOIR_CMD_DB, 0x20000, VM_WIMG_WCOMB);
 	}
 
 	if (db[4] != 0xdb || db[5] != 0x30 || db[6] != 0x03 || db[7] != 0x0c) {
@@ -5362,8 +5362,7 @@ renoir_bar(vm_offset_t dbi, vm_offset_t iatu, vm_offset_t conf)
 	vm_offset_t mhi;
 
 	for (int i = 0; i < 4; i++) {
-		printf("wifi: pcie: 6: %d ms after: link %#x, ltssm %#x; ", i * 500, rd(dbi + 0x80),
-		    rd(ml_io_map(RENOIR_PCIE_PARF, 0x3000) + 0x1b0));
+		printf("wifi: pcie: 6: %d ms after: link %#x; ", i * 500, rd(dbi + 0x80));
 		printf("the radio's id %#x, status/command %#x\n", rd(conf), rd(conf + 4));
 		sleep_ms(500);
 	}
@@ -5396,7 +5395,7 @@ renoir_bar(vm_offset_t dbi, vm_offset_t iatu, vm_offset_t conf)
 	    rd(dbi + 0x20));
 	renoir_say("6: MHI's registers read at BAR0");
 	/* (the first megabyte: MHI's registers, PCIE_SOC_WAKE at 0x3004, and ath11k's window at 512 KB) */
-	renoir_bar_va = mhi = ml_io_map(base, 0x100000);
+	renoir_bar_va = mhi = ml_io_map_unmappable(base, 0x100000, VM_WIMG_IO);
 	printf("wifi: pcie: MHI: length %#x, version %#x, config %#x, channel doorbells at %#x, event doorbells at %#x\n",
 	    rd(mhi + 0x00), rd(mhi + 0x08), rd(mhi + 0x10), rd(mhi + 0x18), rd(mhi + 0x20));
 	printf("wifi: pcie: MHI: BHI at %#x, BHIe at %#x, control %#x, status %#x (state %u%s), error %#x\n", rd(mhi + 0x28),
@@ -5428,8 +5427,15 @@ renoir_pcie_link(unsigned level)
 		radio_space_off();
 		return;
 	}
-	renoir_rsc = ml_io_map(RENOIR_RSC, 0x10000);
-	renoir_tlmm = ml_io_map(0x0f100000, 0x100000);
+	/*
+	 * The big ones outside the kernel's 8 MB for device mappings (osfmk/arm/io_map.c: IO_MAP_SIZE): with the
+	 * touch screen's, the sound's and the rest they filled it, and iOS's start panicked in io_map for the
+	 * speaker's pins (2026-10-29). Mapped once each (the static ones keep them).
+	 */
+	if (renoir_rsc == 0) {
+		renoir_rsc = ml_io_map_unmappable(RENOIR_RSC, 0x10000, VM_WIMG_IO);
+		renoir_tlmm = ml_io_map_unmappable(0x0f100000, 0x100000, VM_WIMG_IO);
+	}
 	renoir_gcc_vote = ml_io_map(RENOIR_GCC_VOTE, 0x1000);
 	renoir_gcc_pcie = ml_io_map(RENOIR_GCC_PCIE0, 0x1000);
 	renoir_gcc_phy = ml_io_map(RENOIR_GCC_PCIE0_PHY, 0x1000);
