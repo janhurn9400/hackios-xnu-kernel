@@ -755,8 +755,8 @@ iounmap(void *address)
  * or the other way round. The first part of it is handed out for good, a stretch at a time
  * (rings); the rest is slots of one size, taken and given back (buffers).
  */
-#define POOL_SIZE	(56u << 20)
-#define POOL_RINGS	(24u << 20)		/* (the data path's rings and link descriptors come to about 6 MB; renoir's
+#define POOL_SIZE	(64u << 20)
+#define POOL_RINGS	(32u << 20)		/* (the data path's rings and link descriptors come to about 6 MB; renoir's
 						 * QCA6490 asks for 9 MB more for its firmware, in two pieces on 4 MB) */
 #define POOL_SLOT	4096u
 #define POOL_SLOTS	((POOL_SIZE - POOL_RINGS) / POOL_SLOT)
