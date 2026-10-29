@@ -755,11 +755,16 @@ iounmap(void *address)
  * or the other way round. The first part of it is handed out for good, a stretch at a time
  * (rings); the rest is slots of one size, taken and given back (buffers).
  */
-#define POOL_SIZE	(44u << 20)
-#define POOL_RINGS	(16u << 20)		/* (the data path's rings and link descriptors come to about 6 MB; renoir's
-						 * QCA6490's 9 MB for its firmware are pieces of their own, see below) */
+#define POOL_SLOT_PART	(32u << 20)		/* the slots of one size, taken and given back (buffers) */
+/*
+ * The rings' part: 12 MB on redwood (the data path's rings and link descriptors come to about 6 MB); 32 MB on
+ * renoir, where 16 were not enough for ath11k's data path of the QCA6490 ("failed to attach DP pdev: -12").
+ * renoir's pool is cached and costs none of the kernel's room for device mappings (lx_os_radio_memory()).
+ */
+#define POOL_RINGS	(lx_os_renoir() ? (32u << 20) : (12u << 20))
+#define POOL_SIZE	(POOL_RINGS + POOL_SLOT_PART)
 #define POOL_SLOT	4096u
-#define POOL_SLOTS	((POOL_SIZE - POOL_RINGS) / POOL_SLOT)
+#define POOL_SLOTS	(POOL_SLOT_PART / POOL_SLOT)
 
 static struct {
 	uint8_t *memory;
