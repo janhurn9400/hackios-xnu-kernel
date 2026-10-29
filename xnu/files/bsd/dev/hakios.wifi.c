@@ -4744,9 +4744,9 @@ renoir_bhi_prepare(void)
 	radio_stream_mask = 0;
 	PE_parse_boot_argn("pcie_stream", &radio_stream, sizeof(radio_stream));
 	radio_space.wanted = 2;
-	pause_ms = renoir_pause ? renoir_pause : 1500;
+	pause_ms = renoir_pause ? renoir_pause : whole ? 0 : 1500;
 	new_from = 0;                           /* (every SMMU write waits pause_ms: see hold()) */
-	fine = 1;
+	fine = !whole;
 	if (!hakios_wifi_radio_map(physical, RENOIR_SBL_SIZE, &renoir_seen)) {
 		printf("wifi: pcie: 7: the SMMU does not give the chip a view of the image\n");
 		return false;
@@ -5562,6 +5562,39 @@ down:
 	renoir_pcie_down(reached);
 }
 
+static void join_given(uint64_t began);
+
+/*
+ * renoir's wifi=1: everything for whoever uses the phone, as redwood's whole_thread() -- the radio brought up
+ * by ath11k on renoir's bus (power, PCIe, firmware, MHI, QRTR, then ath11k's own exchange), its station
+ * offered to the rest of the kernel (iOS's side asks through hakios.apple80211.c), and the network of
+ * fw/network joined -- on a thread of its own beside the system's start.
+ */
+static void
+renoir_whole_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint64_t began = now_us();
+	int error;
+
+	if (hakios_lx_prepare() != 0) {
+		tell("wifi: NO MEMORY FOR THE RADIO in one piece: it is not brought up\n");
+		whole_runs = false;
+		thread_terminate(current_thread());
+	}
+	error = hakios_lx_start();
+	if (error == 0) {
+		tell("wifi: THE RADIO IS UP (renoir, ath11k), %llu.%llu s after the kernel began on it\n", (now_us() - began) / 1000000,
+		    (now_us() - began) / 100000 % 10);
+		join_given(began);
+	} else {
+		tell("wifi: THE RADIO DID NOT COME UP (renoir, ath11k: %d), %llu s in. The last of what was said on the way:\n", error,
+		    (now_us() - began) / 1000000);
+		say_kept();
+	}
+	whole_runs = false;
+	thread_terminate(current_thread());
+}
+
 /*
  * For ath11k's bus on renoir (wifi/lx, hakios.lx.c): the radio powered, its firmware loaded and running,
  * MHI in M0 and QRTR over its IPCR channels for ath11k's qmi.c -- everything of pcie=10 but the exchange,
@@ -5610,6 +5643,32 @@ hakios_wifi_init(void)
 	char board[16] = "";
 
 	if (PE_parse_boot_argn("board", board, sizeof(board)) && strcmp(board, "renoir") == 0) {
+		if (PE_parse_boot_argn("wifi", &on, sizeof(on)) && on == 1) {
+			thread_t thread;
+			uint64_t size = 0;
+
+			if (image_file("amss20.bin", &size) == NULL) {
+				printf("wifi: wifi=1, but the radio's firmware is not in the small image (fw/amss20.bin): no Wi-Fi\n");
+				return;
+			}
+			whole = whole_runs = true;
+			quiet = !(PE_parse_boot_argn("wifi_loud", &back, sizeof(back)) && back);
+			hakios_qmi_set_transport(&qrtr_ops);
+			radio_stream = 0x2400;
+			radio_stream_mask = 0;
+			radio_space.wanted = 2;
+			pause_ms = 0;
+			renoir_pause = 0;
+			hakios_lx_net_early();
+			if (kernel_thread_start(renoir_whole_thread, NULL, &thread) != KERN_SUCCESS) {
+				whole_runs = false;
+				tell("wifi: no thread: the radio is not brought up\n");
+				return;
+			}
+			thread_deallocate(thread);
+			tell("wifi: the radio is being brought up beside the system's start (wifi=1, renoir)\n");
+			return;
+		}
 		if (PE_parse_boot_argn("wifi_lx", &back, sizeof(back)) && back) {
 			/* ath11k on renoir's bus (wifi/lx/src/lx_bus.c: lx_os_renoir_*), as wifi_step=N's step 15 on redwood */
 			hakios_reboot_reason_set();
