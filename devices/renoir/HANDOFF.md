@@ -36,7 +36,8 @@
   (`pcie=11`): configuration and MODE MISSION taken: the firmware runs as for Android's Wi-Fi.**
   **13:30: ATH11K RUNS ON RENOIR AND SCANS: 5 networks heard** (`devices/renoir/wifi-run.sh scan 240 wifi_lx=2
   wifi_scan=1 wifi_quiet=1 pcie_pause=0 wifi_mac=<the phone's>`; the kernel needs `tools/mk-ath11k.sh` and
-  `tools/mk-wlfw.sh` run in the VM before its build). Next: join a network, then Wi-Fi in iOS (`WIFI.md`).
+  `tools/mk-wlfw.sh` run in the VM before its build). **13:40: JOINED the user's FRITZ!Box (WPA2 handshake
+  done)**, then disassociated with reason 33 (no traffic in that run). Next: Wi-Fi in a full iOS run (`WIFI.md`).
 - **The loader now sets the restart reason "bootloader" for every `board=renoir` run** (before the kernel
   starts; `xnuloader/loader.c` `renoir_fastboot_on_reset()`; image `prebuilt/xnu-usb-renoir-crashlog.img`
   09:00): a run that dies early also lands in fastboot. The user wants that always: never MagicOS.

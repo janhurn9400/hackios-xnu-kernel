@@ -141,7 +141,13 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    rings (pieces of 1 MB and more on 4 MB); PERST# left released for the kept radio; the MHI pump stops on a chip
    that reads all ones. The radio has no address of its own (the firmware says zeros; Android gets it from the
    modem's DMS, "use-nv-mac"): give it with boot-arg `wifi_mac=` (the phone's, from MagicOS; not in these files).
-   Next: join a network (`wifi_join=1`, `fw/network`, as redwood), then `wifi=1` for iOS (hakios.apple80211.c).
+   **JOINED, 13:40 (`wifi_join=1 wifi_hold=20`, small image with `fw/network` -- the user's, made by the user,
+   `fw-wifi/network` is git-ignored; `logs/133743-join.log`):** the wanted network heard at 2.4 GHz (channel 11,
+   -60 dBm) and 5 GHz (36), WPA2-PSK/CCMP; authentication and association accepted (station 4), the 4-way
+   handshake done, keys to the driver: "THE NETWORK IS JOINED". The country became "AT" from the access point.
+   Then the access point disassociated us (reason 33, QoS/bandwidth) within the 20 s, with nothing sent (no
+   iOS, no DHCP in this run). Next: `wifi=1` in a full iOS run (hakios.apple80211.c, en0, DHCP); look at reason
+   33 (block ack / QoS setup, or idle) if it comes back with traffic.
    **MISSION MODE, 2026-10-29 12:55 (`pcie=11`, `logs/125435-mission.log`):** logging on (3 ms), the configuration
    from ath11k's "wcn6855 hw2.1" tables (9 pipes, 14 services: the same `qca6390` tables as the WCN6750's; no shadow
    registers, which ath11k does send for this chip) taken after 1148 ms, **mode MISSION taken in 17 ms.** No "firmware
