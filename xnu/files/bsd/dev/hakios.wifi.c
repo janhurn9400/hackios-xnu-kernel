@@ -2764,6 +2764,9 @@ static uint32_t qrtr_peer;                      /* the DSP's node; 0: it has not
 static uint32_t qrtr_next_port = QRTR_FIRST_PORT, qrtr_in, qrtr_out, qrtr_hellos;
 static thread_t link_thread_is;
 
+static bool qrtr_over_mhi;              /* renoir: the datagrams go over MHI's IPCR channels (renoir_mhi()), not GLINK */
+static int renoir_mhi_send(const void *data, uint32_t length);
+
 /* One datagram out, of any type. */
 static int
 qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
@@ -2787,7 +2790,8 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
 	packet->to_node = to_node;
 	packet->to_port = to_port;
 	memcpy(packet + 1, data, length);
-	error = glink_send(packet, (uint32_t)sizeof(*packet) + padded);
+	error = qrtr_over_mhi ? renoir_mhi_send(packet, (uint32_t)sizeof(*packet) + padded) :
+	    glink_send(packet, (uint32_t)sizeof(*packet) + padded);
 	kfree_data(packet, sizeof(*packet) + padded);
 	qrtr_out += error == 0;
 	return error;
@@ -4364,6 +4368,7 @@ renoir_pcie_survey(uint32_t how)
  *   7  ... the firmware's first 512 KB to the boot ROM through BHI (renoir_bhi())
  *   8  ... and the whole of it to the SBL through BHIe (renoir_bhie())
  *   9  ... MHI to M0, the IPCR channels started, what the chip says on them (renoir_mhi())
+ *  10  ... QRTR over them for the QMI code, and the first of the WLFW exchange (hakios_wlfw_renoir())
  * Everything is taken back down at the end, in reverse, but for the supplies (see renoir_pcie_down()).
  * pcie_pause=MS (default 2200): a pause after each announcement, for the loader's notes if a write ends
  * the kernel (the hypervisor may keep some of this for itself).
@@ -4782,7 +4787,7 @@ renoir_bhie(vm_offset_t mhi, vm_offset_t bhie)
  * MHICTRL asks for M0. Then the two IPCR channels are started by commands, channel 21 is given four
  * buffers, and whatever comes on it (the firmware's QRTR hello) is shown. Polled: no MSI yet.
  */
-#define MHI_MEM_SIZE            0x10000u
+#define MHI_MEM_SIZE            0x20000u        /* (0x10000 on: the send buffer for QRTR, 12 KB) */
 #define MHI_CTRL                0x38
 #define MHI_STATUS              0x48
 #define MHI_CCABAP              0x58
@@ -4881,6 +4886,104 @@ mhi_command(vm_offset_t mhi, unsigned type, unsigned channel)
 	}
 	printf("wifi: pcie: 9: no completion for command %#x on channel %u\n", type, channel);
 	return false;
+}
+
+/*
+ * pcie=10: QRTR over the IPCR channels, for the QMI code (hakios.qmi.c, hakios.wlfw.c) as GLINK carries it on
+ * redwood. One datagram at a time goes out of the send buffer (0x10000) on channel 20 and is waited for; a
+ * thread of ours takes what the chip writes into channel 21's four buffers to qrtr_input() and gives each
+ * buffer back at once. Polled every millisecond, as redwood's link (MSI is on, but nobody takes it yet).
+ */
+static vm_offset_t mhi_regs;
+static volatile bool mhi_sent, mhi_pumping;
+static LCK_MTX_DECLARE(mhi_send_lock, &wifi_lock_group);
+static uint32_t mhi_out = 20;
+
+static int
+renoir_mhi_send(const void *data, uint32_t length)
+{
+	volatile uint32_t *t;
+
+	if (mhi_regs == 0 || length > 0x3000) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&mhi_send_lock);
+	for (uint32_t i = 0; i < length; i++) {
+		mhi_mem[0x10000 + i] = ((const uint8_t *)data)[i];
+	}
+	t = MHI_ELEMENT(0x6000 + ch_wp[0]);
+	t[0] = (uint32_t)MHI_AT(0x10000);
+	t[1] = (uint32_t)(MHI_AT(0x10000) >> 32);
+	t[2] = length;
+	t[3] = 2u << 16 | 1u << 9;
+	ch_wp[0] = (ch_wp[0] + 16) % (16 * 16);
+	mhi_sent = false;
+	MHI_CTX(44 * mhi_out)->write = MHI_AT(0x6000 + ch_wp[0]);
+	__asm__ volatile ("dsb sy");
+	mhi_wr64(mhi_regs + rd(mhi_regs + 0x18) + 8 * mhi_out, MHI_AT(0x6000 + ch_wp[0]));
+	for (int ms = 0; ms < 1000 && !mhi_sent; ms++) {
+		sleep_ms(1);
+	}
+	lck_mtx_unlock(&mhi_send_lock);
+	if (!mhi_sent) {
+		printf("wifi: mhi: %u bytes on channel %u: NOT TAKEN within 1 s\n", length, mhi_out);
+		return ETIMEDOUT;
+	}
+	return 0;
+}
+
+static void
+renoir_mhi_pump(__unused void *parameter, __unused wait_result_t result)
+{
+	uint32_t e[4];
+
+	link_thread_is = current_thread();
+	while (mhi_pumping) {
+		while (mhi_event(1, e)) {
+			unsigned type = (e[3] >> 16) & 0xff, channel = e[3] >> 24;
+
+			if (type == 0x22 && channel == mhi_out) {
+				mhi_sent = true;
+			} else if (type == 0x22 && channel == mhi_out + 1) {
+				uint32_t index = (uint32_t)((((uint64_t)e[1] << 32 | e[0]) - MHI_AT(0x7000)) / 16) & 15;
+				uint32_t length = e[2] & 0xffff, buffer = 0x8000 + 0x1000 * (index & 3);
+				uint8_t *copy = length ? kalloc_data(length, Z_WAITOK) : NULL;
+				volatile uint32_t *t = MHI_ELEMENT(0x7000 + ch_wp[1]);
+
+				for (uint32_t b = 0; copy != NULL && b < length; b++) {
+					copy[b] = mhi_mem[buffer + b];
+				}
+				/* the buffer back to the chip, in the element four on (the same buffer: index mod 4) */
+				t[0] = (uint32_t)MHI_AT(buffer);
+				t[1] = (uint32_t)(MHI_AT(buffer) >> 32);
+				t[2] = 0x1000;
+				t[3] = 2u << 16 | 1u << 9 | 1u << 8;
+				ch_wp[1] = (ch_wp[1] + 16) % (16 * 16);
+				MHI_CTX(44 * (mhi_out + 1))->write = MHI_AT(0x7000 + ch_wp[1]);
+				__asm__ volatile ("dsb sy");
+				mhi_wr64(mhi_regs + rd(mhi_regs + 0x18) + 8 * (mhi_out + 1), MHI_AT(0x7000 + ch_wp[1]));
+				if (copy != NULL) {
+					lck_mtx_lock(&qrtr_calling);
+					qrtr_input(copy, length);
+					lck_mtx_unlock(&qrtr_calling);
+					kfree_data(copy, length);
+				}
+			} else {
+				mhi_say_event("data ring", e);
+			}
+			mhi_event_doorbell(mhi_regs, 1);
+		}
+		while (mhi_event(0, e)) {
+			mhi_say_event("control ring", e);
+			mhi_event_doorbell(mhi_regs, 0);
+		}
+		lck_mtx_lock(&qrtr_calling);
+		qrtr_fresh();
+		lck_mtx_unlock(&qrtr_calling);
+		sleep_ms(1);
+	}
+	link_thread_is = NULL;
+	thread_terminate(current_thread());
 }
 
 static void
@@ -5035,6 +5138,29 @@ channels:
 	MHI_CTX(44 * (out + 1))->write = MHI_AT(0x7000 + ch_wp[1]);
 	__asm__ volatile ("dsb sy");
 	mhi_wr64(mhi + rd(mhi + 0x18) + 8 * (out + 1), MHI_AT(0x7000 + ch_wp[1]));
+	if (renoir_level >= 10 && out == 20) {
+		struct qrtr_control hello = { .command = QRTR_HELLO };
+		thread_t pump;
+
+		mhi_regs = mhi;
+		mhi_out = out;
+		qrtr_over_mhi = true;
+		mhi_pumping = true;
+		if (kernel_thread_start(renoir_mhi_pump, NULL, &pump) != KERN_SUCCESS) {
+			mhi_pumping = false;
+			return;
+		}
+		thread_deallocate(pump);
+		hakios_qmi_set_transport(&qrtr_ops);
+		printf("wifi: pcie: 10: QRTR over MHI: our hello %s\n", qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, 0xffffffffu,
+		    QRTR_CONTROL, &hello, sizeof(hello)) == 0 ? "TAKEN" : "NOT TAKEN");
+		printf("wifi: pcie: 10: the WLFW exchange %s\n", hakios_wlfw_renoir(10) ? "GOT AS FAR AS THE MEMORY REQUEST" :
+		    "STOPPED EARLY");
+		mhi_pumping = false;
+		sleep_ms(20);
+		qrtr_over_mhi = false;
+		return;
+	}
 	/*
 	 * QRTR's hello on channel 20 (the firmware says nothing until it has one, 2026-10-29 00:20): a version 1
 	 * header (version, type 2 = hello, our node 1 and control port, no confirmation, 20 bytes, to every node's

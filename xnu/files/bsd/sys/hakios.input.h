@@ -85,6 +85,7 @@ int hakios_wifi_say(const char *format, ...) __printflike(1, 2);      /* a line 
 int hakios_wifi_tell(const char *format, ...) __printflike(1, 2);     /* ... one that is said even with wifi=1 */
 uint32_t hakios_wifi_option(const char *name);                         /* a boot-arg's number, or what wifi=1 stands for */
 const uint8_t *hakios_wifi_file(const char *name, uint64_t *size);     /* a file of fw/ in the small image, in place */
+bool hakios_wlfw_renoir(uint32_t step);                                /* renoir's QCA6490 over MHI: hakios.wlfw.c */
 bool hakios_wlfw_exchange(uint32_t step);                              /* step 15 of wifi_step=N: hakios.wlfw.c */
 bool hakios_wlfw_registers(uint64_t *address, uint32_t *size, bool *mission); /* ... and what it learnt for step 16 */
 void hakios_wlfw_stop(uint32_t step);                                  /* ... and its end, before the DSP is stopped */

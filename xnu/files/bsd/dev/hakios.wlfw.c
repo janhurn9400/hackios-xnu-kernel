@@ -60,6 +60,13 @@ hakios_wlfw_stop(__unused uint32_t step)
 }
 
 bool
+hakios_wlfw_renoir(uint32_t step)
+{
+	say("wifi: %u: THE EXCHANGE IS NOT BUILT IN (tools/mk-wlfw.sh)\n", step);
+	return false;
+}
+
+bool
 hakios_wlfw_exchange(uint32_t step)
 {
 	say("wifi: %u: THE EXCHANGE IS NOT BUILT IN: ath11k's message descriptions were not there when this kernel was built "
@@ -142,6 +149,24 @@ wlfw_cal_done(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq
 	wlfw_indication(&wlfw.cal_done, &wlfw.cal_done_at, "cold boot calibration done", QMI_WLFW_COLD_BOOT_CAL_DONE_IND_V01);
 }
 
+/* renoir's QCA6490 (unlike the WCN6750) asks for memory of the host: what it asks for is kept and said */
+static struct qmi_wlanfw_request_mem_ind_msg_v01 wlfw_memory_asked;
+static volatile bool wlfw_memory_request;
+
+static void
+wlfw_request_mem(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq, __unused struct qmi_txn *txn,
+    const void *decoded)
+{
+	const struct qmi_wlanfw_request_mem_ind_msg_v01 *asked = decoded;
+
+	memcpy(&wlfw_memory_asked, asked, sizeof(wlfw_memory_asked));
+	say("wifi: %u: +%llu ms: THE FIRMWARE ASKS FOR MEMORY: %u pieces\n", wlfw.step, now_ms() - wlfw.began, asked->mem_seg_len);
+	for (uint32_t i = 0; i < asked->mem_seg_len && i < ATH11K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01; i++) {
+		say("wifi: %u:   piece %u: %#x bytes of type %u\n", wlfw.step, i, asked->mem_seg[i].size, asked->mem_seg[i].type);
+	}
+	wlfw_memory_request = true;
+}
+
 static const struct qmi_ops wlfw_ops = { .new_server = wlfw_new_server, .del_server = wlfw_del_server };
 /* (qmi.c's own table has two more, for memory the firmware asks for: this chip's does not) */
 static const struct qmi_msg_handler wlfw_handlers[] = {
@@ -151,6 +176,8 @@ static const struct qmi_msg_handler wlfw_handlers[] = {
 	  sizeof(struct qmi_wlanfw_fw_cold_cal_done_ind_msg_v01), wlfw_cal_done },
 	{ QMI_INDICATION, QMI_WLFW_FW_INIT_DONE_IND_V01, qmi_wlfw_fw_init_done_ind_msg_v01_ei,
 	  sizeof(struct qmi_wlfw_fw_init_done_ind_msg_v01), wlfw_init_done },
+	{ QMI_INDICATION, QMI_WLFW_REQUEST_MEM_IND_V01, qmi_wlanfw_request_mem_ind_msg_v01_ei,
+	  sizeof(struct qmi_wlanfw_request_mem_ind_msg_v01), wlfw_request_mem },
 	{ 0 },
 };
 
@@ -361,6 +388,92 @@ mission(void)
 	}
 	say("wifi: %u: THE FIRMWARE IS IN MISSION MODE\n", wlfw.step);
 	return true;
+}
+
+/*
+ * renoir (board=renoir, pcie=10): the QCA6490 behind PCIe, over our MHI (hakios.wifi.c). The beginning of
+ * ath11k's exchange for the QCA6390 family, which this chip belongs to (hw.c: qca6390/wcn6855 parameters):
+ * the service is looked up whatever its instance (the chip announces version 1, instance 1), the
+ * indications are asked for including the two about memory (this chip has no memory of its own fixed for
+ * the firmware: ath11k's fixed_fw_mem is false for it), the host's capabilities with the m3 image
+ * supported, and then the firmware is expected to ask for memory (Android: 0x4e0000 bytes of type 1 and
+ * 0x398000 of type 4, at once). Giving it that memory is the next step.
+ */
+bool
+hakios_wlfw_renoir(uint32_t step)
+{
+	struct qmi_wlanfw_ind_register_req_msg_v01 indications;
+	struct qmi_wlanfw_ind_register_resp_msg_v01 indications_reply;
+	struct qmi_wlanfw_host_cap_req_msg_v01 host;
+	struct qmi_wlanfw_host_cap_resp_msg_v01 host_reply;
+	int ret;
+
+	if (handle_open) {
+		return false;
+	}
+	bzero(&wlfw, sizeof(wlfw));
+	wlfw.step = step;
+	wlfw.began = now_ms();
+	ret = qmi_handle_init(&handle, ATH11K_QMI_RESP_LEN_MAX, &wlfw_ops, wlfw_handlers);
+	if (ret < 0) {
+		say("wifi: %u: no handle on the router: %d\n", step, ret);
+		return false;
+	}
+	handle_open = true;
+	ret = qmi_add_lookup(&handle, ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01, 0);
+	if (ret < 0 || !wait_for(&wlfw.server, 3000)) {
+		say("wifi: %u: THE SERVICE (%#x) DOES NOT APPEAR within 3 s (lookup: %d)\n", step, ATH11K_QMI_WLFW_SERVICE_ID_V01, ret);
+		goto out;
+	}
+	bzero(&indications, sizeof(indications));
+	bzero(&indications_reply, sizeof(indications_reply));
+	indications.client_id_valid = 1;
+	indications.client_id = QMI_WLANFW_CLIENT_ID;
+	indications.fw_ready_enable_valid = 1;
+	indications.fw_ready_enable = 1;
+	indications.cal_done_enable_valid = 1;
+	indications.cal_done_enable = 1;
+	indications.fw_init_done_enable_valid = 1;
+	indications.fw_init_done_enable = 1;
+	indications.request_mem_enable_valid = 1;
+	indications.request_mem_enable = 1;
+	indications.fw_mem_ready_enable_valid = 1;
+	indications.fw_mem_ready_enable = 1;
+	if (!ask("which indications we want", QMI_WLANFW_IND_REGISTER_REQ_V01, QMI_WLANFW_IND_REGISTER_REQ_MSG_V01_MAX_LEN,
+	    qmi_wlanfw_ind_register_req_msg_v01_ei, &indications, qmi_wlanfw_ind_register_resp_msg_v01_ei, &indications_reply,
+	    false)) {
+		goto out;
+	}
+	if (indications_reply.fw_status_valid) {
+		say("wifi: %u:   the firmware's status word: %#llx\n", step, (unsigned long long)indications_reply.fw_status);
+	}
+	bzero(&host, sizeof(host));
+	bzero(&host_reply, sizeof(host_reply));
+	host.num_clients_valid = 1;
+	host.num_clients = 1;
+	host.mem_cfg_mode_valid = 1;
+	host.mem_cfg_mode = 0;
+	host.bdf_support_valid = 1;
+	host.bdf_support = 1;
+	host.m3_support_valid = 1;
+	host.m3_support = 1;
+	host.m3_cache_support_valid = 1;
+	host.m3_cache_support = 1;
+	host.cal_done_valid = 1;
+	host.cal_done = 0;
+	if (!ask("what the host can do", QMI_WLANFW_HOST_CAP_REQ_V01, QMI_WLANFW_HOST_CAP_REQ_MSG_V01_MAX_LEN,
+	    qmi_wlanfw_host_cap_req_msg_v01_ei, &host, qmi_wlanfw_host_cap_resp_msg_v01_ei, &host_reply, false)) {
+		goto out;
+	}
+	if (!wait_for(&wlfw_memory_request, 3000)) {
+		say("wifi: %u: the firmware has not asked for memory within 3 s\n", step);
+	}
+out:
+	say("wifi: %u: renoir's exchange ends %llu ms after it began: the service %s, memory %s\n", step, now_ms() - wlfw.began,
+	    wlfw.server ? "FOUND" : "not found", wlfw_memory_request ? "ASKED FOR" : "not asked for");
+	qmi_handle_release(&handle);
+	handle_open = false;
+	return wlfw_memory_request;
 }
 
 bool
