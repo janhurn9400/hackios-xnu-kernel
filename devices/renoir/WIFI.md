@@ -115,7 +115,17 @@ the SMMU context code (`radio_space_*` in `hakios.wifi.c`).
    the doorbell value's form, whether channel 20 is IPCR on this firmware (ath11k's QCA6390 table: 20/21),
    MSI being needed for the data path (no interrupts are set up: the chip may wait for MSI enable in its
    configuration space before it moves data).
-   **Next: QMI with WLFW over this** (`hakios.wlfw.c` speaks it for redwood over GLINK/QRTR: give it an
+   **QMI WITH WLFW WORKS, 2026-10-29 09:05 (`pcie=10`, `logs/090327-qmi.log`).** QRTR over MHI (`renoir_mhi_send()`,
+   the pump thread `renoir_mhi_pump()` into `qrtr_input()`), the QMI code on top as on redwood;
+   `hakios_wlfw_renoir()` in `hakios.wlfw.c`: the service at node 7 port 1, indication register (with
+   request_mem and fw_mem_ready) success in 3 ms, host capabilities (m3 supported) success in 8 ms, and
+   **the firmware asks for memory: 0x4e0000 bytes of type 1 and 0x398000 of type 4** -- Android's numbers.
+   (The header with ath11k's message tables: `tools/mk-ath11k.sh fetch; tools/mk-wlfw.sh` in the VM, after a
+   kernel build; done.) Odd: our first two datagrams (the hellos) got no transfer event within 1 s although
+   the chip acted on them; everything after came back in milliseconds.
+   **Next: give the firmware its memory** (two pieces in one physical piece each, shown through the SMMU,
+   QMI_WLANFW_RESPOND_MEM), then FW_MEM_READY, target capabilities, BDF (`bdwlan.*` / `regdb`), M3
+   (`m3.bin`), mode. Earlier plan: **QMI with WLFW over this** (`hakios.wlfw.c` speaks it for redwood over GLINK/QRTR: give it an
    MHI transport, `hakios_qmi_set_transport()`), then ath11k_pci. Originally planned as: the context arrays (channels, event rings, command ring) in shown memory, their
    addresses in MHI's registers (CCABAP 0x58, ECABAP 0x60, CRCBAP 0x68, CRDB, and the data/control limits),
    MHICTRL to M0, then the channels IPCR 20/21 for QRTR -- polling event rings at first (no MSI). Then: Linux's MHI core is GPL-2.0, so it cannot be taken; ath11k's own `pci.c`/`mhi.c`

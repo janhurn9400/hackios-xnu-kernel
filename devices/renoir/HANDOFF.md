@@ -28,8 +28,12 @@
   **`pcie=9`** (00:20-00:35): **our MHI reaches M0 and starts the IPCR channels 20/21** (commands complete
   with success); the QRTR hello sent on 20 is not taken yet, while the LOOPBACK channels 0/1 echo our data
   (`pcie_ch=0`): MHI works. **SOLVED 01:30: with MHI started in the SBL (before BHIe; now the default)
-  the WLAN firmware says QRTR hello on IPCR and announces WLFW (service 0x45) at node 7 port 1.** Next: QMI
-  with WLFW over MHI (`hakios.wlfw.c` + an MHI transport), then ath11k_pci (`WIFI.md` step 6).
+  the WLAN firmware says QRTR hello on IPCR and announces WLFW (service 0x45) at node 7 port 1.**
+  **`pcie=10` (09:05): QMI with WLFW works over MHI; the firmware asks for memory (0x4e0000 type 1, 0x398000
+  type 4), as on Android.** Next: answer that (`WIFI.md` step 6), then BDF, M3, mode, ath11k_pci.
+- **The loader now sets the restart reason "bootloader" for every `board=renoir` run** (before the kernel
+  starts; `xnuloader/loader.c` `renoir_fastboot_on_reset()`; image `prebuilt/xnu-usb-renoir-crashlog.img`
+  09:00): a run that dies early also lands in fastboot. The user wants that always: never MagicOS.
   Test runs: `devices/renoir/wifi-run.sh NAME 110 pcie=9 pcie_pause=0` (stage `oem run`, wait, `fastboot reboot-bootloader`,
   crashlog loader, `oem log`). Runs now end with `fastboot reboot-bootloader` from the loader (the reboot reason stays set by
   default: every restart after a run lands in fastboot), then the crashlog loader and `oem log`. Do not use the default `pcie_pause` with `pcie=6` (a long pause hung a config
