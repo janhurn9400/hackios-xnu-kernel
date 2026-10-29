@@ -3891,6 +3891,13 @@ static bool
 radio_map(uint64_t physical, uint64_t size, uint64_t attributes, unsigned long long *address)
 {
 	size = (size + 4095) & ~4095ull;
+	/*
+	 * A megabyte or more on 4 MB (dt: cnss_wlan_region's alignment 0x400000): renoir's firmware, given its two
+	 * pieces at 0xa05a4000 and 0xa0a84000, went into SYS_ERR at once; Android gives them 0xa1000000 and 0xa1800000.
+	 */
+	if (size >= 0x100000) {
+		radio_space.next = (radio_space.next + 0x3fffff) & ~0x3fffffull;
+	}
 	if (radio_space.next + size > RADIO_ADDRESSES_SIZE) {
 		return false;
 	}
