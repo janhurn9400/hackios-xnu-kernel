@@ -3074,6 +3074,85 @@ choose_window(const struct payload_info *pi)
 }
 
 /*
+ * renoir (board=renoir on the command line): whatever restarts the phone during or after this run -- a
+ * crash, the watchdog, "fastboot reboot-bootloader" -- brings it back in fastboot, not in Android (the
+ * user's wish, 2026-10-29). The kernel does the same once it runs (hakios.torch.c), but a run that dies
+ * before that, or in the loader, landed in MagicOS. Both places Xiaomi's boot loader looks at, as Linux's
+ * "reboot bootloader" writes them: IMEM restart_reason (0x146aa65c) = 0x77665500, and the PMK8350's SDAM
+ * register 0x48 bits 7:1 = 2, through the PMIC arbiter (channel found by its peripheral id 0x071).
+ */
+#define RR_IMEM                 0x146aa65cUL
+#define RR_ARB_CORE             0x0c440000UL
+#define RR_ARB_CHNLS            0x0c600000UL
+#define RR_ARB_OBSERVER         0x0e600000UL
+
+static inline uint32_t
+rr_rd(uint64_t at)
+{
+	return *(volatile uint32_t *)(uintptr_t)at;
+}
+
+static inline void
+rr_wr(uint64_t at, uint32_t value)
+{
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(uintptr_t)at = value;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static int
+rr_wait(uint64_t channel)
+{
+	for (int i = 0; i < 20000; i++) {
+		uint32_t status = rr_rd(channel + 0x08);
+
+		if (status & 1) {
+			return (status & 0xe) == 0;
+		}
+	}
+	return 0;
+}
+
+static void
+renoir_fastboot_on_reset(const char *cmdline)
+{
+	const char *want = "board=renoir";
+	int found = 0, channel = -1, written = 0;
+	uint32_t was = 0xff;
+
+	for (const char *c = cmdline; *c && !found; c++) {
+		int n = 0;
+
+		while (want[n] && c[n] == want[n]) {
+			n++;
+		}
+		found = want[n] == 0 && (c[n] == 0 || c[n] == ' ');
+	}
+	if (!found || PLAT != &platform_redwood) {
+		return;
+	}
+	rr_wr(RR_IMEM, 0x77665500);
+	for (int n = 0; n < 512 && channel < 0; n++) {
+		if (((rr_rd(RR_ARB_CORE + 0x900 + 4 * n) >> 8) & 0xfff) == 0x071) {
+			channel = n;
+		}
+	}
+	if (channel >= 0) {
+		uint64_t observer = RR_ARB_OBSERVER + 0x80UL * channel, write = RR_ARB_CHNLS + 0x10000UL * channel;
+
+		rr_wr(observer, 1u << 27 | 0x48u << 4);
+		if (rr_wait(observer)) {
+			was = rr_rd(observer + 0x18) & 0xff;
+			rr_wr(write + 0x10, (was & 1) | 2u << 1);
+			rr_wr(write, 0x48u << 4);
+			written = rr_wait(write);
+		}
+	}
+	print("restart reason: fastboot after any reset (IMEM %x, PMIC channel %d: %x -> %s)\n", rr_rd(RR_IMEM),
+	    (uint64_t)channel, (uint64_t)was, written ? "written" : "NOT WRITTEN");
+}
+
+/*
  * Load and run the kernel from the payload. Returns when the kernel comes
  * back (panic, checkpoint, early exception); the combined log is staged and
  * written to the log partition. Returns 0 if the kernel could not be started.
@@ -3617,6 +3696,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	ba->deviceTreeLength = dt_len;
 	print("device tree %x len %x, boot_args %x, top %x\n", dt_pa, (uint64_t)dt_len, ba_pa, top);
 	print("cmdline: %s\n", ba->commandLine);
+	renoir_fastboot_on_reset(ba->commandLine);
 	if (kernel_mpidr != this_mpidr) {
 		print("the kernel will run on core %x (this is core %x)\n", kernel_mpidr, this_mpidr);
 	}
