@@ -1,5 +1,31 @@
 # Handoff for the next session
 
+## Session 8 (2026-10-30, ~18:30-21:20): brightness, 90 Hz, direct scanout, UniXNU studied
+
+Read `GPU.md` (the last section) and `UNIXNU.md` (the two new sections). Kernel `prebuilt/vm-kernel/mach.development.bcm2837.direct4`
+(21:13), images `prebuilt/sysimg/flashboot-renoir-bright.apfs` and `root-flash-wifi-ssh-bright.apfs` (the brightness hooks).
+
+**Works now**: brightness by the kernel and by iOS's slider (`fb_dsi=1`); the panel at 90 Hz (`fb_panel_hz=90`, visibly
+smoother in `fb_test=1`); direct scanout (`fb_direct=1`: the display controller reads iOS's frames itself, no CPU copy).
+**Not yet**: 90 frames a second in iOS -- CoreAnimation makes at most ~69 (`ca_vbl=1`), ~14 ms a frame; and the picture is
+cropped by ~2 % (not scaled yet).
+
+**The everyday run** stays session 7's with `fb_dsi=1` added (and the `-bright` images): brightness slider, 60 Hz.
+To try 90 Hz: add `fb_panel_hz=90 ca_vbl=1 fb_direct=1` (kernel `.direct4`).
+
+**Learnt the hard way**: the VM has 3 GB: build with `-j3` (a full rebuild with all jobs stopped the VM, and files copied
+just before were lost). `vmx.sh` with `pkill -f xnu-build.sh` kills its own session. In `prlctl exec` HOME is `/`, so
+`THEOS=/theos` (not `/root/theos`) for `userland/build.sh`.
+
+**Next, in order**:
+1. Where CoreAnimation's ~14 ms a frame go (GPU clock and bus votes while it draws, eagl/Mesa time, CPU); then VIG0's
+   QSEED3 lite scaler so the whole picture is shown (1125 x 2436 -> 1080 x 2400).
+2. Merge upstream `main` into `renoir` (the user's wish: after this display work; fetched as `upstream-new/main`).
+3. Bluetooth from the Mi 10 fork (`umi_bluetooth.c`, QCA6390 over UART), then its camera ladder (`cam=1..6`).
+4. Long term: Metal via AdrenoMetal + Turnip (UniXNU; their A650 driver for A6xx), the way to iOS 17+ (`UNIXNU.md`).
+5. Session 7's list: charger throttling, the touch driver's bad SPI reads.
+- A Home app "critical alerts" prompt could not be dismissed in the last run (probably missing Home services, not display).
+
 ## Session 7 (2026-10-29 evening to 10-30 ~02:40): everything that works now, and the everyday run
 
 Read `FLASH.md` (the flash boot, var_store, the run command), then `GPU.md` (the end: fb_scan), `SOUND.md`,

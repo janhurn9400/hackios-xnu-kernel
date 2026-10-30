@@ -92,12 +92,15 @@
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
+#include <sys/errno.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 
@@ -4008,6 +4011,27 @@ hakios_adreno_init(void)
 #define DS_TE_WRITTEN           0x2b0
 #define DS_TE_AUTOREFRESH       0x2b4
 #define RENOIR_PANEL_LINES      2400
+/* DSI0, the panel's link (dt: qcom,mdss_dsi_ctrl0@ae94000, dsi-ctrl-hw-v2.4, as the Mi 10's) */
+#define DS_DSI_PHYS             0x0ae94000UL
+#define DS_DSI_CTRL             0x0004
+#define DS_DSI_STATUS           0x0008
+#define DS_DSI_DMA_CTRL         0x003c
+#define DS_DSI_DMA_LENGTH       0x004c
+#define DS_DSI_TRIG_CTRL        0x0084
+#define DS_DSI_DMA_TRIGGER      0x0090
+#define DS_DSI_INT_CTRL         0x0110
+#define DS_DSI_TPG_CTRL         0x015c
+#define DS_DSI_TPG_DMA_INIT     0x017c
+#define DS_DSI_TPG_FIFO_RESET   0x01ec
+#define DS_DSI_ENABLE           (1u << 0)
+#define DS_DSI_CMD_MODE         (1u << 2)
+#define DS_DSI_BUSY             ((1u << 1) | (1u << 2))  /* the command DMA, the display controller's stream */
+#define DS_DSI_DMA_DONE         (1u << 0)
+#define DS_DSI_ERROR            (1u << 24)              /* not acknowledged by us */
+/* the panel (MagicOS: msm_drm.dsi_display0=qcom,mdss_dsi_k9_42_02_0b_mp_dsc_cmd; fw-display/) */
+#define RENOIR_BL_MIN           1                       /* qcom,mdss-dsi-bl-min-level */
+#define RENOIR_BL_MAX           2047                    /* qcom,mdss-dsi-bl-max-level, mi,max-brightness-clone */
+#define RENOIR_BL_FLOOR         8                       /* our lowest: 0 permille stays faintly lit */
 
 struct hakios_display_scan {
 	int ok;
@@ -4076,6 +4100,8 @@ uint32_t hakios_display_line(uint32_t *frame);
 int hakios_display_wait_lines(uint32_t first, uint32_t last, uint64_t limit_ns);
 uint64_t hakios_display_next_frame_ns(void);
 int hakios_display_wait_copy(uint64_t copy_ns, uint64_t limit_ns);
+int hakios_display_copy(uint8_t *to, const uint8_t *from, uint32_t row_bytes, uint32_t rows, uint64_t copy_ns,
+    uint64_t limit_ns, uint64_t *started, uint64_t *copied_ns);
 int hakios_display_scan_start(void);
 
 int
@@ -4160,6 +4186,111 @@ hakios_display_wait_copy(uint64_t copy_ns, uint64_t limit_ns)
 	}
 }
 
+/*
+ * The staged frame into the panel's memory (for MiniIOMobileFramebuffer.cpp): as wait_copy, then all at once
+ * in the DMA's idle part. At 90 Hz that part is too short (11.1 ms a refresh, the DMA ~8.8 of it: ~2.2 ms
+ * left, the copy 1.3-1.7 ms and its margin over that): then the copy chases the DMA -- it starts while this
+ * refresh is still being read, as soon as the whole copy fits before the next TE, and writes only rows the
+ * DMA has passed (0x2b0, DS_CHASE_ROWS behind), so this refresh still shows the frame before in whole and
+ * the next one this frame. Boot-arg fb_chase: 0 never, 1 always (to try it at 60 Hz), 2 (the default) only
+ * when the idle part cannot hold the copy. 1 when copied; *started when it began, *copied_ns the copying alone.
+ */
+#define DS_CHASE_ROWS           64
+static uint32_t ds_chase = 2;
+static unsigned ds_chases, ds_chases_late;
+
+int
+hakios_display_copy(uint8_t *to, const uint8_t *from, uint32_t row_bytes, uint32_t rows, uint64_t copy_ns,
+    uint64_t limit_ns, uint64_t *started, uint64_t *copied_ns)
+{
+	uint64_t start = mach_absolute_time(), elapsed, budget = copy_ns + copy_ns / 4 + 500000, window, now;
+	uint32_t done = 0, last_phase, phase = 0;
+	int late = 0;
+
+	*copied_ns = 0;
+	if (!ds_scan.ok) {
+		return 0;
+	}
+	window = (uint64_t)(ds_scan.lines - ds_idle_start) * ds_scan.line_ns;
+	if (ds_chase == 0 || (ds_chase == 2 && budget < window)) {
+		if (!hakios_display_wait_copy(copy_ns, limit_ns)) {
+			return 0;
+		}
+		*started = mach_absolute_time();
+		memcpy(to, from, (size_t)row_bytes * rows);
+		__asm__ volatile ("dsb oshst" ::: "memory");
+		absolutetime_to_nanoseconds(mach_absolute_time() - *started, copied_ns);
+		return 1;
+	}
+	/* wait until the whole copy fits before the next TE, wherever the DMA is */
+	for (;;) {
+		uint32_t before = hakios_display_line(NULL);
+		uint64_t used, nap = 50000;
+
+		phase = hakios_display_line(NULL);
+		if (!ds_scan.ok) {
+			return 0;
+		}
+		used = (uint64_t)phase * ds_scan.line_ns;
+		if (phase >= before && used < ds_scan.frame_ns && budget < ds_scan.frame_ns - used) {
+			break;
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
+		if (elapsed >= limit_ns) {
+			return 0;
+		}
+		if (used < ds_scan.frame_ns && ds_scan.frame_ns - used > 400000) {
+			nap = ds_scan.frame_ns - used - 200000;
+		}
+		if (nap > limit_ns - elapsed) {
+			nap = limit_ns - elapsed;
+		}
+		delay_for_interval((uint32_t)((nap + 999) / 1000), NSEC_PER_USEC);
+	}
+	*started = mach_absolute_time();
+	last_phase = phase;
+	while (done < rows) {
+		uint32_t target, written = 0, before = hakios_display_line(NULL);
+
+		/* (the DMA's state read before the phase: a TE between them pairs a stale "done" with a new refresh's start, never the other way) */
+		if (ds_scan.ok) {
+			written = ds_rd(ds_intf, DS_TE_WRITTEN) & 0xffff;
+			phase = hakios_display_line(NULL);
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - *started, &elapsed);
+		if (!ds_scan.ok || before < last_phase || phase < before || elapsed >= limit_ns) {
+			target = rows;          /* lost the scan, or a TE passed: the rest at once (this refresh may show a seam) */
+			late = 1;
+		} else if (written >= ds_scan.shown) {
+			/* done: this refresh's if past where the DMA ends, otherwise the one before's (this one's not begun) */
+			target = phase >= ds_idle_start ? rows : 0;
+		} else {
+			target = (uint32_t)((uint64_t)written * rows / ds_scan.shown);
+			target = target > DS_CHASE_ROWS ? target - DS_CHASE_ROWS : 0;
+		}
+		last_phase = phase;
+		if (target > done) {
+			now = mach_absolute_time();
+			memcpy(to + (size_t)row_bytes * done, from + (size_t)row_bytes * done, (size_t)row_bytes * (target - done));
+			absolutetime_to_nanoseconds(mach_absolute_time() - now, &elapsed);
+			*copied_ns += elapsed;
+			done = target;
+		} else {
+			delay_for_interval(20, NSEC_PER_USEC);
+		}
+	}
+	__asm__ volatile ("dsb oshst" ::: "memory");
+	ds_chases++;
+	if (late && ds_chases_late++ < 8) {
+		printf("display: chased copy %u came too late (a TE passed, or the scan was lost): a seam possible\n", ds_chases);
+	} else if (ds_chases <= 3) {
+		absolutetime_to_nanoseconds(mach_absolute_time() - *started, &elapsed);
+		printf("display: chased copy %u: %llu us copying in %llu us behind the DMA\n", ds_chases, *copied_ns / 1000,
+		    elapsed / 1000);
+	}
+	return 1;
+}
+
 int
 hakios_display_wait_lines(uint32_t first, uint32_t last, uint64_t limit_ns)
 {
@@ -4205,6 +4336,208 @@ hakios_display_next_frame_ns(void)
 	line = hakios_display_line(NULL);
 	return (uint64_t)(ds_scan.lines - line) * ds_scan.line_ns;
 }
+
+/*
+ * Commands to the panel (boot-arg fb_dsi=1): by DSI0's command DMA, the packet's words put in through the test
+ * pattern generator's FIFO (no buffer in memory to point the DMA at), in low-power mode -- as the Mi 10 fork's
+ * umi_dsi_send_backlight (the same controller, v2.4). Sent in the frame DMA's idle part when the scan is known,
+ * so it never meets the frame's stream. words: the packet as the controller takes it (header word: its two data
+ * or word-count bytes, the data type, bit 31 "last", bit 30 "long"; a long one's payload after, padded). 1 if sent.
+ */
+static vm_offset_t ds_dsi;
+static LCK_GRP_DECLARE(ds_dsi_lck_grp, "hakios-dsi");
+static LCK_MTX_DECLARE(ds_dsi_mtx, &ds_dsi_lck_grp);
+
+static int
+ds_dsi_send(const uint32_t *words, uint32_t count)
+{
+	uint32_t old_dma, old_trig;
+	int done = 0;
+
+	if (ds_dsi == 0 || !ds_alive()) {
+		return 0;
+	}
+	if ((ds_rd(ds_dsi, DS_DSI_CTRL) & (DS_DSI_ENABLE | DS_DSI_CMD_MODE)) != (DS_DSI_ENABLE | DS_DSI_CMD_MODE)) {
+		printf("display: DSI0 is not on in command mode (%#x): no command sent\n", ds_rd(ds_dsi, DS_DSI_CTRL));
+		return 0;
+	}
+	if (ds_scan.ok) {
+		(void)hakios_display_wait_copy(500000, 2 * ds_scan.frame_ns);
+	}
+	for (unsigned i = 0;; i++) {
+		if (!ds_alive()) {
+			return 0;
+		}
+		if (!(ds_rd(ds_dsi, DS_DSI_STATUS) & DS_DSI_BUSY)) {
+			break;
+		}
+		if (i == 499) {         /* 25 ms: longer than a refresh's stream (the scan unknown, nothing timed to it) */
+			printf("display: DSI0 stays busy (%#x): no command sent\n", ds_rd(ds_dsi, DS_DSI_STATUS));
+			return 0;
+		}
+		delay_for_interval(50, NSEC_PER_USEC);
+	}
+	old_dma = ds_rd(ds_dsi, DS_DSI_DMA_CTRL);
+	old_trig = ds_rd(ds_dsi, DS_DSI_TRIG_CTRL);
+	ds_wr(ds_dsi, DS_DSI_INT_CTRL, (ds_rd(ds_dsi, DS_DSI_INT_CTRL) & ~DS_DSI_ERROR) | DS_DSI_DMA_DONE);
+	if ((old_trig & 0xf) != 0x4) {
+		ds_wr(ds_dsi, DS_DSI_TRIG_CTRL, (old_trig & ~0xfu) | 0x4);     /* the DMA started by software */
+	}
+	ds_wr(ds_dsi, DS_DSI_TPG_CTRL, 0x00030006);                          /* the DMA's bytes from the FIFO */
+	for (uint32_t i = 0; i < count; i++) {
+		ds_wr(ds_dsi, DS_DSI_TPG_DMA_INIT, words[i]);
+	}
+	ds_wr(ds_dsi, DS_DSI_DMA_CTRL, (old_dma & ~0xc0000000u) | 0x14000000u);  /* embedded, low power, no broadcast */
+	ds_wr(ds_dsi, DS_DSI_DMA_LENGTH, count * 4);
+	ds_wr(ds_dsi, DS_DSI_DMA_TRIGGER, 1);
+	for (unsigned i = 0; i < 100; i++) {
+		if (ds_rd(ds_dsi, DS_DSI_INT_CTRL) & DS_DSI_DMA_DONE) {
+			ds_wr(ds_dsi, DS_DSI_INT_CTRL, (ds_rd(ds_dsi, DS_DSI_INT_CTRL) & ~DS_DSI_ERROR) | DS_DSI_DMA_DONE);
+			done = 1;
+			break;
+		}
+		delay_for_interval(50, NSEC_PER_USEC);
+	}
+	ds_wr(ds_dsi, DS_DSI_TPG_CTRL, 0);
+	ds_wr(ds_dsi, DS_DSI_TPG_FIFO_RESET, 1);
+	delay_for_interval(2, NSEC_PER_USEC);
+	ds_wr(ds_dsi, DS_DSI_TPG_FIFO_RESET, 0);
+	ds_wr(ds_dsi, DS_DSI_DMA_CTRL, old_dma);
+	if ((old_trig & 0xf) != 0x4) {
+		ds_wr(ds_dsi, DS_DSI_TRIG_CTRL, old_trig);
+	}
+	return done;
+}
+
+/*
+ * The refresh rate: timing@0 (60 Hz) and timing@1 (90 Hz) of the panel's node differ, for a command-mode panel,
+ * only in qcom,mdss-dsi-timing-switch-command, "15 01 00 00 11 00 02 2f 0x" in dsi_lp_mode: one DCS short write
+ * with one parameter, 0x2f = 1 (60) or 2 (90), then 17 ms. The same link clock (652 MHz) and DMA in both.
+ * The short write as the node has it changed nothing on renoir (2026-10-30: sent, the TE stayed at 60.45 Hz), so
+ * the forms are tried in turn: 0 the short write, 1 the same bytes as a long write (as 0x51 needed its panel's own
+ * longer form), 2 the long write after the Novatek's page 0 is chosen (f0 55 aa 52 08 00: its on command leaves
+ * page 1 chosen).
+ */
+#define DS_RATE_FORMS           3
+static unsigned ds_rate_form = 1;       /* the form the panel took (renoir: 1, the long write) */
+
+static int
+ds_panel_rate(uint32_t hz, unsigned form)
+{
+	uint32_t value = hz == 90 ? 2u : 1u, words[3];
+	static const uint32_t page0[3] = { 0xc0000000u | (0x39u << 16) | 6, 0x52aa55f0u, 0xffff0008u };
+	static const char *const names[DS_RATE_FORMS] = { "short write", "long write", "page 0, long write" };
+	int ok = 1;
+
+	lck_mtx_lock(&ds_dsi_mtx);
+	if (form == 2) {
+		ok = ds_dsi_send(page0, 3);
+	}
+	if (form == 0) {
+		words[0] = 0x80000000u | (0x15u << 16) | (value << 8) | 0x2fu;
+		ok = ok && ds_dsi_send(words, 1);
+	} else {
+		words[0] = 0xc0000000u | (0x39u << 16) | 2;
+		words[1] = 0xffff0000u | (value << 8) | 0x2fu;
+		ok = ok && ds_dsi_send(words, 2);
+	}
+	lck_mtx_unlock(&ds_dsi_mtx);
+	delay_for_interval(17 + 50, NSEC_PER_MSEC);     /* the panel's 17 ms, then a few refreshes at the new rate */
+	printf("display: panel to %u Hz (DCS 0x2f = %u, %s): %s\n", hz, value, names[form % DS_RATE_FORMS],
+	    ok ? "sent" : "not sent");
+	return ok;
+}
+
+/*
+ * The rate switched while running, for the framebuffer's test pattern (fb_test, MiniIOMobileFramebuffer.cpp):
+ * the panel told, the scan measured again. Only while nothing else uses the scan (before iOS draws).
+ * The rate measured, in mHz; 0 if the scan was lost.
+ */
+uint32_t hakios_display_set_rate(uint32_t hz);
+static int ds_calibrate(void);
+
+uint32_t
+hakios_display_set_rate(uint32_t hz)
+{
+	if (ds_dsi == 0 || ds_intf == 0) {
+		return 0;
+	}
+	(void)ds_panel_rate(hz, ds_rate_form);
+	ds_scan.ok = 0;
+	if (!ds_calibrate()) {
+		ds_intf = 0;
+		return 0;
+	}
+	return ds_scan.millihz;
+}
+
+/*
+ * Brightness: DCS 0x51 (set display brightness), the level high byte first (qcom,mdss-dsi-bl-inverted-dbv),
+ * 1 to 2047 (bl_ctrl_dcs; 4095 is the panel's HBM, mi,mdss-dsi-hbm-on-command). The standard two-byte form
+ * changed nothing on renoir (2026-10-30, level 185 "sent"); the panel's own commands always carry four.
+ * iOS's level (sysctl kern.hakios.brightness, permille, from backboardd: userland/src/inject.c) is close to
+ * perceptual, the panel's value close to linear in light: squared between them. -1 when fb_dsi is not 1.
+ */
+static int ds_brightness = -1;
+static uint32_t ds_brightness_level;
+static unsigned ds_brightness_logged;
+
+static uint32_t
+ds_permille_to_level(int permille)
+{
+	uint32_t level = RENOIR_BL_MIN + (uint32_t)((uint64_t)(RENOIR_BL_MAX - RENOIR_BL_MIN) * (uint32_t)permille *
+	    (uint32_t)permille / 1000000);
+
+	return level < RENOIR_BL_FLOOR ? RENOIR_BL_FLOOR : level > RENOIR_BL_MAX ? RENOIR_BL_MAX : level;
+}
+
+static int
+ds_set_brightness(int permille)
+{
+	uint32_t level, words[3];
+	int ok = 1;
+
+	permille = permille < 0 ? 0 : permille > 1000 ? 1000 : permille;
+	level = ds_permille_to_level(permille);
+	lck_mtx_lock(&ds_dsi_mtx);
+	ds_brightness = permille;
+	if (level != ds_brightness_level) {
+		/* the panel's own form (its on, nolp and hbm commands: "51 07 ff 00 00"): four parameters, the level first */
+		words[0] = 0xc0000000u | (0x39u << 16) | 5;                    /* DCS long write, 5 bytes */
+		words[1] = ((level & 0xff) << 16) | ((level >> 8) << 8) | 0x51;
+		words[2] = 0xffffff00u;
+		ok = ds_dsi_send(words, 3);
+		if (ok) {
+			ds_brightness_level = level;
+		}
+		if (ds_brightness_logged < 8 || !ok) {
+			ds_brightness_logged++;
+			printf("display: brightness %d permille -> DCS 0x51 %u (%s)\n", permille, level, ok ? "sent" : "not sent");
+		}
+	}
+	lck_mtx_unlock(&ds_dsi_mtx);
+	return ok;
+}
+
+SYSCTL_DECL(_kern_hakios);
+
+static int
+ds_sysctl_brightness(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = ds_brightness, error = sysctl_io_number(req, value, sizeof(value), &value, NULL);
+
+	if (error != 0 || req->newptr == 0) {
+		return error;
+	}
+	if (ds_brightness < 0) {
+		return ENODEV;
+	}
+	(void)ds_set_brightness(value);
+	return 0;
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    NULL, 0, ds_sysctl_brightness, "I", "display brightness in permille (0..1000); -1: no DSI commands (fb_dsi=1)");
 
 /* the TE's period and the DMA's busy part measured over four refreshes (150 ms at most) */
 static int
@@ -4295,6 +4628,298 @@ ds_calibrate(void)
 	return 1;
 }
 
+/*
+ * Boot-arg fb_dpu_probe=1: how the boot firmware set up the display controller, read only, once -- for frames
+ * fetched by the controller itself (direct scanout) in place of the copy. renoir's DT (mdss_mdp@ae00000): the
+ * pipes vig0, vig1, dma0, dma1, dma2 at 0x5000, 0x7000, 0x25000, 0x27000, 0x29000; CTL 0..3 at 0x2000 + 0x200 n;
+ * mixers at 0x45000 + 0x1000 n. The display's SMMU stream: apps SMMU (0x15000000) SID 0x800 mask 0x402.
+ */
+#define DS_MDP_PHYS             0x0ae00000UL
+#define DS_APPS_SMMU_PHYS       0x15000000UL
+
+static void
+ds_dump(const char *what, vm_offset_t base, uint32_t from, uint32_t to)
+{
+	for (uint32_t at = from; at < to; at += 0x20) {
+		printf("display: dpu %s +%#05x: %08x %08x %08x %08x %08x %08x %08x %08x\n", what, at,
+		    ds_rd(base, at), ds_rd(base, at + 4), ds_rd(base, at + 8), ds_rd(base, at + 12),
+		    ds_rd(base, at + 16), ds_rd(base, at + 20), ds_rd(base, at + 24), ds_rd(base, at + 28));
+	}
+}
+
+static void
+ds_dpu_probe(void)
+{
+	static const uint32_t pipes[5] = { 0x5000, 0x7000, 0x25000, 0x27000, 0x29000 };
+	static const char *const names[5] = { "vig0", "vig1", "dma0", "dma1", "dma2" };
+	vm_offset_t mdp = ml_io_map(DS_MDP_PHYS, 0x50000), smmu = ml_io_map(DS_APPS_SMMU_PHYS, 0x1000);
+	uint32_t idr0, idr1, groups, page, pages;
+
+	if (mdp == 0 || smmu == 0 || !ds_alive()) {
+		printf("display: dpu probe: not mapped or the display's clocks are off\n");
+		return;
+	}
+	ds_dump("top", mdp, 0x1000, 0x1040);
+	for (unsigned p = 0; p < 5; p++) {
+		ds_dump(names[p], mdp, pipes[p], pipes[p] + 0x40);
+		if (p < 2) {
+			ds_dump(names[p], mdp, pipes[p] + 0xa00, pipes[p] + 0xa20);      /* its scaler (QSEED3 lite) */
+		}
+	}
+	for (unsigned c = 0; c < 2; c++) {
+		ds_dump(c ? "ctl1" : "ctl0", mdp, 0x2000 + 0x200 * c, 0x2000 + 0x200 * c + 0x80);
+	}
+	for (unsigned m = 0; m < 2; m++) {
+		ds_dump(m ? "lm1" : "lm0", mdp, 0x45000 + 0x1000 * m, 0x45000 + 0x1000 * m + 0x40);
+	}
+	/* the SMMU: which stream mapping group takes SID 0x800, and what its context bank does */
+	idr0 = ds_rd(smmu, 0x20);
+	idr1 = ds_rd(smmu, 0x24);
+	groups = idr0 & 0xff;
+	page = (idr1 >> 31) ? 0x10000 : 0x1000;
+	pages = 1u << (((idr1 >> 28) & 7) + 1);
+	printf("display: dpu smmu: idr0 %#x idr1 %#x: %u stream groups, %u-byte pages, context banks from %#x\n", idr0, idr1,
+	    groups, page, pages * page);
+	for (uint32_t g = 0; g < groups && g < 128; g++) {
+		uint32_t smr = ds_rd(smmu, 0x800 + 4 * g), id = smr & 0xffff, mask = (smr >> 16) & 0x7fff;
+
+		if (!(smr >> 31) || ((0x800 ^ id) & ~mask & 0x7fff) != 0) {
+			continue;
+		}
+		uint32_t s2cr = ds_rd(smmu, 0xc00 + 4 * g), cb = s2cr & 0xff;
+		printf("display: dpu smmu: group %u smr %#x (id %#x mask %#x) s2cr %#x: %s, bank %u\n", g, smr, id, mask, s2cr,
+		    ((s2cr >> 16) & 3) == 0 ? "translate" : ((s2cr >> 16) & 3) == 1 ? "bypass" : "fault", cb);
+		if (((s2cr >> 16) & 3) == 0) {
+			vm_offset_t bank = ml_io_map(DS_APPS_SMMU_PHYS + pages * page + cb * page, 0x1000);
+
+			if (bank != 0) {
+				printf("display: dpu smmu bank %u: sctlr %#x tcr %#x tcr2 %#x ttbr0 %#x%08x mair0 %#x fsr %#x far %#x%08x\n",
+				    cb, ds_rd(bank, 0x0), ds_rd(bank, 0x30), ds_rd(bank, 0x10), ds_rd(bank, 0x24), ds_rd(bank, 0x20),
+				    ds_rd(bank, 0x38), ds_rd(bank, 0x58), ds_rd(bank, 0x64), ds_rd(bank, 0x60));
+			}
+		}
+	}
+}
+
+/*
+ * Direct scanout (boot-arg fb_direct=1; MiniIOMobileFramebuffer.cpp): the frame is not copied, the display
+ * controller's pipe is pointed at it. What fb_dpu_probe found on renoir: the boot firmware shows its picture
+ * through VIG0 alone (source 0xe1000000, 4320-byte rows, 1080 x 2400 in and out, the scaler off), and the
+ * display's SMMU context (apps SMMU bank 4, SID 0x800) has translation off: the pipe takes physical addresses.
+ * Its registers are double-buffered: written, then taken at the next refresh's start once CTL0's flush bit for
+ * the pipe is set (command mode: the panel's TE starts every refresh by itself); the bit clears when they are.
+ * Until then the pipe still reads the frame before. Boot-arg fb_direct_flush: the flush bits (VIG0 alone, 1,
+ * by default; 0x20001 adds the CTL's own bit if the pipe's alone never takes).
+ */
+#define DS_VIG0                 0x5000
+#define DS_SSPP_SRC_SIZE        0x00
+#define DS_SSPP_SRC_XY          0x08
+#define DS_SSPP_OUT_SIZE        0x0c
+#define DS_SSPP_SRC0_ADDR       0x14
+#define DS_SSPP_YSTRIDE0        0x24
+#define DS_CTL0_FLUSH           0x2018
+
+static vm_offset_t ds_mdp;
+static uint32_t ds_boot_addr, ds_boot_stride, ds_boot_size, ds_boot_xy, ds_flush_bits = 1;
+
+/*
+ * The display's addresses. Its frames are iOS's surfaces, scattered pages above 4 GB, but the pipe takes 32-bit
+ * addresses and its SMMU context did no translation: so the context is given tables of ours (as the GPU's in
+ * space_on(), the same MMU-500 behind the same hypervisor, but only the context's own registers and its CBAR;
+ * the stream already goes through it: group 4, SID 0x800 -> bank 4). The boot picture (the splash region,
+ * 0xe1000000 + 35 MB) is mapped at its own address, so the panel goes on showing it when translation comes on;
+ * each surface is mapped into one of DS_SLOTS windows of 16 MB below that, page by page, uncached (the display
+ * reads memory, not the processors' caches; the GPU writes it).
+ */
+#define DS_SPLASH_PHYS          0xe1000000ULL
+#define DS_SPLASH_SIZE          0x2300000ULL
+#define DS_SLOTS                4
+#define DS_SLOT_BASE            0x40000000U
+#define DS_SLOT_SIZE            0x01000000U
+#define DS_DISPLAY_BANK         4
+#define DS_PTE                  (PTE_ACCESSED | PTE_UNPRIVILEGED)       /* attribute 0: uncached */
+
+static struct gpu_space ds_space = { .name = "the display", .context = DS_DISPLAY_BANK };
+static vm_offset_t ds_smmu_bank;
+
+static void
+ds_smmu_flush(void)
+{
+	ds_wr(ds_smmu_bank, SMMU_CB_TLBIASID, DS_DISPLAY_BANK);
+	ds_wr(ds_smmu_bank, SMMU_CB_TLBSYNC, 1);
+	for (unsigned i = 0; i < 1000 && (ds_rd(ds_smmu_bank, SMMU_CB_TLBSTATUS) & 1); i++) {
+		delay_for_interval(1, NSEC_PER_USEC);
+	}
+}
+
+static int
+ds_smmu_on(void)
+{
+	vm_offset_t global = ml_io_map(DS_APPS_SMMU_PHYS, 0x1000), second;
+	uint32_t idr1, page, pages, cbar, cba2r, sctlr;
+	uint64_t root;
+
+	if (global == 0) {
+		return 0;
+	}
+	idr1 = ds_rd(global, 0x24);
+	page = (idr1 >> 31) ? 0x10000 : 0x1000;
+	pages = 1u << (((idr1 >> 28) & 7) + 1);
+	second = ml_io_map(DS_APPS_SMMU_PHYS + page, 0x1000);
+	ds_smmu_bank = ml_io_map(DS_APPS_SMMU_PHYS + (uint64_t)(pages + DS_DISPLAY_BANK) * page, 0x1000);
+	if (second == 0 || ds_smmu_bank == 0) {
+		return 0;
+	}
+	cbar = ds_rd(second, SMMU_CBAR(DS_DISPLAY_BANK));
+	cba2r = ds_rd(second, SMMU_CBA2R(DS_DISPLAY_BANK));
+	sctlr = ds_rd(ds_smmu_bank, SMMU_CB_SCTLR);
+	printf("display: smmu bank %u before: cbar %#x cba2r %#x sctlr %#x\n", DS_DISPLAY_BANK, cbar, cba2r, sctlr);
+	if (sctlr & 1) {
+		printf("display: smmu bank %u translates already: left alone, no direct scanout\n", DS_DISPLAY_BANK);
+		return 0;
+	}
+	for (uint64_t at = 0; at < DS_SPLASH_SIZE; at += 4096) {
+		if (!space_map(&ds_space, DS_SPLASH_PHYS + at, DS_SPLASH_PHYS + at, DS_PTE)) {
+			return 0;
+		}
+	}
+	for (uint32_t i = 0; i < ds_space.table_count; i++) {
+		to_memory((vm_offset_t)ds_space.tables[i].table, 4096);
+		ds_space.tables[i].changed = false;
+	}
+	root = ds_space.tables[0].phys | (uint64_t)DS_DISPLAY_BANK << 48;
+	if (!(cba2r & SMMU_CBA2R_64_BIT)) {
+		ds_wr(second, SMMU_CBA2R(DS_DISPLAY_BANK), cba2r | SMMU_CBA2R_64_BIT);
+	}
+	if ((cbar & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000)) {
+		ds_wr(second, SMMU_CBAR(DS_DISPLAY_BANK), SMMU_CBAR_STAGE_1);
+	}
+	ds_wr(ds_smmu_bank, SMMU_CB_TCR2, SMMU_TCR2);
+	ds_wr(ds_smmu_bank, SMMU_CB_TCR, SMMU_TCR_39_BITS);
+	ds_wr(ds_smmu_bank, SMMU_CB_TTBR0, (uint32_t)root);
+	ds_wr(ds_smmu_bank, SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32));
+	ds_wr(ds_smmu_bank, SMMU_CB_TTBR1, 0);
+	ds_wr(ds_smmu_bank, SMMU_CB_TTBR1 + 4, 0);
+	ds_wr(ds_smmu_bank, SMMU_CB_MAIR0, SMMU_MAIR0);
+	ds_wr(ds_smmu_bank, SMMU_CB_MAIR1, 0);
+	ds_wr(ds_smmu_bank, SMMU_CB_FSR, SMMU_FSR_ALL);
+	ds_smmu_flush();
+	ds_wr(ds_smmu_bank, SMMU_CB_SCTLR, SMMU_SCTLR_ON);
+	delay_for_interval(50, NSEC_PER_MSEC);          /* three refreshes through the tables */
+	printf("display: smmu bank %u now: cbar %#x cba2r %#x sctlr %#x tcr %#x ttbr0 %#x%08x fsr %#x far %#x%08x\n",
+	    DS_DISPLAY_BANK, ds_rd(second, SMMU_CBAR(DS_DISPLAY_BANK)), ds_rd(second, SMMU_CBA2R(DS_DISPLAY_BANK)),
+	    ds_rd(ds_smmu_bank, SMMU_CB_SCTLR), ds_rd(ds_smmu_bank, SMMU_CB_TCR), ds_rd(ds_smmu_bank, SMMU_CB_TTBR0 + 4),
+	    ds_rd(ds_smmu_bank, SMMU_CB_TTBR0), ds_rd(ds_smmu_bank, SMMU_CB_FSR), ds_rd(ds_smmu_bank, SMMU_CB_FAR + 4),
+	    ds_rd(ds_smmu_bank, SMMU_CB_FAR));
+	if (!(ds_rd(ds_smmu_bank, SMMU_CB_SCTLR) & 1) || (ds_rd(ds_smmu_bank, SMMU_CB_FSR) & SMMU_FSR_ALL)) {
+		printf("display: the display's translation did not come on cleanly: off again, no direct scanout\n");
+		ds_wr(ds_smmu_bank, SMMU_CB_SCTLR, sctlr);
+		return 0;
+	}
+	return 1;
+}
+
+/* A frame's pages (4K each) into a slot: the display's address of it, 0 if it does not fit */
+uint32_t hakios_display_map_slot(unsigned slot, const uint64_t *pages, uint32_t count);
+
+uint32_t
+hakios_display_map_slot(unsigned slot, const uint64_t *pages, uint32_t count)
+{
+	uint32_t base = DS_SLOT_BASE + slot * DS_SLOT_SIZE;
+
+	if (ds_smmu_bank == 0 || slot >= DS_SLOTS || (uint64_t)count * 4096 > DS_SLOT_SIZE) {
+		return 0;
+	}
+	for (uint32_t i = 0; i < DS_SLOT_SIZE / 4096; i++) {
+		if (!space_map(&ds_space, base + (uint64_t)i * 4096, i < count ? pages[i] : 0, i < count ? DS_PTE : 0)) {
+			return 0;
+		}
+	}
+	space_commit(&ds_space);
+	ds_smmu_flush();
+	return base;
+}
+
+int hakios_display_direct_start(void);
+uint64_t hakios_display_flip(uint32_t pa, uint32_t stride, uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+    uint64_t limit_ns);
+uint64_t hakios_display_flip_boot(void);
+
+int
+hakios_display_direct_start(void)
+{
+	if (ds_mdp != 0) {
+		return 1;
+	}
+	if (!ds_scan.ok || !ds_alive()) {
+		return 0;
+	}
+	ds_mdp = ml_io_map(DS_MDP_PHYS, 0x8000);
+	if (ds_mdp == 0) {
+		return 0;
+	}
+	ds_boot_addr = ds_rd(ds_mdp, DS_VIG0 + DS_SSPP_SRC0_ADDR);
+	ds_boot_stride = ds_rd(ds_mdp, DS_VIG0 + DS_SSPP_YSTRIDE0);
+	ds_boot_size = ds_rd(ds_mdp, DS_VIG0 + DS_SSPP_SRC_SIZE);
+	ds_boot_xy = ds_rd(ds_mdp, DS_VIG0 + DS_SSPP_SRC_XY);
+	(void)PE_parse_boot_argn("fb_direct_flush", &ds_flush_bits, sizeof(ds_flush_bits));
+	if (ds_boot_addr == 0 || ds_boot_size != ds_rd(ds_mdp, DS_VIG0 + DS_SSPP_OUT_SIZE)) {
+		printf("display: direct scanout: VIG0 is not as fb_dpu_probe found it (address %#x, size %#x, out %#x): off\n",
+		    ds_boot_addr, ds_boot_size, ds_rd(ds_mdp, DS_VIG0 + DS_SSPP_OUT_SIZE));
+		ds_mdp = 0;
+		return 0;
+	}
+	if (!ds_smmu_on()) {
+		ds_mdp = 0;
+		return 0;
+	}
+	printf("display: direct scanout: VIG0 shows %#x (rows of %u bytes, %ux%u); frames go to it by their own address, "
+	    "flush bits %#x (fb_direct=1)\n", ds_boot_addr, ds_boot_stride & 0xffff, ds_boot_size & 0xffff, ds_boot_size >> 16,
+	    ds_flush_bits);
+	return 1;
+}
+
+/* VIG0 to a frame (its rows from x, y on, width x height of them: the panel's size); how long it took to be taken, 0 if not */
+uint64_t
+hakios_display_flip(uint32_t pa, uint32_t stride, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint64_t limit_ns)
+{
+	uint64_t start, waited = 0;
+
+	if (ds_mdp == 0 || !ds_alive()) {
+		return 0;
+	}
+	ds_wr(ds_mdp, DS_VIG0 + DS_SSPP_SRC0_ADDR, pa);
+	ds_wr(ds_mdp, DS_VIG0 + DS_SSPP_YSTRIDE0, (ds_rd(ds_mdp, DS_VIG0 + DS_SSPP_YSTRIDE0) & 0xffff0000u) | (stride & 0xffff));
+	ds_wr(ds_mdp, DS_VIG0 + DS_SSPP_SRC_XY, y << 16 | x);
+	ds_wr(ds_mdp, DS_VIG0 + DS_SSPP_SRC_SIZE, height << 16 | width);
+	ds_wr(ds_mdp, DS_CTL0_FLUSH, ds_flush_bits);
+	start = mach_absolute_time();
+	while (waited < limit_ns) {
+		if (!ds_alive()) {
+			return 0;
+		}
+		if (!(ds_rd(ds_mdp, DS_CTL0_FLUSH) & ds_flush_bits)) {
+			return waited ? waited : 1;
+		}
+		delay_for_interval(100, NSEC_PER_USEC);
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &waited);
+	}
+	printf("display: direct scanout: the flush (%#x) was not taken in %llu ms (CTL0 flush now %#x)\n", ds_flush_bits,
+	    limit_ns / 1000000, ds_rd(ds_mdp, DS_CTL0_FLUSH));
+	return 0;
+}
+
+/* VIG0 back to the boot firmware's picture (the copy path draws there) */
+uint64_t
+hakios_display_flip_boot(void)
+{
+	if (ds_mdp == 0) {
+		return 0;
+	}
+	return hakios_display_flip(ds_boot_addr, ds_boot_stride, ds_boot_xy & 0xffff, ds_boot_xy >> 16, ds_boot_size & 0xffff,
+	           ds_boot_size >> 16, 50000000);
+}
+
 int
 hakios_display_scan_start(void)
 {
@@ -4335,6 +4960,49 @@ hakios_display_scan_start(void)
 	if (!ds_calibrate()) {
 		ds_intf = 0;
 		return 0;
+	}
+	(void)PE_parse_boot_argn("fb_chase", &ds_chase, sizeof(ds_chase));
+	if (PE_parse_boot_argn("fb_dpu_probe", &on, sizeof(on)) && on == 1) {
+		ds_dpu_probe();
+	}
+	if (PE_parse_boot_argn("fb_dsi", &on, sizeof(on)) && on == 1) {
+		uint32_t hz = 60, permille = 600;
+
+		ds_dsi = ml_io_map(DS_DSI_PHYS, 0x1000);
+		/* fb_panel_hz=90: the panel switched, then the scan measured again (fb_scan's rate is then 90) */
+		if (ds_dsi != 0 && PE_parse_boot_argn("fb_panel_hz", &hz, sizeof(hz)) && hz == 90) {
+			unsigned form;
+
+			for (form = 0; form < DS_RATE_FORMS; form++) {
+				if (!ds_panel_rate(90, form)) {
+					continue;
+				}
+				ds_scan.ok = 0;
+				if (ds_calibrate() && ds_scan.millihz >= 80000) {
+					ds_rate_form = form;
+					break;
+				}
+				printf("display: the panel did not come to 90 Hz (%s)\n",
+				    ds_scan.ok ? "its TE stayed slower" : "no scan at the new rate");
+				if (!ds_scan.ok) {
+					break;
+				}
+			}
+			if (!ds_scan.ok || ds_scan.millihz < 80000) {
+				printf("display: back to 60 Hz\n");
+				ds_scan.ok = 0;
+				(void)ds_panel_rate(60, form < DS_RATE_FORMS ? form : 1);
+				if (!ds_calibrate()) {
+					ds_intf = 0;
+					return 0;
+				}
+			}
+		}
+		/* fb_bright=N: the brightness at start, permille (600 without it); iOS's slider takes over after */
+		(void)PE_parse_boot_argn("fb_bright", &permille, sizeof(permille));
+		if (ds_dsi != 0) {
+			(void)ds_set_brightness((int)(permille > 1000 ? 1000 : permille));
+		}
 	}
 	return 1;
 }

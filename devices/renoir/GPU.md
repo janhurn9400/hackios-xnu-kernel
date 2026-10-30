@@ -98,3 +98,28 @@ refresh notifications from the TE). Boot-arg `fb_scan=1` with `board=renoir`; no
   once this refresh's DMA is done and before the next TE. **The user: no more tearing.**
 - With it: `fb_threads=6 fb_filter=0` (the same fork's boot.args). Kernel `prebuilt/vm-kernel/mach.development.bcm2837`
   (= `.fbscan`, 02:30).
+
+## Brightness, 90 Hz and direct scanout (2026-10-30, session 8)
+
+All in the `fb_scan` part of `hakios.adreno.c` and in `MiniIOMobileFramebuffer.cpp`; nothing changes without the boot-args.
+
+- **Panel commands** (`fb_dsi=1`): DSI0's command DMA, the packet fed through the test pattern generator's FIFO, low-power
+  mode (after the Mi 10 fork's `umi_dsi_send_backlight`, the same DSI v2.4). renoir's panel (Novatek,
+  `mdss_dsi_k9_42_02_0b_mp_dsc_cmd`) **ignores short and two-byte forms**: both 0x51 with two bytes and the node's own short
+  write of 0x2F changed nothing while the controller said "sent"; only long writes are taken.
+- **Brightness**: DCS 0x51 as the panel's own commands write it, `51 hi lo 00 00`, level 1..2047 (the boot loader leaves
+  307). Permille to level squared. `fb_bright=N` at start; sysctl `kern.hakios.brightness` (-1 without `fb_dsi=1`); iOS's
+  slider through backboardd hooks in `userland/src/inject.c` (from the Mi 10 fork; installed only when the sysctl answers).
+  Verified: slider -> `display: brightness 385 permille -> DCS 0x51 304 (sent)`, the panel follows.
+- **90 Hz** (`fb_panel_hz=90`): 0x2F = 2 as a long write; the TE then runs at 90.8 Hz, fb_scan measures it again and
+  publishes 91. Visible with `fb_test=1` (a bar redrawn every refresh before iOS starts, 90/60/90 Hz in turn): smoother at
+  90. At 90 Hz the copy chases the DMA (`fb_chase`, 64 rows behind 0x2b0): the idle part of a refresh is too short.
+- **Direct scanout** (`fb_direct=1`): `fb_dpu_probe=1` found VIG0 alone showing the boot picture (0xe1000000, 4320-byte rows,
+  scaler off) and the display's SMMU context (apps SMMU bank 4, SID 0x800) with translation off. The pipe's address
+  register is 32 bits and XNU's RAM starts at 0xf4000000 (its first 192 MB full): so bank 4 gets tables of ours (as the
+  GPU's, `space_map`), the splash region at its own address, each iOS surface in one of 4 windows of 16 MB at 0x40000000+.
+  A swap of one whole-screen BGRA surface: map (once per surface memory), VIG0 address/stride/crop, CTL0 flush bit 0, wait
+  until it clears (the next TE). Measured: **every frame direct**, 3-5 ms in the driver instead of 10-12. Not scaled yet:
+  the middle 1080 x 2400 of iOS's 1125 x 2436 is shown (VIG0's QSEED3 lite scaler is the next step).
+- **The limit now is iOS itself**: with `ca_vbl=1` CoreAnimation follows the 90 Hz refreshes but makes at most ~69 frames a
+  second (about 14 ms a frame, 3.5-4.8 of them waiting for the GPU). Without `ca_vbl=1` it stays at 60.

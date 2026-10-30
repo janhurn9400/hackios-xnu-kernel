@@ -50,6 +50,89 @@ extern "C" int hakios_display_wait_lines(uint32_t first, uint32_t last, uint64_t
 extern "C" uint64_t hakios_display_next_frame_ns(void);
 extern "C" int hakios_display_command_mode(void);
 extern "C" int hakios_display_wait_copy(uint64_t copy_ns, uint64_t limit_ns);
+extern "C" uint32_t hakios_display_set_rate(uint32_t hz);
+extern "C" int hakios_display_direct_start(void);
+extern "C" uint64_t hakios_display_flip(uint32_t pa, uint32_t stride, uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+    uint64_t limit_ns);
+extern "C" uint64_t hakios_display_flip_boot(void);
+extern "C" uint32_t hakios_display_map_slot(unsigned slot, const uint64_t * pages, uint32_t count);
+/*
+ * Boot-arg fb_direct=1 (renoir, with fb_scan=1): a frame of one layer, a whole-screen BGRA surface, is not
+ * copied: its pages are mapped for the display (one of four windows of the display's SMMU context, kept while
+ * the surface's memory is the same) and the display controller's pipe is pointed at it (hakios.adreno.c,
+ * hakios_display_map_slot, hakios_display_flip); it takes it at the next refresh.
+ * The surface is held until the next one has been taken. Not scaled yet: the middle
+ * of a surface larger than the panel is shown (iOS's 1125 x 2436 on 1080 x 2400: 22 columns and 18 rows off
+ * each side). Any other frame goes the old way, the pipe back on the boot picture first.
+ */
+static TUNABLE(uint32_t, gDirect, "fb_direct", 0);
+static bool gDirectOn;
+static MiniIOSurface * gDirectShown;            /* held while the pipe reads it */
+static uint32_t gDirectFlips, gDirectBack, gDirectNot;
+static uint64_t gDirectLatchNs, gDirectLatchMax;
+#define DIRECT_SLOTS            4
+static struct {
+	IOBufferMemoryDescriptor * memory;      /* held while mapped */
+	uint32_t address;                       /* the display's */
+	uint64_t used;
+} gDirectSlot[DIRECT_SLOTS];
+static int gDirectShownSlot = -1;
+static uint64_t gDirectPages[4096], gDirectClock;
+static uint32_t gDirectMapped;
+
+/* The display's address of a surface's pixels: its window, mapped if it has none yet; 0 if it cannot have one. */
+static uint32_t
+directAddress(MiniIOSurface * s)
+{
+	IOBufferMemoryDescriptor * memory = s->memory;
+	int pick = -1;
+	uint32_t count = 0, address;
+
+	if (s->client != NULL || memory == NULL || s->info.offset != 0) {
+		return 0;
+	}
+	gDirectClock++;
+	for (int i = 0; i < DIRECT_SLOTS; i++) {
+		if (gDirectSlot[i].memory == memory) {
+			gDirectSlot[i].used = gDirectClock;
+			return gDirectSlot[i].address;
+		}
+	}
+	for (int i = 0; i < DIRECT_SLOTS; i++) {
+		if (i != gDirectShownSlot && (pick < 0 || gDirectSlot[i].memory == NULL ||
+		    (gDirectSlot[pick].memory != NULL && gDirectSlot[i].used < gDirectSlot[pick].used))) {
+			pick = i;
+		}
+	}
+	for (IOByteCount at = PAGE_SIZE; at < PAGE_SIZE + (IOByteCount) s->info.allocSize && count < 4096;) {
+		IOByteCount length = 0;
+		addr64_t pa = memory->getPhysicalSegment(at, &length, kIOMemoryMapperNone);
+
+		if (pa == 0 || (pa & 4095) || length == 0) {
+			return 0;
+		}
+		for (IOByteCount in = 0; in < length && at + in < PAGE_SIZE + s->info.allocSize && count < 4096; in += 4096) {
+			gDirectPages[count++] = pa + in;
+		}
+		at += length;
+	}
+	address = hakios_display_map_slot((unsigned) pick, gDirectPages, count);
+	if (address == 0) {
+		return 0;
+	}
+	if (gDirectSlot[pick].memory != NULL) {
+		gDirectSlot[pick].memory->release();
+	}
+	memory->retain();
+	gDirectSlot[pick].memory = memory;
+	gDirectSlot[pick].address = address;
+	gDirectSlot[pick].used = gDirectClock;
+	gDirectMapped++;
+	return address;
+}
+static void fbTest(uint8_t * base, uint32_t rowBytes, uint32_t width, uint32_t height);
+extern "C" int hakios_display_copy(uint8_t * to, const uint8_t * from, uint32_t row_bytes, uint32_t rows,
+    uint64_t copy_ns, uint64_t limit_ns, uint64_t * started, uint64_t * copied_ns);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -517,6 +600,15 @@ IOMobileFramebuffer::start(IOService * provider)
 			gScanHz = (scan->millihz + 500) / 1000;
 		}
 		IOLog("MiniIOMobileFramebuffer: frames follow the panel's scan, at %u a second\n", refreshHz());
+		uint32_t test = 0;
+		if (PE_parse_boot_argn("fb_test", &test, sizeof(test)) && test == 1) {
+			fbTest(fBase, fRowBytes, fPanelWidth, fPanelHeight);
+			if ((scan = hakios_display_scan()) != NULL && !PE_parse_boot_argn("fb_hz", &hz, sizeof(hz)))
+				gScanHz = (scan->millihz + 500) / 1000;
+		}
+		if (gDirect == 1 && hakios_display_command_mode()) {
+			gDirectOn = hakios_display_direct_start() != 0;
+		}
 		if (hakios_display_command_mode()) {
 			uint64_t bytes = (uint64_t)fRowBytes * fPanelHeight;
 			if (bytes <= 64 * 1024 * 1024)
@@ -533,6 +625,75 @@ IOMobileFramebuffer::start(IOService * provider)
 	setName("disp0");
 	registerService();
 	return true;
+}
+
+/*
+ * Boot-arg fb_test=1 (with fb_scan=1 fb_dsi=1): the panel's rate seen without iOS. Before anything else is drawn, a
+ * bar crosses a black screen at the same speed in pixels a second, redrawn every refresh -- only its strip, so never
+ * late -- for 6 s each at 90 Hz (green), 60 Hz (red), 90 Hz (green) again; the kernel switches the panel between
+ * them. Then the boot goes on. The colours as the boot framebuffer has them (32-bit, blue in the low byte).
+ */
+#define FB_TEST_BAR             48
+#define FB_TEST_SPEED           960                     /* pixels a second */
+#define FB_TEST_SECONDS         6
+
+static void
+fbTestBar(uint8_t * base, uint32_t rowBytes, uint32_t height, uint32_t x, uint32_t colour)
+{
+	for (uint32_t y = 0; y < height; y++) {
+		uint32_t * row = (uint32_t *)(base + (size_t)y * rowBytes) + x;
+		for (uint32_t i = 0; i < FB_TEST_BAR; i++) {
+			row[i] = colour;
+		}
+	}
+}
+
+static void
+fbTest(uint8_t * base, uint32_t rowBytes, uint32_t width, uint32_t height)
+{
+	static const uint32_t rates[3] = { 90, 60, 90 };
+	uint32_t old = 0, drawn_any = 0;
+
+	PE_initialize_console(NULL, kPEGraphicsMode);   /* the text console stops drawing over it */
+	for (uint32_t y = 0; y < height; y++) {
+		memset(base + (size_t)y * rowBytes, 0, (size_t)width * 4);
+	}
+	for (unsigned phase = 0; phase < 3; phase++) {
+		uint32_t millihz = hakios_display_set_rate(rates[phase]), colour = rates[phase] == 90 ? 0xff00ff00 : 0xffff0000;
+		uint32_t frames = 0, missed = 0;
+		uint64_t start = mach_absolute_time(), elapsed = 0;
+		const struct hakios_display_scan * scan = hakios_display_scan();
+
+		if (millihz == 0 || scan == NULL) {
+			IOLog("MiniIOMobileFramebuffer: fb_test: no scan at %u Hz; the test ends\n", rates[phase]);
+			return;
+		}
+		while (elapsed < (uint64_t)FB_TEST_SECONDS * NSEC_PER_SEC) {
+			uint32_t x;
+
+			/* the next refresh's start, then its DMA done: the strip changed between two reads of the panel */
+			(void)hakios_display_wait_lines(0, 64, scan->frame_ns * 2);
+			if (!hakios_display_wait_copy(200000, scan->frame_ns * 2)) {
+				missed++;
+				continue;
+			}
+			absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
+			x = (uint32_t)(elapsed * FB_TEST_SPEED / NSEC_PER_SEC % (width - FB_TEST_BAR));
+			if (drawn_any) {
+				fbTestBar(base, rowBytes, height, old, 0);
+			}
+			fbTestBar(base, rowBytes, height, x, colour);
+			__asm__ volatile("dsb oshst" ::: "memory");
+			old = x;
+			drawn_any = 1;
+			frames++;
+		}
+		IOLog("MiniIOMobileFramebuffer: fb_test: %u Hz asked, the panel's TE at %u.%03u Hz: %u refreshes drawn in %u s, "
+		    "%u missed\n", rates[phase], millihz / 1000, millihz % 1000, frames, FB_TEST_SECONDS, missed);
+	}
+	for (uint32_t y = 0; y < height; y++) {
+		memset(base + (size_t)y * rowBytes, 0, (size_t)width * 4);
+	}
 }
 
 /* Keep a small copy of the frame that is about to be shown (the surface is the whole screen). */
@@ -1023,7 +1184,79 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
-	if (hakios_display_scan() != NULL && !hakios_display_command_mode()) {
+	bool direct = false;
+	if (gDirectOn) {
+		MiniIOSurface * s = surfaces[0];
+		int32_t src[4], dst[4];
+		uint64_t pa = 0, latch;
+		bool alone = true;
+
+		memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
+		memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
+		for (unsigned layer = 1; layer < SWAP_LAYERS; layer++) {
+			alone = alone && swapWord(swap, SWAP_SURFACE(layer)) == 0;
+		}
+		if (alone && s != NULL && s->info.bytesPerElement == 4 && s->info.planeCount == 0 &&
+		    s->info.pixelFormat == 0x42475241 /* 'BGRA' */ && s->info.width >= fPanelWidth && s->info.height >= fPanelHeight &&
+		    src[0] == 0 && src[1] == 0 && src[2] == (int32_t) s->info.width && src[3] == (int32_t) s->info.height &&
+		    dst[0] == 0 && dst[1] == 0 && dst[2] == (int32_t) s->info.width && dst[3] == (int32_t) s->info.height) {
+			pa = directAddress(s);
+		}
+		if (pa != 0) {
+			if (!fGraphics) {
+				fGraphics = true;
+				PE_initialize_console(NULL, kPEGraphicsMode);
+			}
+			latch = hakios_display_flip((uint32_t) pa, s->info.bytesPerRow, (s->info.width - fPanelWidth) / 2,
+			    (s->info.height - fPanelHeight) / 2, fPanelWidth, fPanelHeight, 50000000);
+			if (latch != 0) {
+				MiniIOSurface * held = MiniIOSurfaceCopy(swapWord(swap, SWAP_SURFACE(0)));
+
+				if (gDirectShown != NULL) {
+					MiniIOSurfaceDrop(gDirectShown);
+				}
+				gDirectShown = held;
+				for (int i = 0; i < DIRECT_SLOTS; i++) {
+					if (gDirectSlot[i].address == (uint32_t) pa && gDirectSlot[i].memory != NULL) {
+						gDirectShownSlot = i;
+					}
+				}
+				gDirectFlips++;
+				gDirectLatchNs += latch;
+				gDirectLatchMax = latch > gDirectLatchMax ? latch : gDirectLatchMax;
+				if (gDirectFlips <= 3) {
+					IOLog("MiniIOMobileFramebuffer: direct scanout: surface %u at %#llx (rows of %u bytes) taken by the pipe "
+					    "in %llu us (%u windows mapped)\n", swapWord(swap, SWAP_SURFACE(0)), pa, s->info.bytesPerRow, latch / 1000,
+					    gDirectMapped);
+				}
+				direct = true;
+			} else {
+				gDirectOn = false;
+				IOLog("MiniIOMobileFramebuffer: direct scanout: the pipe did not take the frame; frames are copied again\n");
+				(void)hakios_display_flip_boot();
+			}
+		} else {
+			if (gDirectNot++ < 3 && s != NULL) {
+				IOLog("MiniIOMobileFramebuffer: direct scanout: swap %u the old way: layer 0 alone %d, %ux%u format %#x, "
+				    "planes %u, from %d,%d %dx%d to %d,%d %dx%d, wrapped %d\n", swapWord(swap, SWAP_ID), alone, s->info.width,
+				    s->info.height, s->info.pixelFormat, s->info.planeCount, src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2],
+				    dst[3], s->client != NULL);
+			}
+		}
+		if (!direct && gDirectShown != NULL) {
+			/* a frame for the old way: the pipe back on the boot picture (the copy draws there), the surface let go */
+			(void)hakios_display_flip_boot();
+			MiniIOSurfaceDrop(gDirectShown);
+			gDirectShown = NULL;
+			gDirectShownSlot = -1;
+			gDirectBack++;
+		}
+	}
+	if (direct) {
+		/* shown: the swap is done, CoreAnimation may go on; the rest of this function only counts */
+		completeSwap();
+		stagedReleased = true;          /* (so it is not done once more at the end) */
+	} else if (hakios_display_scan() != NULL && !hakios_display_command_mode()) {
 		/*
 		 * Where the copy may start (fb_scan): every band of rows (fThreads of them, drawn side by side, each top
 		 * to bottom in about fDrawNs) has to stay behind the scan in this refresh -- written after the scan has
@@ -1079,7 +1312,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	shown = began;
 	/* Staged sources stay owned until the CPU has consumed every layer. */
-	if (fComposeBase == NULL) completeSwap();
+	if (fComposeBase == NULL && !direct) completeSwap();
 	IOLockLock(fLock);
 	if (fLastFrame != 0) {
 		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
@@ -1134,7 +1367,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		if (s == NULL) {
 			continue;
 		}
-		if (s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
+		if (!direct && s->info.bytesPerElement == 4 && s->info.planeCount == 0) {
 			if (!fGraphics) {
 				/* the first picture: the kernel's text console must stop drawing over it */
 				fGraphics = true;
@@ -1146,7 +1379,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
-	if (fComposeBase != NULL) {
+	if (fComposeBase != NULL && !direct) {
 		/* Only this presenter writes fComposeBase. All source pixels have now
 		 * been consumed, so CoreAnimation may render its next frame while we
 		 * wait for TE and copy this private buffer to the panel. Recordings
@@ -1158,12 +1391,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		const struct hakios_display_scan * scan = hakios_display_scan();
 		fStatScanWaits++;
-		if (scan != NULL && hakios_display_wait_copy(fCopyNs, scan->frame_ns * 3 / 2)) {
-			uint64_t copy_start = mach_absolute_time(), copy_ns;
+		uint64_t copy_start = 0, copy_ns = 0;
+		/* (in the DMA's idle part, or at 90 Hz chasing the DMA: hakios_display_copy) */
+		if (scan != NULL && hakios_display_copy(fBase, fComposeBase, fRowBytes, fPanelHeight, fCopyNs,
+		    scan->frame_ns * 3 / 2, &copy_start, &copy_ns)) {
 			shown = copy_start;
-			memcpy(fBase, fComposeBase, (size_t)fRowBytes * fPanelHeight);
-			__asm__ volatile("dsb oshst" ::: "memory");
-			absolutetime_to_nanoseconds(mach_absolute_time() - copy_start, &copy_ns);
 			fCopyNs = copy_ns > fCopyNs ? copy_ns : (fCopyNs * 31 + copy_ns) / 32;
 			if (fSwapsShown < 5)
 				hakios_tl("display: staged frame %u copied in %llu us\n", fSwapsShown, copy_ns / 1000);
@@ -1213,6 +1445,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
 		fStatSwapsLate = 0;
+		if (gDirectFlips != 0 || gDirectNot != 0) {
+			IOLog("MiniIOMobileFramebuffer: direct scanout: %u frames shown by the pipe itself (taken after %llu us on average, "
+			    "%llu at worst), %u went the old way, %u times back to the copy\n", gDirectFlips,
+			    gDirectFlips ? gDirectLatchNs / gDirectFlips / 1000 : 0, gDirectLatchMax / 1000, gDirectNot, gDirectBack);
+			gDirectFlips = gDirectNot = gDirectBack = 0;
+			gDirectLatchNs = gDirectLatchMax = 0;
+		}
 		if (fStatScanWaits != 0) {
 			IOLog("MiniIOMobileFramebuffer: the scan (fb_scan): %u frames started where it let them land whole, %u did not "
 			    "get there in time; %llu us to put a frame into the panel's memory\n", fStatScanWaits - fStatScanMissed,

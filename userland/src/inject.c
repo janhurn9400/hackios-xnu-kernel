@@ -579,6 +579,218 @@ brightness_fixes(void)
 	method_setImplementation(method, (IMP)wait_for_als_arrival);
 }
 
+/*
+ * The brightness slider to the panel: backboardd's level (BKDisplayBrightnessController, its transaction
+ * manager, CoreBrightness's BrightnessSystemInternal) into sysctl kern.hakios.brightness (permille), which
+ * the kernel sends as DCS 0x51 (renoir: hakios.adreno.c, fb_dsi=1). From the Xiaomi Mi 10 fork
+ * (github.com/JopangJovan/hackios-xnu-kernel-umi, devices/xiaomi-mi-10/overlays/userland/src/inject.c),
+ * as it was; the instance offsets (0xc, 0x10) are its, for iOS 16.5. Only when the kernel answers.
+ */
+static float panel_brightness = 0.6f;
+static bool panel_brightness_user_set;
+static id panel_bk_controller;
+static id panel_tx_manager;
+static unsigned panel_brightness_logs;
+
+static id (*orig_bk_init)(id, SEL, id, id, id);
+static float (*orig_bk_get_brightness)(id, SEL);
+static void (*orig_bk_set_brightness)(id, SEL, float, id, unsigned long long);
+static id (*orig_tx_init)(id, SEL, id);
+static float (*orig_tx_get_brightness)(id, SEL);
+static id (*orig_bsi_copy_prop)(id, SEL, id, id);
+static BOOL (*orig_bsi_set_prop)(id, SEL, id, id, id);
+
+static void
+panel_apply_brightness(float level, const char *source)
+{
+	int permille;
+
+	if (level < 0.0f) level = 0.0f;
+	if (level > 1.0f) level = 1.0f;
+	panel_brightness = level;
+	panel_brightness_user_set = true;
+	if (panel_bk_controller != NULL) {
+		*(float *)((char *)panel_bk_controller + 0xc) = level;
+	}
+	if (panel_tx_manager != NULL) {
+		*(float *)((char *)panel_tx_manager + 0x10) = level;
+	}
+	permille = (int)(level * 1000.0f + 0.5f);
+	(void)sysctlbyname("kern.hakios.brightness", NULL, NULL, &permille, sizeof(permille));
+	if (panel_brightness_logs < 8) {
+		panel_brightness_logs++;
+		say("hakios: brightness (%s): %.3f -> %d permille\n", source, (double)level, permille);
+	}
+}
+
+static BOOL
+my_bk_is_brightness_available(__unused id self, __unused SEL cmd)
+{
+	return YES;
+}
+
+static id
+my_bk_init(id self, SEL cmd, id system, id sentinel, id orient)
+{
+	id res = orig_bk_init(self, cmd, system, sentinel, orient);
+
+	if (res != NULL) {
+		panel_bk_controller = res;
+		*(float *)((char *)res + 0xc) = panel_brightness;
+	}
+	return res;
+}
+
+static float
+my_bk_get_brightness(id self, SEL cmd)
+{
+	float level = orig_bk_get_brightness(self, cmd);
+
+	if (!panel_brightness_user_set && level <= 0.001f) {
+		*(float *)((char *)self + 0xc) = panel_brightness;
+		return panel_brightness;
+	}
+	return panel_brightness;
+}
+
+static void
+my_bk_set_brightness(id self, SEL cmd, float level, id reason, unsigned long long options)
+{
+	panel_bk_controller = self;
+	if (!panel_brightness_user_set && level <= 0.001f && reason != NULL &&
+	    CFGetTypeID((CFTypeRef)reason) == CFStringGetTypeID() &&
+	    CFStringCompare((CFStringRef)reason,
+	        CFSTR("synchronizeALSPreferencesAndDisplayBrightness"), 0) == kCFCompareEqualTo) {
+		level = panel_brightness;
+		*(float *)((char *)self + 0xc) = level;
+		orig_bk_set_brightness(self, cmd, level, reason, options);
+		return;
+	}
+	panel_apply_brightness(level, "BKDisplayBrightnessController");
+	orig_bk_set_brightness(self, cmd, panel_brightness, reason, options);
+}
+
+static id
+my_tx_init(id self, SEL cmd, id controller)
+{
+	id res = orig_tx_init(self, cmd, controller);
+
+	if (res != NULL) {
+		panel_tx_manager = res;
+		if (*(float *)((char *)res + 0x10) <= 0.001f) {
+			*(float *)((char *)res + 0x10) = panel_brightness;
+		} else {
+			panel_brightness = *(float *)((char *)res + 0x10);
+		}
+	}
+	return res;
+}
+
+static float
+my_tx_get_brightness(id self, SEL cmd)
+{
+	float level = orig_tx_get_brightness(self, cmd);
+
+	if (!panel_brightness_user_set && level <= 0.001f) {
+		*(float *)((char *)self + 0x10) = panel_brightness;
+		return panel_brightness;
+	}
+	return panel_brightness;
+}
+
+static id
+my_bsi_copy_prop(id self, SEL cmd, id key, id client)
+{
+	id res = orig_bsi_copy_prop(self, cmd, key, client);
+
+	if (key != NULL && CFGetTypeID((CFTypeRef)key) == CFStringGetTypeID()) {
+		if (CFStringCompare((CFStringRef)key, CFSTR("CBBrightnessControlAvailable"), 0) == kCFCompareEqualTo) {
+			if (res != NULL) {
+				CFRelease((CFTypeRef)res);
+			}
+			return (id)CFRetain(kCFBooleanTrue);
+		}
+		if (CFStringCompare((CFStringRef)key, CFSTR("DisplayBrightness"), 0) == kCFCompareEqualTo && res == NULL) {
+			CFStringRef k = CFSTR("Brightness");
+			CFNumberRef num = CFNumberCreate(NULL, kCFNumberFloatType, &panel_brightness);
+
+			if (num != NULL) {
+				CFDictionaryRef dict = CFDictionaryCreate(NULL, (const void **)&k, (const void **)&num, 1,
+				    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+				CFRelease(num);
+				return (id)dict;
+			}
+		}
+	}
+	return res;
+}
+
+static BOOL
+my_bsi_set_prop(id self, SEL cmd, id prop, id key, id client)
+{
+	BOOL ok = orig_bsi_set_prop(self, cmd, prop, key, client);
+
+	if (key != NULL && prop != NULL && CFGetTypeID((CFTypeRef)key) == CFStringGetTypeID() &&
+	    CFStringCompare((CFStringRef)key, CFSTR("DisplayBrightness"), 0) == kCFCompareEqualTo) {
+		float val = -1.0f;
+		CFTypeID tid = CFGetTypeID((CFTypeRef)prop);
+
+		if (tid == CFDictionaryGetTypeID()) {
+			const void *v = CFDictionaryGetValue((CFDictionaryRef)prop, CFSTR("Brightness"));
+			if (v != NULL && CFGetTypeID((CFTypeRef)v) == CFNumberGetTypeID()) {
+				CFNumberGetValue((CFNumberRef)v, kCFNumberFloatType, &val);
+			}
+		} else if (tid == CFNumberGetTypeID()) {
+			CFNumberGetValue((CFNumberRef)prop, kCFNumberFloatType, &val);
+		}
+		if (val >= 0.0f && val <= 1.0f) {
+			panel_apply_brightness(val, "BrightnessSystemInternal");
+			return YES;
+		}
+	}
+	return ok;
+}
+
+static IMP
+hook_objc_method(Class cls, const char *sel_name, IMP replacement)
+{
+	Method m = cls != NULL ? class_getInstanceMethod(cls, sel_registerName(sel_name)) : NULL;
+	return m != NULL ? method_setImplementation(m, replacement) : NULL;
+}
+
+static void
+panel_brightness_fixes(void)
+{
+	int permille = 600;
+	size_t len = sizeof(permille);
+	Class bk = objc_getClass("BKDisplayBrightnessController");
+	Class tx = objc_getClass("BKDisplayBrightnessUpdateTransactionManager");
+	Class bsi = objc_getClass("BrightnessSystemInternal");
+
+	if (sysctlbyname("kern.hakios.brightness", &permille, &len, NULL, 0) != 0 || permille < 0 || permille > 1000) {
+		return;         /* no brightness from the kernel (renoir: boot-arg fb_dsi=1): iOS's own, as before */
+	}
+	panel_brightness = (float)permille / 1000.0f;
+	(void)hook_objc_method(bk, "isBrightnessLevelControlAvailable", (IMP)my_bk_is_brightness_available);
+	orig_bk_init = (id (*)(id, SEL, id, id, id))hook_objc_method(bk,
+	    "_initWithBrightnessSystem:systemShellSentinel:orientationManager:", (IMP)my_bk_init);
+	orig_bk_get_brightness = (float (*)(id, SEL))hook_objc_method(bk, "brightnessLevel",
+	    (IMP)my_bk_get_brightness);
+	orig_bk_set_brightness = (void (*)(id, SEL, float, id, unsigned long long))hook_objc_method(bk,
+	    "setBrightnessLevel:reason:options:", (IMP)my_bk_set_brightness);
+	orig_tx_init = (id (*)(id, SEL, id))hook_objc_method(tx,
+	    "_initWithBrightnessController:", (IMP)my_tx_init);
+	orig_tx_get_brightness = (float (*)(id, SEL))hook_objc_method(tx,
+	    "systemDisplayBrightness", (IMP)my_tx_get_brightness);
+	orig_bsi_copy_prop = (id (*)(id, SEL, id, id))hook_objc_method(bsi,
+	    "copyPropertyForKey:client:", (IMP)my_bsi_copy_prop);
+	orig_bsi_set_prop = (BOOL (*)(id, SEL, id, id, id))hook_objc_method(bsi,
+	    "setProperty:forKey:client:", (IMP)my_bsi_set_prop);
+	say("hakios: panel brightness hooks %s (initial %.2f)\n",
+	    orig_bk_init && orig_bk_set_brightness && orig_bsi_copy_prop && orig_bsi_set_prop ?
+	    "installed" : "INCOMPLETE", (double)panel_brightness);
+}
+
 /* ---- backboardd: the touch screen and the buttons ---------------------------------------------- */
 
 /* IOKit's HID event system, the part that has no public header on iOS (prototypes checked against 20F66) */
@@ -1126,6 +1338,7 @@ hakios_init(void)
 		}
 		opengl_es();
 		window_server_fixes();
+		panel_brightness_fixes();
 		/*
 		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch
 		 * screen service for its own ("still waiting for a main screen digitizer"), whether the
