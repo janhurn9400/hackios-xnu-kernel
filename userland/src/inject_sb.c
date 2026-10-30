@@ -1247,6 +1247,36 @@ load_tweaks(void)
 	}
 }
 
+/*
+ * What the apps are told about the display's frame rate (renoir, 90 Hz): UIKit's -[UIScreen maximumFramesPerSecond]
+ * is round(1 / -[UIScreen _refreshRate]) (UIKitCore, iOS 16.5), and CoreAnimation's own idea is the main CADisplay's.
+ * Said once, 20 s after SpringBoard started, and on the notification com.hakios.fps.
+ */
+static void
+say_frame_rates(void)
+{
+	Class screen_class = objc_getClass("UIScreen"), display_class = objc_getClass("CADisplay");
+	id screen = screen_class ? ((id (*)(id, SEL))objc_msgSend)((id)screen_class, sel_registerName("mainScreen")) : nil;
+	id display = display_class ? ((id (*)(id, SEL))objc_msgSend)((id)display_class, sel_registerName("mainDisplay")) : nil;
+	long max_fps = -1;
+	double screen_period = -1, display_period = -1, display_max = -1;
+
+	if (screen != nil) {
+		max_fps = ((long (*)(id, SEL))objc_msgSend)(screen, sel_registerName("maximumFramesPerSecond"));
+		if (class_respondsToSelector(screen_class, sel_registerName("_refreshRate"))) {
+			screen_period = ((double (*)(id, SEL))objc_msgSend)(screen, sel_registerName("_refreshRate"));
+		}
+	}
+	if (display != nil) {
+		display_period = ((double (*)(id, SEL))objc_msgSend)(display, sel_registerName("refreshRate"));
+		if (class_respondsToSelector(display_class, sel_registerName("maximumFramesPerSecond"))) {
+			display_max = (double)((long (*)(id, SEL))objc_msgSend)(display, sel_registerName("maximumFramesPerSecond"));
+		}
+	}
+	say("hakios: frame rates: UIScreen maximumFramesPerSecond %ld, _refreshRate %.6f s; CADisplay refreshRate %.6f s, "
+	    "maximumFramesPerSecond %.0f\n", max_fps, screen_period, display_period, display_max);
+}
+
 __attribute__((constructor))
 static void
 hakios_springboard_init(void)
@@ -1261,6 +1291,16 @@ hakios_springboard_init(void)
 	}
 	if (hakios_caenv() != 0) {
 		say("hakios: caenv: CoreAnimation's switches set in %s\n", name);
+	}
+	{
+		int fps_token;
+
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			say_frame_rates();
+		});
+		notify_register_dispatch("com.hakios.fps", &fps_token, dispatch_get_main_queue(), ^(__unused int t) {
+			say_frame_rates();
+		});
 	}
 	if (strcmp(name, "SpringBoard") != 0) {
 		static char who[64];

@@ -461,7 +461,7 @@ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
 static void
 setNumber(OSDictionary * dict, const char * key, uint64_t value)
 {
-	OSNumber * n = OSNumber::withNumber(value, 32);
+	OSNumber * n = OSNumber::withNumber(value, value > UINT32_MAX ? 64 : 32);
 
 	if (n != NULL) {
 		dict->setObject(key, n);
@@ -504,8 +504,13 @@ IOMobileFramebuffer::publishModes(void)
 
 	setNumber(horizontal, "Active", fWidth);
 	setNumber(horizontal, "Total", fWidth);
-	setNumber(horizontal, "SyncRate", rate);
-	setNumber(horizontal, "PreciseSyncRate", rate);
+	/*
+	 * The horizontal rate is lines a second (16.16), as a real panel's: the refresh rate times the lines. With the
+	 * refresh rate here as well (as before), CoreAnimation took the display for 60 Hz whatever the vertical rate
+	 * said (CADisplay refreshRate 1/60 at fb_panel_hz=90; UIKit's maximumFramesPerSecond follows it).
+	 */
+	setNumber(horizontal, "SyncRate", (uint64_t) rate * fHeight);
+	setNumber(horizontal, "PreciseSyncRate", (uint64_t) rate * fHeight);
 	setNumber(vertical, "Active", fHeight);
 	setNumber(vertical, "Total", fHeight);
 	setNumber(vertical, "SyncRate", rate);

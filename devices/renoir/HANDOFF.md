@@ -2,7 +2,7 @@
 
 ## Session 8 (2026-10-30, ~18:30-21:20): brightness, 90 Hz, direct scanout, UniXNU studied
 
-Read `GPU.md` (the last section) and `UNIXNU.md` (the two new sections). Kernel `prebuilt/vm-kernel/mach.development.bcm2837.direct6`
+Read `GPU.md` (the last section) and `UNIXNU.md` (the two new sections). Kernel `prebuilt/vm-kernel/mach.development.bcm2837.direct7`
 (21:13), images `prebuilt/sysimg/flashboot-renoir-bright.apfs` and `root-flash-wifi-ssh-bright.apfs` (the brightness hooks).
 
 **Works now**: brightness by the kernel and by iOS's slider (`fb_dsi=1`); the panel at 90 Hz (`fb_panel_hz=90`, visibly
@@ -19,12 +19,17 @@ switches (names found in the shared cache: `CA_ENABLE_ALL_FRAME_RATES`, `CA_MINI
 `CA_VELOCITY_FRAME_RATE_UNCONSTRAINED`, `CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION`, `CA_FRAME_RATE_POLICY`; Info.plist
 `CADisableMinimumFrameDurationOnPhone`), now set by `caenv=` in SpringBoard and Settings too (`userland/src/caenv.h`):
 values guessed (1, 0.011, 1, 0), **no change** (still ~50-54 new pictures a second). Next would be reading QuartzCore's
-code (CADeviceInfo, maximumFramesPerSecond) with a tool that extracts it from the shared cache (`ipsw`). **So the
-everyday run stays at 60 Hz** (without `fb_panel_hz=90 ca_vbl=1`); direct scanout and the overlap help at 60 Hz too. The picture is still
+code (CADeviceInfo, maximumFramesPerSecond) with a tool that extracts it from the shared cache (`ipsw`). **Found (22:10)**: QuartzCore's window server
+takes its beat, and so every app's display rate, from `AppleCLCDDisplay::heartbeat_rate`, which reads
+**`CA_HEARTBEAT_RATE`** (Hz; `period = 1/atof()`) before the display. With `caenv=CA_HEARTBEAT_RATE=90` SpringBoard
+says `UIScreen maximumFramesPerSecond 90, _refreshRate 0.011111 s` (before: 60, 0.016667), and the apps' content rose
+to **up to 84 new pictures a second** (from ~54); the user: Settings and app animations clearly smoother, heavy
+scrolling not yet (the window server's own drawing). Found with `ipsw` (scratchpad, v3.1.739) disassembling QuartzCore
+from `sysimage/cryptex-os.dmg`. Not yet automatic: the boot-arg is needed. **Before that, the everyday run stayed at 60 Hz** (without `fb_panel_hz=90 ca_vbl=1`); direct scanout and the overlap help at 60 Hz too. The picture is still
 cropped by ~2 % (not scaled yet).
 
-**The everyday run** stays session 7's with `fb_dsi=1` added (and the `-bright` images): brightness slider, 60 Hz.
-To try 90 Hz: add `fb_panel_hz=90 ca_vbl=1 fb_direct=1` (kernel `.direct6`).
+**The everyday run** stays session 7's with `fb_dsi=1` added (and the `-caenv` images): brightness slider, 60 Hz.
+**90 Hz that works**: add `fb_panel_hz=90 ca_vbl=1 fb_direct=1 caenv=CA_HEARTBEAT_RATE=90` (kernel `.direct7`).
 
 **Learnt the hard way**: the VM has 3 GB: build with `-j3` (a full rebuild with all jobs stopped the VM, and files copied
 just before were lost). `vmx.sh` with `pkill -f xnu-build.sh` kills its own session. In `prlctl exec` HOME is `/`, so
