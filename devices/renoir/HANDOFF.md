@@ -2,26 +2,32 @@
 
 ## Session 8 (2026-10-30, ~18:30-21:20): brightness, 90 Hz, direct scanout, UniXNU studied
 
-Read `GPU.md` (the last section) and `UNIXNU.md` (the two new sections). Kernel `prebuilt/vm-kernel/mach.development.bcm2837.direct5`
+Read `GPU.md` (the last section) and `UNIXNU.md` (the two new sections). Kernel `prebuilt/vm-kernel/mach.development.bcm2837.direct6`
 (21:13), images `prebuilt/sysimg/flashboot-renoir-bright.apfs` and `root-flash-wifi-ssh-bright.apfs` (the brightness hooks).
 
 **Works now**: brightness by the kernel and by iOS's slider (`fb_dsi=1`); the panel at 90 Hz (`fb_panel_hz=90`, visibly
 smoother in `fb_test=1`); direct scanout (`fb_direct=1`: the display controller reads iOS's frames itself, no CPU copy).
 **Then** (21:30, `.direct5`): frames overlap -- ordinary gestures at 87-91 frames a second, heavy screens 58-75 (the window
-server's drawing, 11-18 ms on the CPU). The user still saw "60 Hz, animations a bit quicker": not settled -- an A/B run
-(the same kernel with and without `fb_panel_hz=90 ca_vbl=1`, the same gesture) is the next thing to do. The picture is still
+server's drawing, 11-18 ms on the CPU). The user still saw "60 Hz, animations a bit quicker", and was right: a picture fingerprint per
+frame (kernel `.direct6`, "N of them the same picture as the one before") showed that while scrolling at 82-88 frames a
+second, ~45 % repeat the frame before: **the apps change their content only ~45-60 times a second**. `ca_vbl=1` only
+speeds up the compositor; UIKit and every app keep to the 60 Hz of the iPhone X identity (iOS 16.5 allows more only on
+ProMotion devices). Every ProMotion iPhone is arm64e (pointer authentication, which renoir's A78/A55 lack); the one
+plain-arm64 ProMotion device with iOS 16 is the **iPad Pro 2017 (A10X, iPadOS 16)**: the only clean way to 90/120 Hz
+content would be that identity and its system image (as UniXNU runs everything as an iPad). **So the everyday run stays
+at 60 Hz** (without `fb_panel_hz=90 ca_vbl=1`); direct scanout and the overlap help at 60 Hz too. The picture is still
 cropped by ~2 % (not scaled yet).
 
 **The everyday run** stays session 7's with `fb_dsi=1` added (and the `-bright` images): brightness slider, 60 Hz.
-To try 90 Hz: add `fb_panel_hz=90 ca_vbl=1 fb_direct=1` (kernel `.direct5`).
+To try 90 Hz: add `fb_panel_hz=90 ca_vbl=1 fb_direct=1` (kernel `.direct6`).
 
 **Learnt the hard way**: the VM has 3 GB: build with `-j3` (a full rebuild with all jobs stopped the VM, and files copied
 just before were lost). `vmx.sh` with `pkill -f xnu-build.sh` kills its own session. In `prlctl exec` HOME is `/`, so
 `THEOS=/theos` (not `/root/theos`) for `userland/build.sh`.
 
 **Next, in order**:
-1. Where CoreAnimation's ~14 ms a frame go (GPU clock and bus votes while it draws, eagl/Mesa time, CPU); then VIG0's
-   QSEED3 lite scaler so the whole picture is shown (1125 x 2436 -> 1080 x 2400).
+1. VIG0's QSEED3 lite scaler so direct scanout shows the whole picture (1125 x 2436 -> 1080 x 2400), then direct
+   scanout at 60 Hz in the everyday run. 90/120 Hz content: only with an iPad Pro 2017 identity (iPadOS 16), a big step.
 2. Merge upstream `main` into `renoir` (the user's wish: after this display work; fetched as `upstream-new/main`).
 3. Bluetooth from the Mi 10 fork (`umi_bluetooth.c`, QCA6390 over UART), then its camera ladder (`cam=1..6`).
 4. Long term: Metal via AdrenoMetal + Turnip (UniXNU; their A650 driver for A6xx), the way to iOS 17+ (`UNIXNU.md`).

@@ -72,6 +72,32 @@ static TUNABLE(uint32_t, gDirect, "fb_direct", 0);
 static bool gDirectOn;
 static MiniIOSurface * gDirectShown;            /* held while the pipe reads it */
 static uint32_t gDirectFlips, gDirectBack, gDirectNot;
+/*
+ * How many of the frames shown were the same picture as the one before (fb_direct): 16 x 16 points of each, read
+ * past this processor's cache (the GPU wrote them), hashed. 90 frames a second of which 30 repeat are 60 pictures.
+ */
+static uint32_t gDirectSame, gDirectHash;
+
+static uint32_t
+directPicture(MiniIOSurface * s)
+{
+	uint32_t hash = 2166136261u;
+
+	if (s->kpixels == NULL) {
+		return 0;
+	}
+	for (uint32_t gy = 0; gy < 16; gy++) {
+		for (uint32_t gx = 0; gx < 16; gx++) {
+			const uint32_t * at = (const uint32_t *) (s->kpixels + (size_t) ((gy * 2 + 1) * s->info.height / 32) *
+			    s->info.bytesPerRow) + (gx * 2 + 1) * s->info.width / 32;
+
+			__asm__ volatile ("dc civac, %0" : : "r" (at) : "memory");
+			__asm__ volatile ("dsb sy" ::: "memory");
+			hash = (hash ^ *(const volatile uint32_t *) at) * 16777619u;
+		}
+	}
+	return hash;
+}
 static uint64_t gDirectLatchNs, gDirectLatchMax;
 #define DIRECT_SLOTS            4
 static struct {
@@ -1239,6 +1265,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 					}
 				}
 				gDirectFlips++;
+				{
+					uint32_t picture = directPicture(s);
+
+					gDirectSame += picture == gDirectHash;
+					gDirectHash = picture;
+				}
 				gDirectLatchNs += latch;
 				gDirectLatchMax = latch > gDirectLatchMax ? latch : gDirectLatchMax;
 				if (gDirectFlips <= 3) {
@@ -1467,10 +1499,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatHeld, fStatLost, fStatSwapsLate);
 		fStatSwapsLate = 0;
 		if (gDirectFlips != 0 || gDirectNot != 0) {
-			IOLog("MiniIOMobileFramebuffer: direct scanout: %u frames shown by the pipe itself (taken after %llu us on average, "
-			    "%llu at worst), %u went the old way, %u times back to the copy\n", gDirectFlips,
-			    gDirectFlips ? gDirectLatchNs / gDirectFlips / 1000 : 0, gDirectLatchMax / 1000, gDirectNot, gDirectBack);
-			gDirectFlips = gDirectNot = gDirectBack = 0;
+			IOLog("MiniIOMobileFramebuffer: direct scanout: %u frames shown by the pipe itself, %u of them the same picture as "
+			    "the one before (taken after %llu us on average, %llu at worst), %u went the old way, %u times back to the copy\n",
+			    gDirectFlips, gDirectSame, gDirectFlips ? gDirectLatchNs / gDirectFlips / 1000 : 0, gDirectLatchMax / 1000,
+			    gDirectNot, gDirectBack);
+			hakios_tl("tl: d %u frames %u same\n", gDirectFlips, gDirectSame);
+			gDirectFlips = gDirectNot = gDirectBack = gDirectSame = 0;
 			gDirectLatchNs = gDirectLatchMax = 0;
 		}
 		if (fStatScanWaits != 0) {
