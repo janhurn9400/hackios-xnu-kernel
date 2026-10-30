@@ -3971,3 +3971,370 @@ hakios_adreno_init(void)
 	}
 	printf("adreno: over; the system goes on starting\n");
 }
+
+/* ---- fb_scan: frames timed to renoir's command-mode panel (for MiniIOMobileFramebuffer.cpp) -------------------- */
+
+/*
+ * After hakios.display.c of the Xiaomi Mi 10 fork (github.com/JopangJovan/hackios-xnu-kernel-umi,
+ * devices/xiaomi-mi-10/overlays/xnu/files/bsd/dev/hakios.display.c, 2026-10-29), cut down to renoir's command
+ * mode: renoir's panel is not sent the framebuffer by a timing engine; the display controller's DMA reads it
+ * at every TE pulse of the panel (60 Hz), its tear check in the interface (DPU 7: intf1 at 0x0ae6b800 +
+ * 0x280..0x2b8, as display_probe found: check on, sync config 0x180085, autorefresh 0x80000001, start
+ * 2400). Two of those registers say where things are: 0x298 the TE line counter (from the start value up),
+ * 0x2b0 how far the DMA has read this refresh. The framebuffer driver composes each frame in a buffer of its
+ * own and copies it into the panel's memory only once this refresh's DMA is done and the copy fits before the
+ * next TE -- no refresh shows half of one frame and half of the next -- and its refresh notifications follow
+ * the TE instead of a timer of its own.
+ *
+ * Boot-arg fb_scan=1 with board=renoir; nothing otherwise. Only two bus clocks are ever written (GCC's of the
+ * display clock controller, 0x27004 as display_probe turned it on; dispcc's of the display registers,
+ * 0x2080), and before every read of the interface those clocks and the display's power switch are checked:
+ * on these SoCs a read of a block whose clock is off hangs the bus (fb_vsync's two hangs, GPU.md).
+ */
+#define DS_GCC_PHYS             0x00100000UL
+#define DS_GCC_DISP_AHB_CBCR    0x27004
+#define DS_DISPCC_PHYS          0x0af00000UL
+#define DS_DISPCC_GDSCR         0x3000
+#define DS_DISPCC_AHB_CBCR      0x2080
+#define DS_INTF_PHYS            0x0ae6b800UL
+#define DS_CBCR_ENABLE          (1u << 0)
+#define DS_CBCR_OFF             (1u << 31)
+#define DS_GDSC_ON              (1u << 31)
+#define DS_INTF_TIMING_ENGINE   0x000
+#define DS_TE_ENABLE            0x284
+#define DS_TE_CONFIG            0x288
+#define DS_TE_INIT              0x294
+#define DS_TE_LINE              0x298
+#define DS_TE_WRITTEN           0x2b0
+#define DS_TE_AUTOREFRESH       0x2b4
+#define RENOIR_PANEL_LINES      2400
+
+struct hakios_display_scan {
+	int ok;
+	uint32_t lines, shown, millihz;
+	uint64_t line_ns, frame_ns;
+};
+
+static vm_offset_t ds_intf, ds_gcc, ds_dispcc;
+static struct hakios_display_scan ds_scan;
+static uint32_t ds_te_initial, ds_idle_start;
+
+static inline uint32_t
+ds_rd(vm_offset_t base, uint32_t offset)
+{
+	return *(volatile uint32_t *)(base + offset);
+}
+
+static inline void
+ds_wr(vm_offset_t base, uint32_t offset, uint32_t value)
+{
+	__asm__ volatile ("dmb oshst" ::: "memory");
+	*(volatile uint32_t *)(base + offset) = value;
+	__asm__ volatile ("dsb osh" ::: "memory");
+}
+
+/* the display block's registers can be read now: power on, both bus clocks running */
+static int
+ds_alive(void)
+{
+	uint32_t v = ds_rd(ds_gcc, DS_GCC_DISP_AHB_CBCR & 0xfff);
+
+	if (v == UINT32_MAX || !(v & DS_CBCR_ENABLE) || (v & DS_CBCR_OFF)) {
+		return 0;
+	}
+	v = ds_rd(ds_dispcc, DS_DISPCC_GDSCR);
+	if (v == UINT32_MAX || !(v & DS_GDSC_ON)) {
+		return 0;
+	}
+	v = ds_rd(ds_dispcc, DS_DISPCC_AHB_CBCR);
+	return v != UINT32_MAX && (v & DS_CBCR_ENABLE) && !(v & DS_CBCR_OFF);
+}
+
+static int
+ds_clock_on(vm_offset_t base, uint32_t cbcr, const char *name)
+{
+	uint32_t v = ds_rd(base, cbcr);
+
+	if (v == UINT32_MAX) {
+		return 0;
+	}
+	if (!(v & DS_CBCR_ENABLE) || (v & DS_CBCR_OFF)) {
+		ds_wr(base, cbcr, v | DS_CBCR_ENABLE);
+		delay_for_interval(10, NSEC_PER_MSEC);
+		v = ds_rd(base, cbcr);
+	}
+	if (!(v & DS_CBCR_ENABLE) || (v & DS_CBCR_OFF)) {
+		printf("display: the %s clock does not take (%#x): no scan to go by\n", name, v);
+		return 0;
+	}
+	return 1;
+}
+
+int hakios_display_command_mode(void);
+const struct hakios_display_scan *hakios_display_scan(void);
+uint32_t hakios_display_line(uint32_t *frame);
+int hakios_display_wait_lines(uint32_t first, uint32_t last, uint64_t limit_ns);
+uint64_t hakios_display_next_frame_ns(void);
+int hakios_display_wait_copy(uint64_t copy_ns, uint64_t limit_ns);
+int hakios_display_scan_start(void);
+
+int
+hakios_display_command_mode(void)
+{
+	return ds_scan.ok;              /* renoir's is only ever the command-mode scan */
+}
+
+const struct hakios_display_scan *
+hakios_display_scan(void)
+{
+	return ds_scan.ok ? &ds_scan : NULL;
+}
+
+/* where the TE's refresh is: lines since its start (0 .. lines-1) */
+uint32_t
+hakios_display_line(uint32_t *frame)
+{
+	uint32_t raw, line;
+
+	if (frame != NULL) {
+		*frame = 0;
+	}
+	if (ds_intf == 0) {
+		return 0;
+	}
+	if (!ds_alive()) {
+		printf("display: the display block's clock or power went off: the scan is no longer read\n");
+		ds_intf = 0;
+		ds_scan.ok = 0;
+		return 0;
+	}
+	raw = ds_rd(ds_intf, DS_TE_LINE) & 0xffff;
+	line = raw >= ds_te_initial ? raw - ds_te_initial : 0;
+	return line < ds_scan.lines ? line : ds_scan.lines - 1;
+}
+
+/* the copy may go now: this refresh's DMA done and the copy's time (with a margin) left before the next TE */
+int
+hakios_display_wait_copy(uint64_t copy_ns, uint64_t limit_ns)
+{
+	uint64_t start = mach_absolute_time(), elapsed, budget = copy_ns + copy_ns / 4 + 500000;
+
+	if (!ds_scan.ok) {
+		return 0;
+	}
+	for (;;) {
+		uint32_t before = hakios_display_line(NULL), written, phase;
+		uint64_t used, ahead = 0, nap = 50000;
+
+		if (!ds_scan.ok) {
+			return 0;
+		}
+		written = ds_rd(ds_intf, DS_TE_WRITTEN) & 0xffff;
+		phase = hakios_display_line(NULL);
+		if (!ds_scan.ok) {
+			return 0;
+		}
+		used = (uint64_t)phase * ds_scan.line_ns;
+		/* (the phase read on both sides of the DMA's state: a TE between them does not pair an old "done" with a new refresh) */
+		if (phase >= before && phase >= ds_idle_start && written >= ds_scan.shown && used < ds_scan.frame_ns &&
+		    budget < ds_scan.frame_ns - used) {
+			return 1;
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
+		if (elapsed >= limit_ns) {
+			return 0;
+		}
+		/* sleep through the part known to be busy; poll only the last 200 us */
+		if (phase < ds_idle_start) {
+			ahead = (uint64_t)(ds_idle_start - phase) * ds_scan.line_ns;
+		} else if (used >= ds_scan.frame_ns || budget >= ds_scan.frame_ns - used) {
+			ahead = (used < ds_scan.frame_ns ? ds_scan.frame_ns - used : 0) + (uint64_t)ds_idle_start * ds_scan.line_ns;
+		}
+		if (ahead > 400000) {
+			nap = ahead - 200000;
+		}
+		if (nap > limit_ns - elapsed) {
+			nap = limit_ns - elapsed;
+		}
+		delay_for_interval((uint32_t)((nap + 999) / 1000), NSEC_PER_USEC);
+	}
+}
+
+int
+hakios_display_wait_lines(uint32_t first, uint32_t last, uint64_t limit_ns)
+{
+	uint64_t start = mach_absolute_time(), waited;
+
+	if (!ds_scan.ok || first >= last || last > ds_scan.lines) {
+		return 0;
+	}
+	for (;;) {
+		uint32_t line = hakios_display_line(NULL);
+		uint64_t ahead;
+
+		if (!ds_scan.ok) {
+			return 0;
+		}
+		if (line >= first && line < last) {
+			return 1;
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &waited);
+		if (waited >= limit_ns) {
+			return 0;
+		}
+		ahead = (uint64_t)((first + ds_scan.lines - line) % ds_scan.lines) * ds_scan.line_ns;
+		if (ahead > 400000) {
+			uint64_t nap = ahead - 200000;
+
+			if (waited + nap > limit_ns) {
+				nap = limit_ns - waited;
+			}
+			delay_for_interval((uint32_t)(nap / 1000), NSEC_PER_USEC);
+		}
+	}
+}
+
+uint64_t
+hakios_display_next_frame_ns(void)
+{
+	uint32_t line;
+
+	if (!ds_scan.ok) {
+		return 0;
+	}
+	line = hakios_display_line(NULL);
+	return (uint64_t)(ds_scan.lines - line) * ds_scan.line_ns;
+}
+
+/* the TE's period and the DMA's busy part measured over four refreshes (150 ms at most) */
+static int
+ds_calibrate(void)
+{
+	uint32_t config = ds_rd(ds_intf, DS_TE_CONFIG), refresh = ds_rd(ds_intf, DS_TE_AUTOREFRESH);
+	uint64_t start = mach_absolute_time(), previous_time = start, first_wrap = 0, last_wrap = 0, line_time = 0, line_count = 0,
+	    elapsed;
+	uint32_t previous, busy_last = 0;
+	unsigned wraps = 0, busy_samples = 0, idle_samples = 0;
+
+	ds_te_initial = ds_rd(ds_intf, DS_TE_INIT) & 0xffff;
+	if (!(ds_rd(ds_intf, DS_TE_ENABLE) & 1) || (config & 0x180000) != 0x180000 || refresh != 0x80000001 ||
+	    ds_te_initial != RENOIR_PANEL_LINES) {
+		printf("display: the tear check is not as display_probe found it (enable %#x, config %#x, autorefresh %#x, start %u): "
+		    "no scan to go by\n", ds_rd(ds_intf, DS_TE_ENABLE), config, refresh, ds_te_initial);
+		return 0;
+	}
+	previous = ds_rd(ds_intf, DS_TE_LINE) & 0xffff;
+	while (wraps < 4) {
+		uint32_t raw, written, phase;
+		uint64_t now, interval;
+
+		delay_for_interval(50, NSEC_PER_USEC);
+		if (!ds_alive()) {
+			return 0;
+		}
+		raw = ds_rd(ds_intf, DS_TE_LINE) & 0xffff;
+		written = ds_rd(ds_intf, DS_TE_WRITTEN) & 0xffff;
+		now = mach_absolute_time();
+		absolutetime_to_nanoseconds(now - start, &elapsed);
+		if (elapsed > 150000000 || raw < ds_te_initial) {
+			printf("display: the TE line counter does not run (%u after %llu ms): no scan to go by\n", raw, elapsed / 1000000);
+			return 0;
+		}
+		if ((ds_rd(ds_intf, DS_TE_LINE) & 0xffff) < raw) {
+			continue;               /* a TE between the two reads */
+		}
+		if (raw < previous) {
+			if (wraps++ == 0) {
+				first_wrap = now;
+			}
+			last_wrap = now;
+		} else if (raw > previous) {
+			absolutetime_to_nanoseconds(now - previous_time, &interval);
+			line_time += interval;
+			line_count += raw - previous;
+		}
+		phase = raw - ds_te_initial;
+		if (written > 0 && written < ds_te_initial) {
+			if (phase > busy_last) {
+				busy_last = phase;
+			}
+			busy_samples++;
+		} else if (written >= ds_te_initial) {
+			idle_samples++;
+		}
+		previous = raw;
+		previous_time = now;
+	}
+	if (!line_count || !busy_samples || !idle_samples) {
+		printf("display: the DMA was not seen both busy and done (%u, %u): no scan to go by\n", busy_samples, idle_samples);
+		return 0;
+	}
+	absolutetime_to_nanoseconds(last_wrap - first_wrap, &elapsed);
+	ds_scan.frame_ns = elapsed / (wraps - 1);
+	ds_scan.line_ns = line_time / line_count;
+	if (!ds_scan.line_ns || ds_scan.frame_ns < NSEC_PER_SEC / 125 || ds_scan.frame_ns > NSEC_PER_SEC / 30) {
+		printf("display: an implausible TE period (%llu ns): no scan to go by\n", ds_scan.frame_ns);
+		return 0;
+	}
+	/*
+	 * lines: the TE counter's lines a refresh (renoir: 2385, a little fewer than the panel's rows -- unlike the Mi 10's,
+	 * whose counter runs past them); shown: the panel's rows, what the DMA's progress (0x2b0) counts up to
+	 */
+	ds_scan.lines = (uint32_t)(ds_scan.frame_ns / ds_scan.line_ns);
+	ds_scan.shown = ds_te_initial;
+	ds_idle_start = busy_last + 32;         /* a margin after the last line the DMA was seen busy at */
+	if (ds_scan.lines < ds_scan.shown / 2 || ds_scan.lines > 8192 || ds_idle_start >= ds_scan.lines) {
+		printf("display: the TE's lines (%u) and the DMA's (%u) do not fit: no scan to go by\n", ds_scan.lines, ds_idle_start);
+		return 0;
+	}
+	ds_scan.millihz = (uint32_t)(1000000000000ULL / ds_scan.frame_ns);
+	ds_scan.ok = 1;
+	printf("display: renoir's command-mode TE: %u.%03u Hz, %llu ns a line, %u lines a refresh; the DMA done after line %u: "
+	    "frames are staged and copied in its idle part (fb_scan=1)\n", ds_scan.millihz / 1000, ds_scan.millihz % 1000,
+	    ds_scan.line_ns, ds_scan.lines, ds_idle_start);
+	return 1;
+}
+
+int
+hakios_display_scan_start(void)
+{
+	uint32_t on = 0;
+	char board_name[16] = "";
+
+	if (ds_scan.ok) {
+		return 1;
+	}
+	if (!PE_parse_boot_argn("fb_scan", &on, sizeof(on)) || on != 1 ||
+	    !PE_parse_boot_argn("board", board_name, sizeof(board_name)) || strcmp(board_name, "renoir") != 0) {
+		return 0;
+	}
+	ds_gcc = ml_io_map(DS_GCC_PHYS + (DS_GCC_DISP_AHB_CBCR & ~0xfffu), 0x1000);
+	if (ds_gcc == 0 || !ds_clock_on(ds_gcc, DS_GCC_DISP_AHB_CBCR & 0xfff, "display clock controller's bus")) {
+		return 0;
+	}
+	ds_dispcc = ml_io_map(DS_DISPCC_PHYS, 0x4000);
+	if (ds_dispcc == 0) {
+		return 0;
+	}
+	if (!(ds_rd(ds_dispcc, DS_DISPCC_GDSCR) & DS_GDSC_ON)) {
+		printf("display: the display block has no power: no scan to go by\n");
+		return 0;
+	}
+	if (!ds_clock_on(ds_dispcc, DS_DISPCC_AHB_CBCR, "display registers' bus")) {
+		return 0;
+	}
+	ds_intf = ml_io_map(DS_INTF_PHYS, 0x1000);
+	if (ds_intf == 0) {
+		return 0;
+	}
+	if (ds_rd(ds_intf, DS_INTF_TIMING_ENGINE) & 1) {
+		printf("display: the panel is in video mode (timing engine on): not what fb_scan knows for renoir\n");
+		ds_intf = 0;
+		return 0;
+	}
+	if (!ds_calibrate()) {
+		ds_intf = 0;
+		return 0;
+	}
+	return 1;
+}

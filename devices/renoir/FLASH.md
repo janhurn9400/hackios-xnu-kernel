@@ -88,7 +88,7 @@ loader (`ufs_native` not tried on renoir yet).
   2042368 on may be written this run`.
 - `var_store_secs=N` (new): saves every N seconds as well. Needed with `adsp=1`, where USB is gone and the run
   cannot be ended in order. The everyday run:
-  `... var_store=1 ufs_write=1 var_store_secs=300 ... haptic=5 torch=3 adsp=1 sound=4 sound_below=144 wifi=1 wifi_file=0 ...`
+  `... var_store=1 ufs_write=1 var_store_secs=300 ... cpufreq=1 fb_scan=1 fb_threads=6 fb_filter=0 ... haptic=5 torch=3 adsp=1 sound=4 sound_below=144 wifi=1 wifi_file=0 ...`
 - **Torch** (`torch=3`): works (`torch=2` test, and in iOS without the DSP). With `adsp=1` it stays off while the
   battery is at 45 C or more (the driver's guard): renoir charged at 1.5 A at 100 % and the battery reached 46 C
   (22:50). Nothing manages heat yet (no thermal throttling of the charger, CPU or GPU): the next thing to do.
@@ -106,6 +106,6 @@ loader (`ufs_native` not tried on renoir yet).
 - From the Mi 10 fork (`JopangJovan/hackios-xnu-kernel-umi`, `devices/xiaomi-mi-10/boot.args`): `fb_threads=6
   fb_filter=0` (the frame copied by six threads, nearest-neighbour scaling): already supported here, now in the run
   command; the user found it quick ("richtig schnell"), not measured yet. Still at 60 Hz and tearing.
-- Next: that fork's `hakios.display.c` (`fb_scan=1`): the copy timed to the command-mode panel's DMA and TE
+- Done (see GPU.md, 02:31; the user: no more tearing): that fork's `hakios.display.c` (`fb_scan=1`): the copy timed to the command-mode panel's DMA and TE
   (INTF 0x0ae6b800 +0x298 TE line, +0x2b0 DMA write pointer; dispcc 0x3000/0x2080 as renoir's), the panel's own rate
   given to CoreAnimation. Also there: Bluetooth on QCA6390 over UART to iOS's stack, brightness by DCS 0x51.

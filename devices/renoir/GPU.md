@@ -80,3 +80,21 @@ python3-venv). Then the run of `NEXT.md` step 3 with `board=renoir gpu=1`.
   taken out again. So it happens between the display controller and the panel. Open: the panel nodes in
   this device tree (Visionox R66451, 2340 lines, 120/90/60 Hz) are not renoir's panel (the firmware set
   2400 lines); the right one is named on MagicOS's kernel command line (`msm_drm.dsi_display0=`).
+
+## Tearing solved: fb_scan (2026-10-30, 02:31)
+
+After the Mi 10 fork's `hakios.display.c` (`JopangJovan/hackios-xnu-kernel-umi`; credited in the code), cut to
+renoir's command-mode panel, appended to `hakios.adreno.c` (the `fb_scan` section; no new file for the build), and
+that fork's `MiniIOMobileFramebuffer.cpp` changes applied as they were (a staging buffer, the copy timed to the scan,
+refresh notifications from the TE). Boot-arg `fb_scan=1` with `board=renoir`; nothing changes without it.
+
+- What it reads (intf1 at 0x0ae6b800, after checking the display's power switch and both bus clocks before every
+  read): 0x298 the TE line counter, 0x2b0 the DMA's progress. Calibration at start, four refreshes:
+  `renoir's command-mode TE: 60.503 Hz, 6927 ns a line, 2386 lines a refresh; the DMA done after line 1276`.
+  The panel is at 60.5 Hz, not 60: our 60 Hz timer drifted against it -- that was the tearing.
+- renoir's TE counter has fewer lines a refresh (2386) than the panel rows (2400), unlike the Mi 10's; the fork's
+  check that it has more was relaxed (`lines >= shown / 2`).
+- Each frame is scaled into the staging buffer (10.4 MB), then copied into the panel's memory in **1.3-1.7 ms**
+  once this refresh's DMA is done and before the next TE. **The user: no more tearing.**
+- With it: `fb_threads=6 fb_filter=0` (the same fork's boot.args). Kernel `prebuilt/vm-kernel/mach.development.bcm2837`
+  (= `.fbscan`, 02:30).
