@@ -4539,6 +4539,21 @@ ds_sysctl_brightness(__unused struct sysctl_oid *oidp, __unused void *arg1, __un
 SYSCTL_PROC(_kern_hakios, OID_AUTO, brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
     NULL, 0, ds_sysctl_brightness, "I", "display brightness in permille (0..1000); -1: no DSI commands (fb_dsi=1)");
 
+/*
+ * The panel's refresh rate as fb_scan measured it, in millihertz (0 without the scan): for the window server's beat
+ * (userland/src/inject.c sets CA_HEARTBEAT_RATE from it, so that apps are told a 90 Hz panel is one).
+ */
+static int
+ds_sysctl_millihz(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = ds_scan.ok ? (int)ds_scan.millihz : 0;
+
+	return sysctl_io_number(req, value, sizeof(value), NULL, NULL);
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, display_millihz, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    NULL, 0, ds_sysctl_millihz, "I", "the panel's refresh rate in millihertz, as fb_scan measured it (0: not known)");
+
 /* the TE's period and the DMA's busy part measured over four refreshes (150 ms at most) */
 static int
 ds_calibrate(void)

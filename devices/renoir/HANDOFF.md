@@ -2,8 +2,8 @@
 
 ## Session 8 (2026-10-30, ~18:30-21:20): brightness, 90 Hz, direct scanout, UniXNU studied
 
-Read `GPU.md` (the last section) and `UNIXNU.md` (the two new sections). Kernel `prebuilt/vm-kernel/mach.development.bcm2837.direct7`
-(21:13), images `prebuilt/sysimg/flashboot-renoir-bright.apfs` and `root-flash-wifi-ssh-bright.apfs` (the brightness hooks).
+Read `GPU.md` (the last section) and `UNIXNU.md` (the two new sections). Kernel `prebuilt/vm-kernel/mach.development.bcm2837.direct8`
+(21:13), images `prebuilt/sysimg/flashboot-renoir-hz.apfs` and `root-flash-wifi-ssh-hz.apfs` (brightness hooks, caenv, the heartbeat).
 
 **Works now**: brightness by the kernel and by iOS's slider (`fb_dsi=1`); the panel at 90 Hz (`fb_panel_hz=90`, visibly
 smoother in `fb_test=1`); direct scanout (`fb_direct=1`: the display controller reads iOS's frames itself, no CPU copy).
@@ -25,11 +25,15 @@ takes its beat, and so every app's display rate, from `AppleCLCDDisplay::heartbe
 says `UIScreen maximumFramesPerSecond 90, _refreshRate 0.011111 s` (before: 60, 0.016667), and the apps' content rose
 to **up to 84 new pictures a second** (from ~54); the user: Settings and app animations clearly smoother, heavy
 scrolling not yet (the window server's own drawing). Found with `ipsw` (scratchpad, v3.1.739) disassembling QuartzCore
-from `sysimage/cryptex-os.dmg`. Not yet automatic: the boot-arg is needed. **Before that, the everyday run stayed at 60 Hz** (without `fb_panel_hz=90 ca_vbl=1`); direct scanout and the overlap help at 60 Hz too. The picture is still
+from `sysimage/cryptex-os.dmg`. Now automatic (22:15): the kernel says the measured rate
+(`kern.hakios.display_millihz`) and `inject.c` sets `CA_HEARTBEAT_RATE` and the VBL timer (as `ca_vbl=1`) itself when the
+panel is faster than 61 Hz: `fb_panel_hz=90` alone gives `UIScreen maximumFramesPerSecond 91`. Upstream (redwood, a
+120 Hz panel) only has `fb_hz=120` for the driver's beat, nothing for the apps: worth giving back. **Before that, the everyday run stayed at 60 Hz** (without `fb_panel_hz=90 ca_vbl=1`); direct scanout and the overlap help at 60 Hz too. The picture is still
 cropped by ~2 % (not scaled yet).
 
-**The everyday run** stays session 7's with `fb_dsi=1` added (and the `-caenv` images): brightness slider, 60 Hz.
-**90 Hz that works**: add `fb_panel_hz=90 ca_vbl=1 fb_direct=1 caenv=CA_HEARTBEAT_RATE=90` (kernel `.direct7`).
+**The everyday run** is session 7's with kernel `.direct8`, the `-hz` images (`flashboot-renoir-hz.apfs`,
+`root-flash-wifi-ssh-hz.apfs`) and `fb_dsi=1 fb_panel_hz=90 fb_direct=1` added: brightness slider, 90 Hz content.
+Without `fb_panel_hz=90 fb_direct=1`: 60 Hz as before.
 
 **Learnt the hard way**: the VM has 3 GB: build with `-j3` (a full rebuild with all jobs stopped the VM, and files copied
 just before were lost). `vmx.sh` with `pkill -f xnu-build.sh` kills its own session. In `prlctl exec` HOME is `/`, so

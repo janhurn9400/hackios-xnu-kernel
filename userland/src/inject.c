@@ -1317,6 +1317,28 @@ hakios_init(void)
 			say("hakios: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
 		}
 		/*
+		 * A panel faster than 60 Hz (renoir: fb_panel_hz=90; kern.hakios.display_millihz, what fb_scan measured):
+		 * the window server's beat is that rate, and through it every app's (QuartzCore,
+		 * CA::WindowServer::AppleCLCDDisplay::heartbeat_rate reads CA_HEARTBEAT_RATE in Hz before the display; without
+		 * it the iPhone X's 60 Hz: UIScreen maximumFramesPerSecond 60, and the apps' content stayed at ~54 new pictures
+		 * a second on a 90 Hz panel; with it up to 84). Its frames then follow the driver's refresh notifications, as
+		 * with ca_vbl=1. A caenv= below still decides.
+		 */
+		{
+			int millihz = 0;
+			size_t length = sizeof(millihz);
+
+			if (sysctlbyname("kern.hakios.display_millihz", &millihz, &length, NULL, 0) == 0 && millihz > 61000) {
+				char hz[16];
+
+				snprintf(hz, sizeof(hz), "%d", (millihz + 500) / 1000);
+				setenv("CA_HEARTBEAT_RATE", hz, 1);
+				setenv("CA_FORCE_TIMER", "1", 1);
+				say("hakios: the panel runs at %d.%03d Hz: CA_HEARTBEAT_RATE=%s, frames on the driver's refreshes\n",
+				    millihz / 1000, millihz % 1000, hz);
+			}
+		}
+		/*
 		 * Boot-arg caenv=NAME=VALUE (as many as wanted): into the window server's environment, for
 		 * CoreAnimation's own switches (CA_LOG_TRIPLE_BUFFERING=1, CA_FORCE_DOUBLE_BUFFERING=1 ...).
 		 */
