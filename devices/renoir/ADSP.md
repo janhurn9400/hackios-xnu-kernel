@@ -189,3 +189,19 @@ a battery level in the status bar**, about right by the user's check: the ADSP's
 3. The loader could also stop using USB once a run with the DSP is over and say so on screen.
 
 - Speaker amplifiers, for the sound later: two NXP TFA98xx at 0x34/0x35 (MagicOS dmesg).
+
+## USB under the DSP, narrowed down (2026-10-30, session 8)
+
+`adsp_step=7` (the DSP out of reset, no GLINK, no QRTR, nothing said to it) is enough: the live log stops in step 7.
+So it is the DSP firmware's own doing, not our talk. The Mac's log (`/usr/bin/log show ... --predicate
+'process == "kernel"'`, IOUSBHostFamily, IOAccessoryManager, AppleHPM) for that run, DSP started at 22:29:03:
+- 22:29:04.1 the Mac's USB-C port controller sees the port's power change (`configureAccessoryPowerInternal ...
+  PowerModeOff`): the DSP's charger firmware starts Power Delivery;
+- 22:29:06.7 `xnuloader: hardware port disabled`, 22:29:07.0 **enumerated again at 480 Mbps**, 22:29:08.4 `hardware
+  connection lost`;
+- 22:29:24.2 `AppleTCController ... No plug detected`: renoir lets go of the port (a Type-C detach), 22:29:24.6 attached
+  again, the Mac as host (`setting USB2 USB3 as DFP ... as connected`), and **no device enumerates any more**.
+So the cable is good again ~20 s after the DSP's start; the loader's (UEFI's) USB device never connects after the detach.
+Next: let the loader restart its USB device once the port is back (~25 s after the DSP's start, not on every failed
+receive, which `813328a` did from the first second on), and log what UEFI sees of VBUS. MagicOS's dmesg has the FSA4480
+USB-C audio switch (I2C `i2c@a94000` 0x42, no GPIOs in the DT): not the DSP's to switch, so not the cause.
