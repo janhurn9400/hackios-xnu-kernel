@@ -14,8 +14,13 @@ second, ~45 % repeat the frame before: **the apps change their content only ~45-
 speeds up the compositor; UIKit and every app keep to the 60 Hz of the iPhone X identity (iOS 16.5 allows more only on
 ProMotion devices). Every ProMotion iPhone is arm64e (pointer authentication, which renoir's A78/A55 lack); the one
 plain-arm64 ProMotion device with iOS 16 is the **iPad Pro 2017 (A10X, iPadOS 16)**: the only clean way to 90/120 Hz
-content would be that identity and its system image (as UniXNU runs everything as an iPad). **So the everyday run stays
-at 60 Hz** (without `fb_panel_hz=90 ca_vbl=1`); direct scanout and the overlap help at 60 Hz too. The picture is still
+content would be that identity and its system image (as UniXNU runs everything as an iPad). Tried next: QuartzCore's own
+switches (names found in the shared cache: `CA_ENABLE_ALL_FRAME_RATES`, `CA_MINIMUM_FRAME_DURATION`,
+`CA_VELOCITY_FRAME_RATE_UNCONSTRAINED`, `CA_ENABLE_HIGH_FRAME_RATE_RESTRICTION`, `CA_FRAME_RATE_POLICY`; Info.plist
+`CADisableMinimumFrameDurationOnPhone`), now set by `caenv=` in SpringBoard and Settings too (`userland/src/caenv.h`):
+values guessed (1, 0.011, 1, 0), **no change** (still ~50-54 new pictures a second). Next would be reading QuartzCore's
+code (CADeviceInfo, maximumFramesPerSecond) with a tool that extracts it from the shared cache (`ipsw`). **So the
+everyday run stays at 60 Hz** (without `fb_panel_hz=90 ca_vbl=1`); direct scanout and the overlap help at 60 Hz too. The picture is still
 cropped by ~2 % (not scaled yet).
 
 **The everyday run** stays session 7's with `fb_dsi=1` added (and the `-bright` images): brightness slider, 60 Hz.

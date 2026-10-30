@@ -49,6 +49,7 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include "caenv.h"
 
 /* where what is said goes: the standard error, which is the console's for SpringBoard (an application's is nowhere) */
 static int say_fd = 2;
@@ -1257,6 +1258,9 @@ hakios_springboard_init(void)
 
 	if (name == NULL) {
 		return;
+	}
+	if (hakios_caenv() != 0) {
+		say("hakios: caenv: CoreAnimation's switches set in %s\n", name);
 	}
 	if (strcmp(name, "SpringBoard") != 0) {
 		static char who[64];

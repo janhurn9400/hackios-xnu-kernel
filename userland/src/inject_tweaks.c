@@ -34,6 +34,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "caenv.h"
 
 /*
  * Both places a package may put a tweak: the one ElleKit uses now, and the one Cydia Substrate used,
@@ -263,6 +264,7 @@ __attribute__((constructor))
 static void
 hakios_tweaks_init(void)
 {
+	(void)hakios_caenv();
 	static bool done;
 
 	if (done) {
