@@ -94,3 +94,18 @@ loader (`ufs_native` not tried on renoir yet).
   (22:50). Nothing manages heat yet (no thermal throttling of the charger, CPU or GPU): the next thing to do.
 - After `fastboot oem stop` the phone sometimes resets into Xiaomi's fastboot a little later: boot the loader and
   stage the boot volume again before the next run.
+
+## Heat and frames (2026-10-30, 02:20)
+
+- **Thermal guard** (`hakios.cpufreq.c`, `thermal_thread`, with `cpufreq=1`; `thermal=0` turns it off): once a
+  second the hottest TSENS sensor (both controllers, TM at 0x0c263000 / 0x0c265000, `SN_STATUS` 0xa0 + 4 x n,
+  tenths of a degree, bit 21 valid) and the battery's temperature (from the ADSP's battery manager) pick a level,
+  and every CPU group is held at or under 100/80/60/40 % of its top frequency (battery from 40/42/44 C, SoC from
+  75/85/95 C; left 2 C / 5 C lower). Before it every core ran at its top row all the time. Seen: idle 34.7 C,
+  using the phone 48-59 C, level 0. Kernel `prebuilt/vm-kernel/mach.development.bcm2837` (= `.thermal`, 02:06).
+- From the Mi 10 fork (`JopangJovan/hackios-xnu-kernel-umi`, `devices/xiaomi-mi-10/boot.args`): `fb_threads=6
+  fb_filter=0` (the frame copied by six threads, nearest-neighbour scaling): already supported here, now in the run
+  command; the user found it quick ("richtig schnell"), not measured yet. Still at 60 Hz and tearing.
+- Next: that fork's `hakios.display.c` (`fb_scan=1`): the copy timed to the command-mode panel's DMA and TE
+  (INTF 0x0ae6b800 +0x298 TE line, +0x2b0 DMA write pointer; dispcc 0x3000/0x2080 as renoir's), the panel's own rate
+  given to CoreAnimation. Also there: Bluetooth on QCA6390 over UART to iOS's stack, brightness by DCS 0x51.

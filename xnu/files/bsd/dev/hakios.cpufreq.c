@@ -86,6 +86,12 @@ domain_of(uint32_t phys_id)
 	return core < 4 ? 0 : core < 7 ? 1 : 2;
 }
 
+/* each group's table as raise_domain() found it, for the thermal guard below */
+static struct {
+	vm_offset_t base;
+	uint32_t rows, khz[EPSS_TABLE_ROWS];
+} groups[EPSS_DOMAINS];
+
 static void
 raise_domain(uint32_t domain, uint32_t cores)
 {
@@ -102,12 +108,116 @@ raise_domain(uint32_t domain, uint32_t cores)
 		}
 		top = row;
 		top_khz = khz;
+		groups[domain].khz[row] = khz;
 	}
+	groups[domain].base = base;
+	groups[domain].rows = top + 1;
 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
 	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
 	delay_for_interval(20, NSEC_PER_MSEC);
 	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz\n", domain, cores, was, top,
 	    top_khz / 1000);
+}
+
+/*
+ * The thermal guard (renoir, 2026-10-29: with every core at its top row all the time, the audio DSP, Wi-Fi
+ * and charging, the battery reached 46 C -- warm in the hand, and the torch's guard kept the light off).
+ * Nothing else here manages heat: iOS's own performance controller has no hardware to drive. So once a
+ * second the hottest of the SoC's temperature sensors (TSENS: both controllers, every sensor that says it
+ * is valid) and the battery's temperature (from the audio DSP's battery manager, when it runs) give a
+ * level, and every group of ours is held at or under a share of its top frequency for that level:
+ *
+ *   level 0  everything                      battery under 40 C and the SoC under 75 C
+ *   level 1  80 % of the top frequency       battery from 40 C, or the SoC from 75 C
+ *   level 2  60 %                            battery from 42 C, or the SoC from 85 C
+ *   level 3  40 %                            battery from 44 C, or the SoC from 95 C
+ *
+ * A level is left only 2 C (battery) or 5 C (SoC) under where it began, so it does not flap. Boot-arg
+ * thermal=0: no guard (every group stays at its top row, as before). The SoC's own hardware limits
+ * (LMh) are left as they are; this is only the comfortable side of them.
+ */
+#define TSENS_TM0_PHYS          0x0c263000UL    /* renoir's and redwood's two controllers' TM blocks */
+#define TSENS_TM1_PHYS          0x0c265000UL
+#define TSENS_SN_STATUS(s)      (0xa0 + 4 * (s))  /* [11:0] the last temperature, tenths of a degree, signed; [21] valid */
+#define TSENS_SENSORS           16
+#define TSENS_VALID             (1u << 21)
+
+static int
+tsens_hottest(vm_offset_t tm[2], int *where)
+{
+	int hottest = -2730;
+
+	for (int c = 0; c < 2; c++) {
+		for (int sn = 0; sn < TSENS_SENSORS; sn++) {
+			uint32_t v = *(volatile uint32_t *)(tm[c] + TSENS_SN_STATUS(sn));
+			int t = (int)(v & 0xfff);
+
+			if (!(v & TSENS_VALID)) {
+				continue;
+			}
+			if (t & 0x800) {
+				t -= 0x1000;
+			}
+			if (t > hottest && t < 1500) {
+				hottest = t;
+				*where = c * 100 + sn;
+			}
+		}
+	}
+	return hottest;                         /* tenths of a degree; -2730: none valid */
+}
+
+static void
+hold_groups(unsigned share)
+{
+	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+		uint32_t row = 0, limit;
+
+		if (groups[d].base == 0 || groups[d].rows == 0) {
+			continue;
+		}
+		limit = (uint32_t)((uint64_t)groups[d].khz[groups[d].rows - 1] * share / 100);
+		for (uint32_t r = 0; r < groups[d].rows; r++) {
+			if (groups[d].khz[r] <= limit) {
+				row = r;
+			}
+		}
+		*(volatile uint32_t *)(groups[d].base + EPSS_PERF_STATE) = row;
+	}
+}
+
+static void
+thermal_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	static const unsigned share[] = { 100, 80, 60, 40 };
+	static const int battery_from[] = { 0, 40, 42, 44 }, soc_from[] = { 0, 750, 850, 950 };
+	vm_offset_t tm[2] = { ml_io_map(TSENS_TM0_PHYS, 0x1000), ml_io_map(TSENS_TM1_PHYS, 0x1000) };
+	unsigned level = 0, looks = 0;
+
+	for (;; looks++) {
+		int where = -1, soc = tsens_hottest(tm, &where), battery = hakios_battery_temperature();
+		unsigned want = 0;
+
+		for (unsigned l = 1; l < 4; l++) {
+			/* entering a level at its threshold; staying in the one we are in until 2 C / 5 C under it */
+			int bat_at = battery_from[l] - (l <= level ? 2 : 0), soc_at = soc_from[l] - (l <= level ? 50 : 0);
+
+			if ((battery > -273 && battery >= bat_at) || (soc > -2730 && soc >= soc_at)) {
+				want = l;
+			}
+		}
+		if (want != level || looks == 0) {
+			hold_groups(share[want]);
+			tell("thermal: level %u (%u %% of the top frequency): the SoC %d.%d C (sensor %d of controller %d), the "
+			    "battery %d C\n", want, share[want], soc / 10, (soc < 0 ? -soc : soc) % 10, where % 100, where / 100,
+			    battery);
+			level = want;
+		} else if (looks % 60 == 0) {
+			tell("thermal: still level %u: the SoC %d.%d C, the battery %d C\n", level, soc / 10,
+			    (soc < 0 ? -soc : soc) % 10, battery);
+		}
+		delay_for_interval(1000, NSEC_PER_MSEC);
+	}
 }
 
 /*
@@ -585,6 +695,15 @@ hakios_cpufreq_init(void)
 		}
 	}
 	printf("cpufreq: on core %u a loop ran at %u, now at %u\n", here, before, loop_speed());
+	{
+		uint32_t guard = 1;
+		thread_t thread;
+
+		PE_parse_boot_argn("thermal", &guard, sizeof(guard));
+		if (guard && kernel_thread_start(thermal_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+	}
 	if (PE_parse_boot_argn("membench", &enabled, sizeof(enabled)) && enabled == 1) {
 		memory_bench();
 	} else if (enabled == 2) {
