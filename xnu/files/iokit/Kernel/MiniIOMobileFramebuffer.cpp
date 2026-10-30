@@ -61,7 +61,10 @@ extern "C" uint32_t hakios_display_map_slot(unsigned slot, const uint64_t * page
  * copied: its pages are mapped for the display (one of four windows of the display's SMMU context, kept while
  * the surface's memory is the same) and the display controller's pipe is pointed at it (hakios.adreno.c,
  * hakios_display_map_slot, hakios_display_flip); it takes it at the next refresh.
- * The surface is held until the next one has been taken. Not scaled yet: the middle
+ * The surface is held, and in use (IOSurfaceIsInUse), from its swap until the next one has been taken: and
+ * CoreAnimation is not made to wait for that (the swap returns once queued): it draws its next frame meanwhile,
+ * into a surface not in use -- a third one it makes for itself when both of its two are -- as on an iPhone.
+ * (Waiting made a frame cost drawing + GPU + the wait for the refresh, 15-25 ms: every other one missed at 90 Hz.) Not scaled yet: the middle
  * of a surface larger than the panel is shown (iOS's 1125 x 2436 on 1080 x 2400: 22 columns and 18 rows off
  * each side). Any other frame goes the old way, the pipe back on the boot picture first.
  */
@@ -356,6 +359,8 @@ public:
 	IOLock *        fSwapLock;              /* around the next five */
 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
 	MiniIOSurface * fSwapSurfaces[SWAP_QUEUE][SWAP_LAYERS]; /* ... their surfaces, held from SwapEnd on: their maker may let go of them */
+	bool            fSwapUsed[SWAP_QUEUE];  /* ... its layer 0 marked in use (fb_direct) */
+	bool            fShowUsed;              /* ... the one show() has (presenter thread only) */
 	unsigned        fSwapFirst, fSwapsWaiting;
 	uint64_t        fNextTicket, fCompletedTicket;
 	/*
@@ -1107,6 +1112,13 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 
 		fSwapSurfaces[slot][layer] = sid != 0 ? MiniIOSurfaceCopy(sid) : NULL;
 	}
+	if (gDirectOn && fSwapSurfaces[slot][0] != NULL) {
+		/* in use from now until the pipe has let it go (show(); a frame that goes the old way: at once) */
+		MiniIOSurfaceUse(fSwapSurfaces[slot][0], 1);
+		fSwapUsed[slot] = true;
+	} else {
+		fSwapUsed[slot] = false;
+	}
 	fSwapsWaiting++;
 	uint64_t ticket = ++fNextTicket;
 	IOLockWakeup(fSwapLock, fSwap, true);
@@ -1114,7 +1126,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	 * is still scaling it into the command-mode staging buffer. Once staged,
 	 * the panel wait no longer needs the source and can overlap the next render.
 	 */
-	while (fComposeBase != NULL && fCompletedTicket < ticket) {
+	while (fComposeBase != NULL && !gDirectOn && fCompletedTicket < ticket) {
 		if (IOLockSleepDeadline(fSwapLock, &fCompletedTicket, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
 		    fCompletedTicket < ticket) {
 			hakios_tl("display: staged swap completion timed out\n");
@@ -1155,6 +1167,7 @@ IOMobileFramebuffer::presenter(void)
 		}
 		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
 		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
+		fShowUsed = fSwapUsed[fSwapFirst];
 		IOLockUnlock(fSwapLock);
 		show(swap, surfaces);
 		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
@@ -1213,7 +1226,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				MiniIOSurface * held = MiniIOSurfaceCopy(swapWord(swap, SWAP_SURFACE(0)));
 
 				if (gDirectShown != NULL) {
+					MiniIOSurfaceUse(gDirectShown, -1);
 					MiniIOSurfaceDrop(gDirectShown);
+				}
+				if (!fShowUsed) {
+					MiniIOSurfaceUse(s, 1);         /* (queued before direct scanout came on) */
 				}
 				gDirectShown = held;
 				for (int i = 0; i < DIRECT_SLOTS; i++) {
@@ -1246,11 +1263,15 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		if (!direct && gDirectShown != NULL) {
 			/* a frame for the old way: the pipe back on the boot picture (the copy draws there), the surface let go */
 			(void)hakios_display_flip_boot();
+			MiniIOSurfaceUse(gDirectShown, -1);
 			MiniIOSurfaceDrop(gDirectShown);
 			gDirectShown = NULL;
 			gDirectShownSlot = -1;
 			gDirectBack++;
 		}
+	}
+	if (!direct && fShowUsed) {
+		MiniIOSurfaceUse(surfaces[0], -1);      /* marked when queued, but not shown by the pipe after all */
 	}
 	if (direct) {
 		/* shown: the swap is done, CoreAnimation may go on; the rest of this function only counts */

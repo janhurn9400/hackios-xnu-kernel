@@ -744,6 +744,21 @@ MiniIOSurfaceCopy(uint32_t sid)
 	return s;
 }
 
+/* The kernel's own use of a surface (the display shows it): what IOSurfaceIsInUse() reads in its clients. */
+void
+MiniIOSurfaceUse(MiniIOSurface * s, int delta)
+{
+	if (s == NULL || gSurfaceLock == NULL) {
+		return;
+	}
+	IOLockLock(gSurfaceLock);
+	if (delta > 0 || s->useCount[0] != 0) {
+		s->useCount[0] += delta;
+		s->shared()->useCount = (uint64_t) s->useCount[1] << 32 | s->useCount[0];
+	}
+	IOLockUnlock(gSurfaceLock);
+}
+
 /* How many surfaces there are and how much (wired) memory they hold: for the kernel's memory report. */
 extern "C" void
 MiniIOSurfaceUsage(uint32_t * count, uint64_t * bytes)

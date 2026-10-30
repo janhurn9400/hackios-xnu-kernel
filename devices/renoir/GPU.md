@@ -123,3 +123,9 @@ All in the `fb_scan` part of `hakios.adreno.c` and in `MiniIOMobileFramebuffer.c
   the middle 1080 x 2400 of iOS's 1125 x 2436 is shown (VIG0's QSEED3 lite scaler is the next step).
 - **The limit now is iOS itself**: with `ca_vbl=1` CoreAnimation follows the 90 Hz refreshes but makes at most ~69 frames a
   second (about 14 ms a frame, 3.5-4.8 of them waiting for the GPU). Without `ca_vbl=1` it stays at 60.
+- **Frames overlap** (kernel `.direct5`): measured with `touch_lat=1 cpuload=100` and `tools/frames.py`, the slow frames at
+  90 Hz were serial -- the window server drawing (5-8 ms), the GPU (4-6), then waiting until the pipe had taken the frame
+  (8-10), and only then the next frame. Now a swap returns once queued; its surface is marked in use (IOSurfaceIsInUse)
+  until the pipe has taken the next one, so CoreAnimation draws into another. Ordinary gestures went from 55-62 frames a
+  second (half of them slow) to **87-91** (0-5 % slow); heavy screens 58-75, limited by the window server's own drawing
+  (11-18 ms a frame on the CPU). The refresh notifications carry the TE's real times, so animations keep their speed.

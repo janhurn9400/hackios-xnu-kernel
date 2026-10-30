@@ -2,16 +2,18 @@
 
 ## Session 8 (2026-10-30, ~18:30-21:20): brightness, 90 Hz, direct scanout, UniXNU studied
 
-Read `GPU.md` (the last section) and `UNIXNU.md` (the two new sections). Kernel `prebuilt/vm-kernel/mach.development.bcm2837.direct4`
+Read `GPU.md` (the last section) and `UNIXNU.md` (the two new sections). Kernel `prebuilt/vm-kernel/mach.development.bcm2837.direct5`
 (21:13), images `prebuilt/sysimg/flashboot-renoir-bright.apfs` and `root-flash-wifi-ssh-bright.apfs` (the brightness hooks).
 
 **Works now**: brightness by the kernel and by iOS's slider (`fb_dsi=1`); the panel at 90 Hz (`fb_panel_hz=90`, visibly
 smoother in `fb_test=1`); direct scanout (`fb_direct=1`: the display controller reads iOS's frames itself, no CPU copy).
-**Not yet**: 90 frames a second in iOS -- CoreAnimation makes at most ~69 (`ca_vbl=1`), ~14 ms a frame; and the picture is
+**Then** (21:30, `.direct5`): frames overlap -- ordinary gestures at 87-91 frames a second, heavy screens 58-75 (the window
+server's drawing, 11-18 ms on the CPU). The user still saw "60 Hz, animations a bit quicker": not settled -- an A/B run
+(the same kernel with and without `fb_panel_hz=90 ca_vbl=1`, the same gesture) is the next thing to do. The picture is still
 cropped by ~2 % (not scaled yet).
 
 **The everyday run** stays session 7's with `fb_dsi=1` added (and the `-bright` images): brightness slider, 60 Hz.
-To try 90 Hz: add `fb_panel_hz=90 ca_vbl=1 fb_direct=1` (kernel `.direct4`).
+To try 90 Hz: add `fb_panel_hz=90 ca_vbl=1 fb_direct=1` (kernel `.direct5`).
 
 **Learnt the hard way**: the VM has 3 GB: build with `-j3` (a full rebuild with all jobs stopped the VM, and files copied
 just before were lost). `vmx.sh` with `pkill -f xnu-build.sh` kills its own session. In `prlctl exec` HOME is `/`, so
