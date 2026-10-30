@@ -1,5 +1,59 @@
 # Handoff for the next session
 
+## Session 7 (2026-10-29 evening to 10-30 ~02:40): everything that works now, and the everyday run
+
+Read `FLASH.md` (the flash boot, var_store, the run command), then `GPU.md` (the end: fb_scan), `SOUND.md`,
+`TOUCH.md`. Branch `renoir`, committed up to `3021644` (+ this handoff), **nothing pushed**.
+
+**Working on the phone** (iOS 16.5 from the flash partition `darwin`): touch (typing good after the edge-latch fix),
+GPU 490 MHz (this chip's max, speed bin 105), **no tearing** (`fb_scan=1`: frames timed to the command-mode panel's
+TE, 60.503 Hz), sound + haptics (also with Safari now: it was RAM, fixed by the flash boot), Wi-Fi (home FRITZ!Box
+and the iPhone hotspot; `wifi_file=0` away from home), battery level, torch (blocked while the battery is >= 45 C),
+**iOS keeps its data** (`var_store`), SSH over Wi-Fi, Sileo (register with `/var/jb/bin/sh /var/jb/prep.sh` over
+SSH after each boot), the thermal guard (CPU caps by SoC/battery temperature), Metal's core (upstream's
+`hakios-metal-probe` passes on renoir).
+
+**The everyday run** (phone in Xiaomi fastboot, USB):
+```
+fastboot boot devices/renoir/prebuilt/xnu-usb-renoir-crashlog.img        # the loader (renoir's darwin GUID)
+fastboot oem ramdisk; fastboot stage devices/renoir/prebuilt/sysimg/flashboot-renoir.apfs     # 2 s
+FOLLOW=5 KERNEL=devices/renoir/prebuilt/vm-kernel/mach.development.bcm2837 \
+RAMDISK=devices/renoir/prebuilt/sysimg/root-flash-wifi-ssh.apfs devices/renoir/run-open.sh 3600 \
+  root_apfs=ufs_darwin ufs=2 var_store=1 ufs_write=1 var_store_secs=300 sb_delay=8 bootcpu=7 cpus=8 cpufreq=1 \
+  fb_scan=1 fb_threads=6 fb_filter=0 touchscreen=1 board=renoir gpu=1 haptic=5 torch=3 adsp=1 sound=4 \
+  sound_below=144 wifi=1 wifi_file=0 wifi_mac=5c:d0:6e:ea:63:12
+```
+With `adsp=1` USB goes ~3 s after the DSP starts (sound needs it): reach the phone by SSH
+(`ssh -i ssh/id_ed25519 root@<ip>`; `dmesg` from `/var/jb/sbin`), data saved every 5 min. Without `adsp=1` USB and
+the live log stay, `fastboot oem stop` ends the run in order (saves). After `oem stop`: `fastboot oem reboot`,
+Xiaomi fastboot, boot the loader again before the next run. `fastboot reboot` from Xiaomi's fastboot: MagicOS.
+The hotspot: Mac first, then renoir (the iPhone restarts the hotspot when a device joins and our Wi-Fi driver
+does not notice a drop: toggle renoir's Wi-Fi then).
+
+**Next, in order** (the user's wishes):
+1. Brightness by DSI DCS 0x51 (the Mi 10 fork has the DSI command DMA and backboardd hooks), then **90 Hz** with
+   the panel's timing-switch commands from its DT node -- which node is renoir's panel: MagicOS's
+   `/proc/cmdline` (`msm_drm.dsi_display0=`), see "MagicOS data" below. fb_scan measures the TE rate by itself.
+2. The camera: four sensors (DT: CSIPHY 1/5/0/3, PM8008i/j); sensor module files from MagicOS (below); steps as
+   upstream's `hakios.camera.c` (cam=1 read only, cam=2 power + chip ID, cam=3 test pattern, cam=4 frames).
+3. Charger throttling: `battmgr=2` dump to find the charge-control-limit property (renoir's firmware numbers differ
+   from Linux's after 9), then set it by opcode 0x31 when warm (the battery reached 46 C charging at 100 %).
+4. Bluetooth like the Mi 10 fork (QCA6390 over UART into iOS's stack; renoir's QCA6490 is on UART too).
+5. The touch driver's 26 % bad SPI reads; compare upstream's thermal driver with ours; upstream's Metal plug-in.
+
+**MagicOS data** (read 2026-10-30 02:40, read only; git-ignored folders):
+- Panel: `msm_drm.dsi_display0=qcom,mdss_dsi_k9_42_02_0b_mp_dsc_cmd` (DSC, command mode). Its node from the live
+  DT in `fw-display/qcom,mdss_dsi_k9_42_02_0b_mp_dsc_cmd/` (raw properties), the whole live DT in
+  `fw-display/live-fdt.dtb` (our `prebuilt/device-tree.dts` lacks this panel). Two timings, 1080 x 2400:
+  `timing@0` 60 Hz, `timing@1` **90 Hz**. The switch is one DCS short write in LP mode, then 17 ms:
+  **90 Hz: `15 01 00 00 11 00 02 2f 02` (0x2F = 0x02); 60 Hz: `... 2f 01`**. Brightness: DCS 0x51 (`mi,hbm-*`
+  properties there). So the DSI command DMA (the Mi 10 fork's `umi_dsi_send_backlight`, DSI0 at 0x0ae94000)
+  gives both; fb_scan then measures 90 Hz by itself. At 90 Hz a refresh is 11.1 ms, the DMA takes ~8.8 ms now
+  (1276 lines x 6.9 us) and the copy 1.3-1.7 ms: tight.
+- Camera modules in `fw-camera/`: `com.qti.sensormodule.renoir_ofilm_s5kgw3_wide.bin` (Samsung S5KGW3, 64 MP,
+  main), `..._ofilm_imx355_ultra.bin` (Sony IMX355, ultra-wide), `..._sunny_s5k3t2_front.bin` (Samsung S5K3T2,
+  front), `..._sunny_s5k5e9yx04_macro.bin` (Samsung S5K5E9, macro); the tuning files beside them.
+
 ## Session 6 (2026-10-29, ~20:30-22:10): iOS from the flash, smooth, typing works, Metal's core runs
 
 Read `FLASH.md` first (partition `darwin`, the images, the boot command). Everything below is on the phone now:
