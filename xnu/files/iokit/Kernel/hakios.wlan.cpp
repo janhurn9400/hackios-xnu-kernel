@@ -29,6 +29,7 @@
 #include <IOKit/IOUserClient.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSNumber.h>
+#include <sys/errno.h>
 
 extern "C" void HakiosWLANStart(const char * interface, const uint8_t * address);
 
@@ -134,4 +135,68 @@ HakiosWLANStart(const char * interface, const uint8_t * address)
 		wlan->release();
 	}
 	controller->release();
+}
+
+/*
+ * renoir's Bluetooth (bsd/dev/hakios.wifi.c, bt=1): bluetoothd finds its controller's public address in a service
+ * named "bluetooth" (local-mac-address); the H4 data itself goes over the kernel-control socket
+ * com.hakios.bluetooth. After the Xiaomi Mi 10 fork's hakios.bluetooth.cpp (JopangJovan/hackios-xnu-kernel-umi).
+ * HakiosBluetoothReady says whether the transport is up (umi_bluetool's answer to BlueTool's boot script),
+ * HakiosBluetoothSupportedCommands the controller's own list (inject_bluetooth.c skips what it lacks).
+ */
+static IOService *bluetooth_service;
+
+extern "C" void hakios_bluetooth_set_ready(bool ready);
+extern "C" int hakios_bluetooth_publish(const uint8_t address[6], const uint8_t commands[64]);
+
+extern "C" void
+hakios_bluetooth_set_ready(bool ready)
+{
+	if (bluetooth_service != NULL) {
+		bluetooth_service->setProperty("HakiosBluetoothReady", ready);
+	}
+}
+
+extern "C" int
+hakios_bluetooth_publish(const uint8_t address[6], const uint8_t commands[64])
+{
+	IOService *provider = IOService::getPlatform();
+	IOService *service = new IOService;
+	OSData *mac, *supported;
+
+	if (provider == NULL || service == NULL || !service->init()) {
+		if (service != NULL) {
+			service->release();
+		}
+		return ENOMEM;
+	}
+	mac = OSData::withBytes(address, 6);
+	supported = OSData::withBytes(commands, 64);
+	if (mac == NULL || supported == NULL) {
+		OSSafeReleaseNULL(mac);
+		OSSafeReleaseNULL(supported);
+		service->release();
+		return ENOMEM;
+	}
+	service->setName("bluetooth");
+	service->setProperty("local-mac-address", mac);
+	service->setProperty("HakiosBluetoothSupportedCommands", supported);
+	mac->release();
+	supported->release();
+	service->setProperty("transport-speed", 115200, 32);
+	service->setProperty("compatible", "qca,qca6490");
+	service->setProperty("HakiosBluetoothReady", false);
+	if (!service->attach(provider)) {
+		service->release();
+		return EIO;
+	}
+	if (!service->start(provider)) {
+		service->detach(provider);
+		service->release();
+		return EIO;
+	}
+	service->registerService();
+	bluetooth_service = service;
+	service->release();     /* the registry holds it now */
+	return 0;
 }

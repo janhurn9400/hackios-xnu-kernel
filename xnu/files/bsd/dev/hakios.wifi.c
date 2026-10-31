@@ -5868,3 +5868,1232 @@ hakios_wifi_init(void)
  *     engines and the rings of the data path. Those can be looked at in turn as well, at the
  *     price of a thread that never sleeps while the link is up.
  */
+
+/* ---- renoir: the QCA6490's Bluetooth half, on a UART ------------------------------------------------- */
+
+/*
+ * After the Xiaomi Mi 10 fork's umi_bluetooth.c (github.com/JopangJovan/hackios-xnu-kernel-umi,
+ * devices/xiaomi-mi-10/overlays/xnu/files/bsd/dev/umi_bluetooth.c, its QCA6390), cut to renoir's QCA6490
+ * ("hastings", SoC 0x400c0200; Android's HAL: board ID 0, so hpnv20.bin). The Bluetooth half of the radio is a
+ * UART away (devices/renoir/WIFI-BT-HAPTICS.md): QUP0 SE7 (0x99c000, Android's /dev/ttyHS0), CTS/RTS/TX/RX on
+ * gpio 68-71, reset (BT_EN) on gpio 65; its supplies are the radio's, as Wi-Fi votes them (renoir_supplies). The
+ * patch and the NVM come from fw/ of the small image (userland/build.sh puts ../fw-bluetooth there; the vendor's,
+ * never in the repository). Same steps as the Mi 10: power, clock, reset, the UART at 115200, HCI Reset and
+ * Read Local Version from the ROM, the patch (TLV, EDL 0xfc00) and the NVM, HCI Reset again, the version, the
+ * supported commands and the address; then a stream kernel-control socket "com.hakios.bluetooth" carries H4
+ * for bluetoothd (BT_HCI_TRANSPORT=H4:POSIX:com.hakios.bluetooth,115200), and the service "bluetooth" in the
+ * registry says the address (iokit/Kernel/hakios.wlan.cpp).
+ *
+ * Boot-args: bt=1 the endpoint for iOS; bt_probe=N a look only, 1 the registers, 2 with the clocks voted,
+ * 3 a UART loopback, 4 the ROM's HCI, 5 the firmware and a short radio scan (and the radio off again).
+ * bt_pins=F: the pins' function (1 by default, as the Mi 10's QUP pins).
+ */
+#include <kern/thread_call.h>
+#include <sys/kauth.h>
+#include <sys/kern_control.h>
+#include <sys/kpi_mbuf.h>
+#include <sys/termios.h>
+#include <sys/ttycom.h>
+
+#define BT_GCC_PHYS             0x00100000UL
+#define BT_UART_PHYS            0x0099c000UL    /* QUP0 SE7 (dt: qcom,qup_uart@99c000) */
+#define BT_TLMM_PHYS            0x0f100000UL
+#define BT_VOTE                 0x52008         /* the application processor's clock votes */
+#define BT_VOTE_BITS            (1u << 6 | 1u << 7 | 1u << 17)  /* QUP0's m-AHB, s-AHB, SE7 */
+#define BT_M_AHB_CBCR           0x17004
+#define BT_S_AHB_CBCR           0x17008
+#define BT_SE_CBCR              0x1785c         /* SE7's clock (SE2's 0x1726c + 5 x 0x130) */
+#define BT_RCG                  0x17860         /* ... its source: command, config, M, N, D */
+#define BT_PIN_CTS              68
+#define BT_PIN_RTS              69
+#define BT_PIN_TX               70
+#define BT_PIN_RX               71
+#define BT_PIN_RESET            65
+#define BT_SOC                  0x400c0200u
+#define bt_say(...)             hakios_wifi_tell(__VA_ARGS__)
+
+#define HAKIOS_BT_H4_MAX 4096u
+struct hakios_bt_h4 {
+	uint8_t bytes[HAKIOS_BT_H4_MAX];
+	uint32_t used, wanted, header;
+	int complete;
+};
+
+/* 0: incomplete, 1: a packet, 2: a QCA IBS byte, -1: a bad type, -2: too long (the Mi 10's hakios.bluetooth.h) */
+static inline int
+hakios_bt_h4_push(struct hakios_bt_h4 *p, uint8_t byte)
+{
+	if (p->complete) {
+		p->used = p->wanted = p->header = 0;
+		p->complete = 0;
+	}
+	if (p->used == 0) {
+		if (byte >= 0xfc && byte <= 0xfe) {
+			return 2;
+		}
+		switch (byte) {
+		case 1: case 3: p->header = 4; break;
+		case 2: case 5: p->header = 5; break;
+		case 4: p->header = 3; break;
+		default: return -1;
+		}
+		p->wanted = p->header;
+	}
+	if (p->used >= HAKIOS_BT_H4_MAX) {
+		return -2;
+	}
+	p->bytes[p->used++] = byte;
+	if (p->used == p->header) {
+		uint32_t length;
+
+		switch (p->bytes[0]) {
+		case 1: case 3: length = p->bytes[3]; break;
+		case 4: length = p->bytes[2]; break;
+		default:
+			length = p->bytes[3] | (uint32_t)p->bytes[4] << 8;
+			if (p->bytes[0] == 5) {
+				length &= 0x3fff;
+			}
+			break;
+		}
+		if (length > HAKIOS_BT_H4_MAX - p->header) {
+			p->used = p->wanted = p->header = 0;
+			return -2;
+		}
+		p->wanted = p->header + length;
+	}
+	if (p->used == p->wanted) {
+		p->complete = 1;
+		return 1;
+	}
+	return 0;
+}
+
+/* HCI Command Complete's status for `opcode`, or -1 */
+static inline int
+hakios_bt_cc_status(const uint8_t *e, size_t n, uint16_t opcode)
+{
+	if (n < 7 || e[0] != 4 || e[1] != 0x0e || (size_t)e[2] + 3 != n || e[4] != (uint8_t)opcode ||
+	    e[5] != (uint8_t)(opcode >> 8)) {
+		return -1;
+	}
+	return e[6];
+}
+
+/* a TLV segment taken: hastings answers with a unified Command Complete, the EDL subopcode included */
+static inline int
+hakios_bt_qca_tlv_ack(const uint8_t *e, size_t n)
+{
+	return (n == 8 && hakios_bt_cc_status(e, n, 0xfc00) == 0 && e[7] == 0x1e) ||
+	       (n == 6 && e[0] == 4 && e[1] == 0xff && e[2] == 3 && e[3] == 0 && e[4] == 4 && e[5] == 0);
+}
+
+/* the NVM's tag 17 (HCI transport) at 115200 baud: hastings keeps the baud rate in its byte 1; all records checked first */
+static inline int
+hakios_bt_nvm_prepare(uint8_t *data, size_t n)
+{
+	size_t hci = 0;
+
+	if (n < 4 || data[0] != 2 || ((uint32_t)data[1] | (uint32_t)data[2] << 8 | (uint32_t)data[3] << 16) != n - 4) {
+		return -1;
+	}
+	for (size_t off = 4; off < n;) {
+		unsigned id, len;
+
+		if (n - off < 12) {
+			return -1;
+		}
+		id = data[off] | (unsigned)data[off + 1] << 8;
+		len = data[off + 2] | (unsigned)data[off + 3] << 8;
+		if (len > n - off - 12) {
+			return -1;
+		}
+		if (id == 17) {
+			if (len < 3 || hci) {
+				return -1;
+			}
+			hci = off + 12;
+		}
+		off += 12 + len;
+	}
+	if (!hci) {
+		return -1;
+	}
+	data[hci + 1] = 0;      /* QCA_BAUDRATE_115200 */
+	return 0;
+}
+
+extern int hakios_bluetooth_publish(const uint8_t address[6], const uint8_t commands[64]);     /* hakios.wlan.cpp */
+extern void hakios_bluetooth_set_ready(bool ready);
+void hakios_bluetooth_init(void);
+
+static uint32_t
+bt_read(vm_offset_t base, uint32_t offset)
+{
+	uint32_t value = *(volatile uint32_t *)(base + offset);
+
+	__asm__ volatile ("dmb oshld" ::: "memory");
+	return value;
+}
+
+static void
+bt_write(vm_offset_t base, uint32_t offset, uint32_t value)
+{
+	__asm__ volatile ("dmb oshst" ::: "memory");
+	*(volatile uint32_t *)(base + offset) = value;
+	__asm__ volatile ("dsb osh" ::: "memory");
+}
+
+/* internal loopback: the FIFOs' framing without the radio (bt_probe=3) */
+static void
+bt_loopback(vm_offset_t uart)
+{
+	static const uint32_t offsets[] = { 0x48, 0x4c, 0x22c, 0x258, 0x25c, 0x260, 0x264, 0x268, 0x26c, 0x270, 0x280, 0x284,
+		                            0x288, 0x28c, 0x294, 0x2a4, 0x2a8, 0x80c, 0x810, 0x814 };
+	static const uint8_t pattern[] = { 0x01, 0x03, 0x0c, 0x00, 0x55, 0xaa, 0x7e, 0xff };
+	uint32_t saved[sizeof(offsets) / sizeof(offsets[0])];
+	uint8_t received[sizeof(pattern)];
+	unsigned count = 0, elapsed, waited;
+
+	if ((bt_read(uart, 0x40) & 0x1001) || bt_read(uart, 0x800) || bt_read(uart, 0x804)) {
+		bt_say("bt: loopback skipped: the sequencer or a FIFO is busy\n");
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(saved) / sizeof(saved[0]); i++) {
+		saved[i] = bt_read(uart, offsets[i]);
+	}
+	bt_write(uart, 0x48, 0x41); bt_write(uart, 0x4c, 0x41);
+	bt_write(uart, 0x22c, 1); bt_write(uart, 0x258, 0);
+	bt_write(uart, 0x25c, 2); bt_write(uart, 0x280, 0);
+	bt_write(uart, 0x260, 0xf); bt_write(uart, 0x264, 0);
+	bt_write(uart, 0x284, 0x4380e); bt_write(uart, 0x288, 0xc3e0e);
+	bt_write(uart, 0x268, 8); bt_write(uart, 0x28c, 8); bt_write(uart, 0x26c, 0);
+	bt_write(uart, 0x294, 160); bt_write(uart, 0x2a4, 0); bt_write(uart, 0x2a8, 0);
+	bt_write(uart, 0x80c, 1); bt_write(uart, 0x810, 0); bt_write(uart, 0x814, 6);
+	bt_write(uart, 0x618, 0xffffffff); bt_write(uart, 0x648, 0xffffffff);
+	bt_write(uart, 0x630, (1u << 27) | 0x80);
+	bt_write(uart, 0x270, sizeof(pattern)); bt_write(uart, 0x600, 1u << 27);
+	for (unsigned i = 0; i < sizeof(pattern); i++) {
+		bt_write(uart, 0x700, pattern[i]);
+	}
+	for (elapsed = 0; elapsed < 20000 && count < sizeof(pattern); elapsed++) {
+		uint32_t status = bt_read(uart, 0x804), words = status & 0x1ffffff;
+
+		while (words--) {
+			unsigned bytes = 4;
+			uint32_t value;
+
+			if (!words && (status & (1u << 31))) {
+				bytes = (status >> 28) & 7;
+			}
+			value = bt_read(uart, 0x780);
+			for (unsigned b = 0; b < bytes; b++) {
+				if (count < sizeof(received)) {
+					received[count++] = (value >> (8 * b)) & 0xff;
+				}
+			}
+		}
+		delay(1);
+	}
+	bt_say("bt: loopback %s: %u of %u bytes in %u us, interrupts %#x/%#x\n",
+	    count == sizeof(pattern) && !memcmp(pattern, received, sizeof(pattern)) ? "PASS" : "FAIL", count,
+	    (unsigned)sizeof(pattern), elapsed, bt_read(uart, 0x610), bt_read(uart, 0x640));
+	bt_write(uart, 0x604, 4); bt_write(uart, 0x634, 4);
+	for (waited = 0; waited < 10000 && (bt_read(uart, 0x40) & 0x1001); waited++) {
+		delay(1);
+	}
+	if (bt_read(uart, 0x40) & 0x1001) {
+		bt_write(uart, 0x604, 2); bt_write(uart, 0x634, 2);
+		for (waited = 0; waited < 10000 && (bt_read(uart, 0x40) & 0x1001); waited++) {
+			delay(1);
+		}
+	}
+	if (!(bt_read(uart, 0x40) & 0x1001)) {
+		for (unsigned i = 0; i < sizeof(saved) / sizeof(saved[0]); i++) {
+			bt_write(uart, offsets[i], saved[i]);
+		}
+		bt_write(uart, 0x618, 0xffffffff); bt_write(uart, 0x648, 0xffffffff);
+	}
+}
+
+#define BT_EVENT_MAX            258u
+#define BT_RX_RAW_SIZE          16384u
+static struct hakios_bt_h4 bt_rx_packet;
+static bool bt_ibs_ack_pending, bt_host_awake;
+static unsigned bt_ibs_wakes, bt_ibs_sleeps;
+static uint8_t bt_nvm_work[8192];
+static uint8_t bt_public_address[6];
+static uint8_t bt_supported_commands[64];
+static uint8_t bt_rx_raw[BT_RX_RAW_SIZE];
+static unsigned bt_rx_head, bt_rx_tail;
+
+static int
+bt_rx_capture(vm_offset_t uart)
+{
+	uint32_t irq = bt_read(uart, 0x640);
+
+	if (irq) {
+		bt_write(uart, 0x648, irq);
+	}
+	for (unsigned budget = 0; budget < 64; budget++) {
+		uint32_t status = bt_read(uart, 0x804), words = status & 0x1ffffff, word;
+		unsigned last, bytes;
+
+		if (!words) {
+			return 0;
+		}
+		if (words > ((bt_read(uart, 0xe28) >> 16) & 0x3f)) {
+			return EIO;
+		}
+		last = (status >> 28) & 7;
+		bytes = words == 1 && (status >> 31) && last ? last : 4;
+		if (bytes > 4) {
+			return EIO;
+		}
+		if (BT_RX_RAW_SIZE - (bt_rx_head - bt_rx_tail) < bytes) {
+			return ENOBUFS;
+		}
+		word = bt_read(uart, 0x780);
+		for (unsigned b = 0; b < bytes; b++) {
+			bt_rx_raw[bt_rx_head++ & (BT_RX_RAW_SIZE - 1)] = (word >> (8 * b)) & 0xff;
+		}
+	}
+	return 0;
+}
+
+static int
+bt_rx_frame(vm_offset_t uart, uint8_t *frame, unsigned capacity, unsigned *length, bool events_only)
+{
+	int error = bt_rx_capture(uart);
+
+	if (error) {
+		return -error;
+	}
+	while (bt_rx_head != bt_rx_tail) {
+		uint8_t byte = bt_rx_raw[bt_rx_tail++ & (BT_RX_RAW_SIZE - 1)];
+		int result = hakios_bt_h4_push(&bt_rx_packet, byte);
+
+		if (result < 0) {
+			bt_say("bt: H4 framing error %d at byte %#x\n", result, byte);
+			memset(&bt_rx_packet, 0, sizeof(bt_rx_packet));
+			return -EILSEQ;
+		}
+		if (result == 2) {
+			if (byte == 0xfd) {
+				bt_ibs_ack_pending = true;
+				bt_ibs_wakes++;
+			}
+			if (byte == 0xfe) {
+				bt_ibs_sleeps++;
+			}
+			if (byte == 0xfc) {
+				bt_host_awake = true;
+			}
+		}
+		if (result != 1 || (events_only && bt_rx_packet.bytes[0] != 4)) {
+			continue;
+		}
+		if (bt_rx_packet.used > capacity) {
+			return -EMSGSIZE;
+		}
+		*length = bt_rx_packet.used;
+		memcpy(frame, bt_rx_packet.bytes, *length);
+		return 1;
+	}
+	return 0;
+}
+
+static int
+bt_rx_event(vm_offset_t uart, uint8_t event[BT_EVENT_MAX], unsigned *length)
+{
+	return bt_rx_frame(uart, event, BT_EVENT_MAX, length, true);
+}
+
+static int
+bt_uart_tx(vm_offset_t uart, const uint8_t *packet, unsigned length)
+{
+	unsigned sent = 0, depth = (bt_read(uart, 0xe24) >> 16) & 0x3f;
+
+	if (!depth || depth > 64 || !length || length > HAKIOS_BT_H4_MAX) {
+		return EINVAL;
+	}
+	bt_write(uart, 0x618, 0xffffffff);
+	bt_write(uart, 0x270, length);
+	bt_write(uart, 0x600, 1u << 27);
+	for (unsigned elapsed = 0; elapsed < length * 180 + 10000; elapsed++) {
+		int rx_error = bt_rx_capture(uart);
+		unsigned used;
+		uint32_t irq;
+
+		if (rx_error) {
+			return rx_error;
+		}
+		used = bt_read(uart, 0x800) & 0x0fffffff;
+		if (used > depth) {
+			return EIO;
+		}
+		for (unsigned free = depth - used; free && sent < length; free--) {
+			bt_write(uart, 0x700, packet[sent++]);
+		}
+		irq = bt_read(uart, 0x610);
+		if (sent == length && (irq & 1)) {
+			bt_write(uart, 0x618, irq);
+			return 0;
+		}
+		delay(1);
+	}
+	bt_say("bt: TX timed out: %u of %u sent, interrupts %#x, FIFO %#x\n", sent, length, bt_read(uart, 0x610),
+	    bt_read(uart, 0x800));
+	bt_write(uart, 0x604, 4);
+	return ETIMEDOUT;
+}
+
+static int
+bt_service_ibs(vm_offset_t uart)
+{
+	static const uint8_t ack = 0xfc;
+	int error;
+
+	if (!bt_ibs_ack_pending) {
+		return 0;
+	}
+	error = bt_uart_tx(uart, &ack, 1);
+	if (!error) {
+		bt_ibs_ack_pending = false;
+	}
+	return error;
+}
+
+static int
+bt_hci_command(vm_offset_t uart, uint16_t opcode, const uint8_t *params, unsigned param_length, bool wait,
+    uint8_t event[BT_EVENT_MAX], unsigned *event_length)
+{
+	uint8_t packet[259];
+	int error;
+
+	if (param_length > 255) {
+		return EINVAL;
+	}
+	packet[0] = 1; packet[1] = opcode & 0xff; packet[2] = opcode >> 8; packet[3] = param_length;
+	if (param_length) {
+		memcpy(packet + 4, params, param_length);
+	}
+	*event_length = 0;
+	error = bt_uart_tx(uart, packet, param_length + 4);
+	if (error || !wait) {
+		return error;
+	}
+	for (unsigned elapsed = 0; elapsed < 100000; elapsed++) {
+		int result = bt_rx_event(uart, event, event_length);
+
+		if (result < 0) {
+			return -result;
+		}
+		error = bt_service_ibs(uart);
+		if (error) {
+			return error;
+		}
+		if (result == 1) {
+			int status = hakios_bt_cc_status(event, *event_length, opcode);
+
+			if (status >= 0) {
+				if (status) {
+					bt_say("bt: HCI %#x: status %#x\n", opcode, status);
+				}
+				return status ? EIO : 0;
+			}
+			if (opcode == 0xfc00 && hakios_bt_qca_tlv_ack(event, *event_length)) {
+				return 0;
+			}
+			/* inquiry and other asynchronous commands are acknowledged with a Command Status */
+			if (*event_length == 7 && event[1] == 0x0f && event[5] == (uint8_t)opcode && event[6] == (uint8_t)(opcode >> 8)) {
+				return event[3] ? EIO : 0;
+			}
+			bt_say("bt: event %#x while waiting for %#x\n", event[1], opcode);
+		}
+		*event_length = 0;
+		delay(10);
+	}
+	bt_say("bt: HCI %#x timed out (RX %#x, interrupts %#x)\n", opcode, bt_read(uart, 0x804), bt_read(uart, 0x640));
+	return ETIMEDOUT;
+}
+
+static int
+bt_qca_download(vm_offset_t uart, const uint8_t *tlv, size_t size, bool skip_events)
+{
+	size_t offset = 0;
+	unsigned segment = 0;
+
+	if (!tlv || size < 4 || size > 512 * 1024 || (tlv[1] | (uint32_t)tlv[2] << 8 | (uint32_t)tlv[3] << 16) != size - 4) {
+		return EINVAL;
+	}
+	while (offset < size) {
+		unsigned part = (unsigned)(size - offset), length = 0;
+		uint8_t params[245], event[BT_EVENT_MAX];
+		bool ack;
+		int error;
+
+		if (part > 243) {
+			part = 243;
+		}
+		params[0] = 0x1e;
+		params[1] = part;
+		memcpy(params + 2, tlv + offset, part);
+		offset += part;
+		segment++;
+		ack = !skip_events || offset == size;
+		error = bt_hci_command(uart, 0xfc00, params, part + 2, ack, event, &length);
+		if (!error && ack && !hakios_bt_qca_tlv_ack(event, length)) {
+			error = EIO;
+		}
+		if (error) {
+			bt_say("bt: TLV type %u: segment %u of %u failed: %d\n", tlv[0], segment, (unsigned)((size + 242) / 243), error);
+			return error;
+		}
+	}
+	bt_say("bt: TLV type %u taken: %u bytes, %u segments\n", tlv[0], (unsigned)size, segment);
+	return 0;
+}
+
+static uint16_t
+bt_le16(const uint8_t *p)
+{
+	return p[0] | (uint16_t)p[1] << 8;
+}
+
+static uint32_t
+bt_le32(const uint8_t *p)
+{
+	return bt_le16(p) | (uint32_t)bt_le16(p + 2) << 16;
+}
+
+static int
+bt_qca_firmware(vm_offset_t uart)
+{
+	static const uint8_t version_request = 0x19, logging[] = { 0x14, 0 };
+	uint8_t event[BT_EVENT_MAX];
+	unsigned length = 0, nonzero = 0, mode;
+	uint64_t patch_size = 0, nvm_size = 0;
+	const uint8_t *patch, *nvm;
+	uint32_t product, soc;
+	uint16_t rom;
+	int error;
+
+	error = bt_hci_command(uart, 0xfc00, &version_request, 1, true, event, &length);
+	if (error) {
+		return error;
+	}
+	if (length != 21 || event[7] != 0x19) {
+		bt_say("bt: a version answer of %u bytes: not one known\n", length);
+		return ENODEV;
+	}
+	product = bt_le32(event + 9);
+	soc = bt_le32(event + 17);
+	rom = bt_le16(event + 15);
+	bt_say("bt: QCA product %#x, ROM %#x, SoC %#x, patch %#x\n", product, rom, soc, bt_le16(event + 13));
+	if (soc != BT_SOC) {
+		bt_say("bt: not the SoC Android's HAL saw (%#x)\n", BT_SOC);
+		return ENODEV;
+	}
+	patch = hakios_wifi_file("hpbtfw20.tlv", &patch_size);
+	nvm = hakios_wifi_file("hpnv20.bin", &nvm_size);
+	if (patch == NULL || nvm == NULL || patch_size < 28 || nvm_size < 4) {
+		bt_say("bt: no hpbtfw20.tlv / hpnv20.bin in fw/ of the small image (../fw-bluetooth)\n");
+		return ENOENT;
+	}
+	if (bt_le16(patch + 16) != product || bt_le16(patch + 18) != rom) {
+		bt_say("bt: the patch is for product %#x, ROM %#x\n", bt_le16(patch + 16), bt_le16(patch + 18));
+		return EINVAL;
+	}
+	mode = patch[14];
+	if (mode != 0 && mode != 3) {
+		return EINVAL;
+	}
+	if (nvm_size > sizeof(bt_nvm_work)) {
+		return E2BIG;
+	}
+	memcpy(bt_nvm_work, nvm, (size_t)nvm_size);
+	if (hakios_bt_nvm_prepare(bt_nvm_work, (size_t)nvm_size)) {
+		bt_say("bt: hpnv20.bin is not a hastings NVM\n");
+		return EINVAL;
+	}
+	bt_say("bt: loading hpbtfw20.tlv (%llu bytes) and hpnv20.bin (%llu) at 115200 baud\n", patch_size, nvm_size);
+	error = bt_qca_download(uart, patch, (size_t)patch_size, mode == 3);
+	if (error) {
+		return error;
+	}
+	delay(10000);
+	error = bt_qca_download(uart, bt_nvm_work, (size_t)nvm_size, false);
+	if (!error) {
+		error = bt_hci_command(uart, 0xfc17, logging, sizeof(logging), true, event, &length);
+	}
+	if (!error) {
+		error = bt_hci_command(uart, 0x0c03, NULL, 0, true, event, &length);
+	}
+	if (!error) {
+		error = bt_hci_command(uart, 0x1001, NULL, 0, true, event, &length);
+	}
+	if (error) {
+		return error;
+	}
+	if (length != 15 || bt_le16(event + 11) != 29) {
+		return EIO;
+	}
+	bt_say("bt: the firmware runs: HCI %#x, LMP %#x, subversion %#x\n", event[7], event[10], bt_le16(event + 13));
+	error = bt_hci_command(uart, 0x1002, NULL, 0, true, event, &length);
+	if (error) {
+		return error;
+	}
+	if (length != 71) {
+		return EILSEQ;
+	}
+	memcpy(bt_supported_commands, event + 7, sizeof(bt_supported_commands));
+	error = bt_hci_command(uart, 0x1009, NULL, 0, true, event, &length);
+	if (error) {
+		return error;
+	}
+	if (length != 13) {
+		return EILSEQ;
+	}
+	for (unsigned i = 0; i < 6; i++) {
+		bt_public_address[i] = event[12 - i];
+		nonzero |= bt_public_address[i];
+	}
+	if (!nonzero || (bt_public_address[0] & 1)) {
+		return EINVAL;
+	}
+	return 0;
+}
+
+/* bt_probe=5: three seconds of LE passive scan and a classic inquiry, counted */
+static int
+bt_radio_scan(vm_offset_t uart)
+{
+	static const uint8_t mask[] = { 0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d }, le_mask[] = { 2, 0, 0, 0, 0, 0, 0, 0 };
+	static const uint8_t params[] = { 0, 0x60, 0, 0x30, 0, 0, 0 }, enable[] = { 1, 1 }, disable[] = { 0, 0 };
+	static const uint8_t inquiry[] = { 0x33, 0x8b, 0x9e, 2, 0 };
+	uint8_t event[BT_EVENT_MAX];
+	unsigned length = 0, reports = 0, classic = 0;
+	uint64_t deadline;
+	bool complete = false;
+	int error, stop;
+
+	error = bt_hci_command(uart, 0x0c01, mask, sizeof(mask), true, event, &length);
+	if (!error) {
+		error = bt_hci_command(uart, 0x2001, le_mask, sizeof(le_mask), true, event, &length);
+	}
+	if (!error) {
+		error = bt_hci_command(uart, 0x200b, params, sizeof(params), true, event, &length);
+	}
+	if (!error) {
+		error = bt_hci_command(uart, 0x200c, enable, sizeof(enable), true, event, &length);
+	}
+	if (error) {
+		return error;
+	}
+	clock_interval_to_deadline(3000, NSEC_PER_MSEC, &deadline);
+	while (mach_absolute_time() < deadline) {
+		int result = bt_rx_event(uart, event, &length);
+
+		if (result < 0) {
+			error = -result;
+			break;
+		}
+		error = bt_service_ibs(uart);
+		if (error) {
+			break;
+		}
+		if (result == 1 && event[1] == 0x3e && length >= 5 && event[3] == 2) {
+			reports += event[4];
+		}
+		delay(100);
+	}
+	stop = bt_hci_command(uart, 0x200c, disable, sizeof(disable), true, event, &length);
+	bt_say("bt: LE passive scan: %u reports (stop %d)\n", reports, stop);
+	if (error || stop) {
+		return error ? error : stop;
+	}
+	error = bt_hci_command(uart, 0x0401, inquiry, sizeof(inquiry), true, event, &length);
+	if (error) {
+		return error;
+	}
+	clock_interval_to_deadline(4000, NSEC_PER_MSEC, &deadline);
+	while (mach_absolute_time() < deadline) {
+		int result = bt_rx_event(uart, event, &length);
+
+		if (result < 0) {
+			return -result;
+		}
+		error = bt_service_ibs(uart);
+		if (error) {
+			return error;
+		}
+		if (result == 1) {
+			if ((event[1] == 2 || event[1] == 0x22 || event[1] == 0x2f) && length >= 4) {
+				classic += event[3];
+			}
+			if (event[1] == 1) {
+				complete = true;
+				break;
+			}
+		}
+		delay(100);
+	}
+	bt_say("bt: classic inquiry: %u reports, complete %u; IBS wakes %u, sleeps %u\n", classic, complete, bt_ibs_wakes,
+	    bt_ibs_sleeps);
+	return complete ? 0 : ETIMEDOUT;
+}
+
+/*
+ * bluetoothd's own H4:POSIX backend on a stream kernel-control socket. The worker alone does the UART's I/O; the
+ * socket's callbacks only queue what the host sends.
+ */
+#define BT_TX_QUEUE_SIZE        65536u
+static LCK_GRP_DECLARE(bt_control_group, "hakios-bluetooth");
+static LCK_MTX_DECLARE(bt_control_lock, &bt_control_group);
+static kern_ctl_ref bt_control;
+static vm_offset_t bt_control_uart;
+static uint32_t bt_control_unit, bt_control_generation;
+static uint8_t bt_tx_queue[BT_TX_QUEUE_SIZE];
+static unsigned bt_tx_head, bt_tx_tail;
+static bool bt_control_fault;
+static struct termios bt_control_termios;
+
+static errno_t
+bt_control_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *address, void **info)
+{
+	uid_t uid = kauth_cred_getuid(kauth_cred_get());
+	int error;
+
+	if (uid != 0 && uid != 501) {
+		return EPERM;
+	}
+	lck_mtx_lock(&bt_control_lock);
+	error = bt_control_fault ? EIO : (bt_control_unit ? EBUSY : 0);
+	if (!error) {
+		bt_control_unit = address->sc_unit;
+		bt_control_generation++;
+		bt_tx_head = bt_tx_tail = 0;
+		*info = NULL;
+		bt_say("bt: H4 client connected (uid %u, unit %u)\n", uid, bt_control_unit);
+	}
+	lck_mtx_unlock(&bt_control_lock);
+	return error;
+}
+
+static errno_t
+bt_control_disconnect(__unused kern_ctl_ref ref, uint32_t unit, __unused void *info)
+{
+	lck_mtx_lock(&bt_control_lock);
+	if (bt_control_unit == unit) {
+		bt_control_unit = 0;
+		bt_control_generation++;
+		bt_tx_head = bt_tx_tail = 0;
+		bt_say("bt: H4 client gone (unit %u)\n", unit);
+	}
+	lck_mtx_unlock(&bt_control_lock);
+	return 0;
+}
+
+static errno_t
+bt_control_send(__unused kern_ctl_ref ref, uint32_t unit, __unused void *info, mbuf_t message, __unused int flags)
+{
+	size_t length = mbuf_pkthdr_len(message);
+	int error = 0;
+
+	lck_mtx_lock(&bt_control_lock);
+	if (bt_control_fault) {
+		error = EIO;
+	} else if (unit != bt_control_unit) {
+		error = ENOTCONN;
+	} else if (length > BT_TX_QUEUE_SIZE - (bt_tx_head - bt_tx_tail)) {
+		error = ENOBUFS;
+	}
+	for (size_t offset = 0; !error && offset < length;) {
+		uint8_t bytes[256];
+		size_t count = length - offset;
+
+		if (count > sizeof(bytes)) {
+			count = sizeof(bytes);
+		}
+		error = mbuf_copydata(message, offset, count, bytes);
+		if (error) {
+			break;
+		}
+		for (size_t i = 0; i < count; i++) {
+			bt_tx_queue[bt_tx_head++ & (BT_TX_QUEUE_SIZE - 1)] = bytes[i];
+		}
+		offset += count;
+	}
+	lck_mtx_unlock(&bt_control_lock);
+	mbuf_freem(message);
+	return error;
+}
+
+static errno_t
+bt_control_getopt(__unused kern_ctl_ref ref, __unused uint32_t unit, __unused void *info, int option, void *data,
+    size_t *length)
+{
+	int modem = TIOCM_CTS | TIOCM_DSR | TIOCM_CAR;
+	size_t wanted;
+
+	if (option == (int)TIOCGETA) {
+		wanted = sizeof(bt_control_termios);
+	} else if (option == (int)TIOCMGET) {
+		wanted = sizeof(modem);
+	} else {
+		bt_say("bt: H4 get option %#x: not one known\n", option);
+		return ENOPROTOOPT;
+	}
+	if (!data) {
+		*length = wanted;
+		return 0;
+	}
+	if (*length < wanted) {
+		return EMSGSIZE;
+	}
+	lck_mtx_lock(&bt_control_lock);
+	memcpy(data, option == (int)TIOCGETA ? (void *)&bt_control_termios : (void *)&modem, wanted);
+	lck_mtx_unlock(&bt_control_lock);
+	*length = wanted;
+	return 0;
+}
+
+static errno_t
+bt_control_setopt(__unused kern_ctl_ref ref, __unused uint32_t unit, __unused void *info, int option, void *data,
+    size_t length)
+{
+	uint32_t opt = (uint32_t)option;
+
+	if (opt == (uint32_t)TIOCSETA || opt == (uint32_t)TIOCSETAW || opt == (uint32_t)TIOCSETAF) {
+		const struct termios *settings = data;
+
+		if (length != sizeof(struct termios) || !data) {
+			return EINVAL;
+		}
+		if ((settings->c_ispeed && settings->c_ispeed != 115200) || (settings->c_ospeed && settings->c_ospeed != 115200)) {
+			return EINVAL;
+		}
+		lck_mtx_lock(&bt_control_lock);
+		bt_control_termios = *settings;
+		lck_mtx_unlock(&bt_control_lock);
+		return 0;
+	}
+	if (opt == (uint32_t)TIOCSDTR || opt == (uint32_t)TIOCCDTR || opt == (uint32_t)TIOCMSET || opt == (uint32_t)TIOCMBIS ||
+	    opt == (uint32_t)TIOCMBIC || opt == (uint32_t)TIOCFLUSH) {
+		return 0;
+	}
+	bt_say("bt: H4 set option %#x (%u bytes): not one known\n", option, (unsigned)length);
+	return ENOPROTOOPT;
+}
+
+static void
+bt_control_worker(__unused void *unused, __unused wait_result_t result)
+{
+	static struct hakios_bt_h4 tx;
+	static uint8_t receive[HAKIOS_BT_H4_MAX];
+	unsigned receive_length = 0, commands = 0;
+	uint32_t generation = 0;
+	bool waking = false;
+	uint64_t wake_deadline = 0;
+
+	for (;;) {
+		uint32_t unit;
+		bool fault;
+		int error = 0;
+
+		lck_mtx_lock(&bt_control_lock);
+		unit = bt_control_unit;
+		fault = bt_control_fault;
+		if (generation != bt_control_generation) {
+			generation = bt_control_generation;
+			memset(&tx, 0, sizeof(tx));
+			receive_length = 0;
+			commands = 0;
+		}
+		while (unit && !fault && !tx.complete && bt_tx_head != bt_tx_tail) {
+			uint8_t byte = bt_tx_queue[bt_tx_tail++ & (BT_TX_QUEUE_SIZE - 1)];
+			int state = hakios_bt_h4_push(&tx, byte);
+
+			if (state < 0 || state == 2 || (tx.used && tx.bytes[0] == 4)) {
+				fault = bt_control_fault = true;
+				bt_say("bt: the host's H4 stream is not one: refused\n");
+			}
+		}
+		lck_mtx_unlock(&bt_control_lock);
+		if (unit && !fault && tx.complete) {
+			if (!bt_host_awake) {
+				if (!waking) {
+					static const uint8_t wake = 0xfd;
+
+					error = bt_uart_tx(bt_control_uart, &wake, 1);
+					clock_interval_to_deadline(1000, NSEC_PER_MSEC, &wake_deadline);
+					waking = true;
+				} else if (mach_absolute_time() >= wake_deadline) {
+					error = ETIMEDOUT;
+				}
+			} else {
+				waking = false;
+				if (tx.bytes[0] == 1 && commands++ < 128) {
+					bt_say("bt: iOS's HCI %#x (%u bytes)\n", bt_le16(tx.bytes + 1), tx.used);
+				}
+				error = bt_uart_tx(bt_control_uart, tx.bytes, tx.used);
+				memset(&tx, 0, sizeof(tx));
+			}
+		}
+		if (!error && !receive_length) {
+			int state = bt_rx_frame(bt_control_uart, receive, sizeof(receive), &receive_length, false);
+
+			if (state < 0) {
+				error = -state;
+			}
+			if (state > 0 && receive_length >= 7 && receive[0] == 4 && receive[1] == 0x0e && receive[6]) {
+				bt_say("bt: HCI %#x refused: status %#x\n", bt_le16(receive + 4), receive[6]);
+			}
+		}
+		if (!error) {
+			error = bt_service_ibs(bt_control_uart);
+		}
+		if (error && !fault) {
+			lck_mtx_lock(&bt_control_lock);
+			bt_control_fault = true;
+			lck_mtx_unlock(&bt_control_lock);
+			hakios_bluetooth_set_ready(false);
+			bt_say("bt: the H4 transport failed: %d\n", error);
+		}
+		/* never queued with bt_control_lock held: the socket's callbacks take it */
+		if (receive_length) {
+			int queued = unit ? ctl_enqueuedata(bt_control, unit, receive, receive_length, 0) : ENOTCONN;
+
+			if (queued != ENOBUFS) {
+				receive_length = 0;
+			}
+		}
+		delay(1000);
+	}
+}
+
+static int
+bt_control_start(vm_offset_t uart)
+{
+	struct kern_ctl_reg registration = { 0 };
+	thread_t thread;
+	int error;
+
+	strlcpy(registration.ctl_name, "com.hakios.bluetooth", sizeof(registration.ctl_name));
+	registration.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
+	registration.ctl_sendsize = BT_TX_QUEUE_SIZE;
+	registration.ctl_recvsize = BT_TX_QUEUE_SIZE;
+	registration.ctl_connect = bt_control_connect;
+	registration.ctl_disconnect = bt_control_disconnect;
+	registration.ctl_send = bt_control_send;
+	registration.ctl_getopt = bt_control_getopt;
+	registration.ctl_setopt = bt_control_setopt;
+	bt_control_termios.c_cflag = CS8 | CREAD | CLOCAL;
+	bt_control_termios.c_ispeed = bt_control_termios.c_ospeed = 115200;
+	error = ctl_register(&registration, &bt_control);
+	if (error) {
+		return error;
+	}
+	error = hakios_bluetooth_publish(bt_public_address, bt_supported_commands);
+	if (error) {
+		ctl_deregister(bt_control);
+		return error;
+	}
+	bt_control_uart = uart;
+	bt_host_awake = false;
+	hakios_bluetooth_set_ready(true);
+	if (kernel_thread_start(bt_control_worker, NULL, &thread) != KERN_SUCCESS) {
+		hakios_bluetooth_set_ready(false);
+		ctl_deregister(bt_control);
+		return EIO;
+	}
+	thread_deallocate(thread);
+	bt_say("bt: the H4 endpoint com.hakios.bluetooth is ready\n");
+	return 0;
+}
+
+/* SE7's source: 7.3728 MHz from GPLL0's even output (selector 6), M/N 384/15625, for an exact 115200 */
+static bool
+bt_uart_clock(vm_offset_t gcc)
+{
+	bt_write(gcc, BT_RCG + 0x8, 384);
+	bt_write(gcc, BT_RCG + 0xc, ~(15625u - 384u) & 0xffff);
+	bt_write(gcc, BT_RCG + 0x10, ~15625u & 0xffff);
+	bt_write(gcc, BT_RCG + 0x4, 0x2601);    /* dual-edge M/N, GPLL0 even, /1 */
+	bt_write(gcc, BT_RCG, 1);
+	for (unsigned i = 0; i < 10000; i++) {
+		if (!(bt_read(gcc, BT_RCG) & 1)) {
+			return true;
+		}
+		delay(1);
+	}
+	return false;
+}
+
+static unsigned bt_pin_function = 1;
+
+static void
+bt_gpio(vm_offset_t tlmm, unsigned pin, uint32_t cfg, bool high)
+{
+	bt_write(tlmm, pin * 0x1000 + 4, high ? 2 : 0);
+	bt_write(tlmm, pin * 0x1000, cfg);
+}
+
+static int
+bt_uart_quiesce(vm_offset_t uart)
+{
+	unsigned depth, words;
+
+	for (unsigned attempt = 0; attempt < 2; attempt++) {
+		uint32_t active = bt_read(uart, 0x40);
+
+		if (!(active & 0x1001)) {
+			break;
+		}
+		if (active & 1) {
+			bt_write(uart, 0x604, attempt ? 2 : 4);
+		}
+		if (active & 0x1000) {
+			bt_write(uart, 0x634, attempt ? 2 : 4);
+		}
+		for (unsigned t = 0; t < 10000 && (bt_read(uart, 0x40) & 0x1001); t++) {
+			delay(1);
+		}
+	}
+	if (bt_read(uart, 0x40) & 0x1001) {
+		return ETIMEDOUT;
+	}
+	depth = (bt_read(uart, 0xe28) >> 16) & 0x3f;
+	words = bt_read(uart, 0x804) & 0x1ffffff;
+	if (!depth || words > depth) {
+		return EIO;
+	}
+	while (words--) {
+		(void)bt_read(uart, 0x780);
+	}
+	bt_write(uart, 0x618, 0xffffffff);
+	bt_write(uart, 0x648, 0xffffffff);
+	return 0;
+}
+
+/* the radio's supplies, as Wi-Fi votes them (renoir_supplies: the first five are the radio's) */
+static int
+bt_power(void)
+{
+	if (renoir_rsc == 0) {
+		renoir_rsc = ml_io_map_unmappable(RENOIR_RSC, 0x10000, VM_WIMG_IO);
+		renoir_tlmm = ml_io_map_unmappable(0x0f100000, 0x100000, VM_WIMG_IO);
+	}
+	for (unsigned i = 0; i < 5; i++) {
+		if (!renoir_supply(renoir_supplies[i].name, renoir_supplies[i].mv, true)) {
+			return EIO;
+		}
+	}
+	return 0;
+}
+
+/* power, clock, reset, the UART, the ROM's HCI; with `firmware' the patch and NVM, then the endpoint or a scan */
+static bool
+bt_hci_probe(vm_offset_t gcc, vm_offset_t tlmm, vm_offset_t uart, bool firmware, bool runtime)
+{
+	static const uint32_t uregs[] = { 0x48, 0x4c, 0x22c, 0x258, 0x25c, 0x260, 0x264, 0x268, 0x26c, 0x270, 0x280, 0x284,
+		                          0x288, 0x28c, 0x294, 0x2a4, 0x2a8, 0x80c, 0x810, 0x814 };
+	static const unsigned upins[4] = { BT_PIN_CTS, BT_PIN_RTS, BT_PIN_TX, BT_PIN_RX };
+	uint32_t root[5], uvals[sizeof(uregs) / sizeof(uregs[0])], pins[4], reset_cfg, reset_io, vote, hwcg, added;
+	uint8_t event[BT_EVENT_MAX];
+	unsigned i, length = 0;
+	int error, stopped;
+
+	for (i = 0; i < 5; i++) {
+		root[i] = bt_read(gcc, BT_RCG + 4 * i);
+	}
+	reset_cfg = bt_read(tlmm, BT_PIN_RESET * 0x1000);
+	reset_io = bt_read(tlmm, BT_PIN_RESET * 0x1000 + 4);
+	for (i = 0; i < 4; i++) {
+		pins[i] = bt_read(tlmm, upins[i] * 0x1000);
+	}
+	for (i = 0; i < sizeof(uvals) / sizeof(uvals[0]); i++) {
+		uvals[i] = bt_read(uart, uregs[i]);
+	}
+	vote = bt_read(gcc, BT_VOTE);
+	hwcg = bt_read(gcc, BT_S_AHB_CBCR) & 2u;
+	added = BT_VOTE_BITS & ~vote;
+	bt_write(gcc, BT_S_AHB_CBCR, bt_read(gcc, BT_S_AHB_CBCR) & ~2u);
+	bt_write(gcc, BT_VOTE, vote | BT_VOTE_BITS);
+	for (i = 0; i < 10000; i++) {
+		if (!((bt_read(gcc, BT_M_AHB_CBCR) | bt_read(gcc, BT_S_AHB_CBCR) | bt_read(gcc, BT_SE_CBCR)) & 0x80000000)) {
+			break;
+		}
+		delay(1);
+	}
+	error = i == 10000 ? ETIMEDOUT : bt_uart_quiesce(uart);
+	if (!error && !bt_uart_clock(gcc)) {
+		error = ETIMEDOUT;
+	}
+	if (!error) {
+		error = bt_power();
+	}
+	if (error) {
+		bt_say("bt: power or clock: %d\n", error);
+		goto cleanup;
+	}
+	/* reset low, then high again, as Android's btpower does (about 56 ms each) */
+	bt_gpio(tlmm, BT_PIN_RESET, 0x241, false);      /* GPIO, 4 mA, pull-down, output */
+	delay(56000);
+	bt_gpio(tlmm, BT_PIN_RESET, 0x241, true);
+	delay(56000);
+	/* the UART's pins: CTS in, RTS out pulled down, TX out pulled up, RX in (the Mi 10's settings) */
+	bt_write(tlmm, BT_PIN_CTS * 0x1000, bt_pin_function << 2);
+	bt_write(tlmm, BT_PIN_RTS * 0x1000, bt_pin_function << 2 | 1);
+	bt_write(tlmm, BT_PIN_TX * 0x1000, bt_pin_function << 2 | 3);
+	bt_write(tlmm, BT_PIN_RX * 0x1000, bt_pin_function << 2);
+	bt_write(uart, 0x48, 0x41); bt_write(uart, 0x4c, 0x41);
+	bt_write(uart, 0x258, 0); bt_write(uart, 0x22c, 0);
+	bt_write(uart, 0x25c, 2); bt_write(uart, 0x280, 0);
+	bt_write(uart, 0x260, 0xf); bt_write(uart, 0x264, 0);
+	bt_write(uart, 0x284, 0x4380e); bt_write(uart, 0x288, 0xc3e0e);
+	bt_write(uart, 0x268, 8); bt_write(uart, 0x28c, 8); bt_write(uart, 0x26c, 0);
+	bt_write(uart, 0x294, 160); bt_write(uart, 0x2a4, 0); bt_write(uart, 0x2a8, 0);
+	bt_write(uart, 0x80c, 1); bt_write(uart, 0x810, 0); bt_write(uart, 0x814, 6);
+	bt_write(uart, 0x618, 0xffffffff); bt_write(uart, 0x648, 0xffffffff);
+	bt_write(uart, 0x630, (1u << 27) | 0x80);       /* START_READ, RFR_OPEN */
+	memset(&bt_rx_packet, 0, sizeof(bt_rx_packet));
+	bt_rx_head = bt_rx_tail = 0;
+	bt_host_awake = bt_ibs_ack_pending = false;
+	bt_ibs_wakes = bt_ibs_sleeps = 0;
+	error = bt_hci_command(uart, 0x0c03, NULL, 0, true, event, &length);
+	if (!error) {
+		error = bt_hci_command(uart, 0x1001, NULL, 0, true, event, &length);
+	}
+	if (!error && length == 15) {
+		bt_say("bt: the ROM answers: HCI %#x, manufacturer %u, LMP subversion %#x\n", event[7], bt_le16(event + 11),
+		    bt_le16(event + 13));
+		if (firmware) {
+			error = bt_qca_firmware(uart);
+			if (!error && !runtime) {
+				error = bt_radio_scan(uart);
+			}
+			if (!error && runtime) {
+				error = bt_control_start(uart);
+				if (!error) {
+					return true;
+				}
+			}
+		}
+	} else if (!error) {
+		error = EILSEQ;
+	}
+	bt_say("bt: %s: %d\n", firmware ? "firmware and radio" : "the ROM's HCI", error);
+	bt_gpio(tlmm, BT_PIN_RESET, 0x241, false);
+	stopped = bt_uart_quiesce(uart);
+	bt_say("bt: the UART stopped: %d\n", stopped);
+cleanup:
+	for (i = 0; i < sizeof(uvals) / sizeof(uvals[0]); i++) {
+		bt_write(uart, uregs[i], uvals[i]);
+	}
+	bt_write(uart, 0x618, 0xffffffff);
+	bt_write(uart, 0x648, 0xffffffff);
+	bt_write(tlmm, BT_PIN_RESET * 0x1000 + 4, reset_io & 2);
+	bt_write(tlmm, BT_PIN_RESET * 0x1000, reset_cfg);
+	for (i = 0; i < 4; i++) {
+		bt_write(tlmm, upins[i] * 0x1000, pins[i]);
+	}
+	bt_write(gcc, BT_RCG + 0x8, root[2]);
+	bt_write(gcc, BT_RCG + 0xc, root[3]);
+	bt_write(gcc, BT_RCG + 0x10, root[4]);
+	bt_write(gcc, BT_RCG + 0x4, root[1]);
+	bt_write(gcc, BT_RCG, root[0] | 1);
+	for (i = 0; i < 10000 && (bt_read(gcc, BT_RCG) & 1); i++) {
+		delay(1);
+	}
+	if (added) {
+		bt_write(gcc, BT_VOTE, bt_read(gcc, BT_VOTE) & ~added);
+	}
+	bt_write(gcc, BT_S_AHB_CBCR, (bt_read(gcc, BT_S_AHB_CBCR) & ~2u) | hwcg);
+	return false;
+}
+
+static void
+bt_thread(__unused void *unused, __unused wait_result_t result)
+{
+	uint32_t probe = 0, enabled = 0, added_votes = 0, saved_hwcg = 0;
+	bool runtime = PE_parse_boot_argn("bt", &enabled, sizeof(enabled)) && enabled == 1;
+	vm_offset_t gcc, tlmm, uart;
+
+	(void)PE_parse_boot_argn("bt_probe", &probe, sizeof(probe));
+	(void)PE_parse_boot_argn("bt_pins", &bt_pin_function, sizeof(bt_pin_function));
+	if (runtime) {
+		probe = 5;
+	}
+	gcc = ml_io_map(BT_GCC_PHYS, 0x80000);
+	tlmm = ml_io_map(BT_TLMM_PHYS, 0x100000);
+	if (!gcc || !tlmm) {
+		bt_say("bt: GCC or TLMM not mapped\n");
+		return;
+	}
+	bt_say("bt: renoir's QCA6490 Bluetooth, %s (bt_probe=%u)\n", runtime ? "for iOS" : "a look", probe);
+	bt_say("bt: GCC vote %#x, m-AHB %#x, s-AHB %#x, SE7 %#x, its source %#x %#x %#x %#x %#x\n", bt_read(gcc, BT_VOTE),
+	    bt_read(gcc, BT_M_AHB_CBCR), bt_read(gcc, BT_S_AHB_CBCR), bt_read(gcc, BT_SE_CBCR), bt_read(gcc, BT_RCG),
+	    bt_read(gcc, BT_RCG + 4), bt_read(gcc, BT_RCG + 8), bt_read(gcc, BT_RCG + 12), bt_read(gcc, BT_RCG + 16));
+	bt_say("bt: gpio65 %#x/%#x, 68 %#x, 69 %#x, 70 %#x, 71 %#x, 91 %#x/%#x\n", bt_read(tlmm, 65 * 0x1000),
+	    bt_read(tlmm, 65 * 0x1000 + 4), bt_read(tlmm, 68 * 0x1000), bt_read(tlmm, 69 * 0x1000), bt_read(tlmm, 70 * 0x1000),
+	    bt_read(tlmm, 71 * 0x1000), bt_read(tlmm, 91 * 0x1000), bt_read(tlmm, 91 * 0x1000 + 4));
+	if (probe >= 2) {
+		uint32_t vote = bt_read(gcc, BT_VOTE);
+		unsigned waited;
+
+		added_votes = BT_VOTE_BITS & ~vote;
+		saved_hwcg = bt_read(gcc, BT_S_AHB_CBCR) & 2u;
+		bt_write(gcc, BT_S_AHB_CBCR, bt_read(gcc, BT_S_AHB_CBCR) & ~2u);
+		bt_write(gcc, BT_VOTE, vote | BT_VOTE_BITS);
+		for (waited = 0; waited < 10000; waited++) {
+			if (!((bt_read(gcc, BT_M_AHB_CBCR) | bt_read(gcc, BT_S_AHB_CBCR) | bt_read(gcc, BT_SE_CBCR)) & 0x80000000)) {
+				break;
+			}
+			delay(1);
+		}
+		bt_say("bt: the UART's clocks voted: %u us, CBCRs %#x %#x %#x\n", waited, bt_read(gcc, BT_M_AHB_CBCR),
+		    bt_read(gcc, BT_S_AHB_CBCR), bt_read(gcc, BT_SE_CBCR));
+	}
+	/* never a GENI register with its clocks off: that read can stall the interconnect */
+	if ((bt_read(gcc, BT_M_AHB_CBCR) | bt_read(gcc, BT_S_AHB_CBCR) | bt_read(gcc, BT_SE_CBCR)) & 0x80000000) {
+		bt_say("bt: the UART's clocks are off: its registers not read\n");
+	} else if ((uart = ml_io_map(BT_UART_PHYS, 0x4000)) != 0) {
+		static const uint32_t regs[] = { 0x40, 0x48, 0x4c, 0x64, 0x68, 0x6c, 0x7c, 0x258, 0x610, 0x640, 0x800, 0x804, 0xe24, 0xe28 };
+
+		for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+			bt_say("bt: GENI %#x = %#x\n", regs[i], bt_read(uart, regs[i]));
+		}
+		if (probe == 3) {
+			bt_loopback(uart);
+		}
+		if (probe >= 4 && bt_hci_probe(gcc, tlmm, uart, probe == 5, runtime)) {
+			return;
+		}
+	}
+	if (probe >= 2) {
+		bt_write(gcc, BT_S_AHB_CBCR, (bt_read(gcc, BT_S_AHB_CBCR) & ~2u) | saved_hwcg);
+		if (added_votes) {
+			bt_write(gcc, BT_VOTE, bt_read(gcc, BT_VOTE) & ~added_votes);
+		}
+	}
+	bt_say("bt: %s over\n", runtime ? "start" : "the look");
+}
+
+/* boot-arg bt=1 or bt_probe=N, board=renoir: on a thread of its own, beside the system's start */
+void
+hakios_bluetooth_init(void)
+{
+	uint32_t value = 0;
+	thread_t thread;
+
+	if (!hakios_wifi_is_renoir() ||
+	    (!PE_parse_boot_argn("bt", &value, sizeof(value)) && !PE_parse_boot_argn("bt_probe", &value, sizeof(value))) ||
+	    value == 0) {
+		return;
+	}
+	if (kernel_thread_start(bt_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}

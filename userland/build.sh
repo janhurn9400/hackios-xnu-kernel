@@ -118,6 +118,10 @@ IOS_JOBS=${JOBS-"
 # (Count a QEMU run log with its duplicate lines removed: run-ios.sh prints launchd's log twice.)
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
+# BLUETOOTH=1: iOS's Bluetooth on renoir's QCA6490 (the kernel's bt=1, bsd/dev/hakios.wifi.c): bluetoothd, with
+# its transport the kernel's H4 socket (mkjobs.py), and BlueTool's stand-in src/bluetool.c (Apple's would run
+# Broadcom scripts). After the Xiaomi Mi 10 fork's.
+[ "${BLUETOOTH-0}" != 1 ] || IOS_JOBS="$IOS_JOBS com.apple.bluetoothd com.apple.BlueTool"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libhakios.dylib, src/inject_sb.c is libhakios.sb.dylib, src/inject_media.c is
 # libhakios.media.dylib).
@@ -137,6 +141,8 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 # storefront Apple's bag server returned for this device, which is how the App Store is asked whether
 # a storefront is the only thing it is missing. It also writes down whether a bag request is ever
 # built at all. For an experiment, not for an image anybody else boots.
+[ "${BLUETOOTH-0}" != 1 ] || INJECT="$INJECT
+/redwood/lib/libhakios.bluetooth.dylib bluetoothd"
 [ -n "$STOREFRONT" ] && INJECT="$INJECT
 /redwood/lib/libhakios.store.dylib appstored AppStore
 /redwood/lib/libhakios.fairplay.dylib fairplayd.H2"
@@ -241,6 +247,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# ... and inside an application, to say what killed it (src/inject_app.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -lobjc \
 			-o obj/libhakios.app.dylib src/inject_app.c
+		if [ "${BLUETOOTH-0}" = 1 ]; then
+			$DYN -fblocks -framework CoreFoundation -framework IOKit -o obj/bluetool src/bluetool.c
+			$DYN -dynamiclib -install_name /redwood/lib/libhakios.bluetooth.dylib -framework CoreFoundation \
+				-framework IOKit -o obj/libhakios.bluetooth.dylib src/inject_bluetooth.c
+		fi
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
@@ -310,6 +321,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.fairplay.dylib ] && cp obj/libhakios.fairplay.dylib root/lib/
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
+	if [ "${BLUETOOTH-0}" = 1 ]; then cp obj/libhakios.bluetooth.dylib root/lib/; cp obj/bluetool root/bin/; fi
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver
 		cp obj/HakiosAudio root/lib/HakiosAudio.driver/
@@ -420,6 +432,12 @@ if [ -f ../fw-wifi/amss20.bin ]; then
 	done
 	rm -f root/fw/network
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
+fi
+# ... and its Bluetooth half's patch and NVM, from /vendor/bt_firmware/image of the same Android into ../fw-bluetooth
+# (bt=1, bsd/dev/hakios.wifi.c; board ID 0, so the default NVM; 197 and 6 KB)
+if [ -f ../fw-bluetooth/hpbtfw20.tlv ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-bluetooth/hpbtfw20.tlv ../fw-bluetooth/hpnv20.bin root/fw/
 fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (bsd/dev/hakios.haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)

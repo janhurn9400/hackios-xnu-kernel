@@ -274,6 +274,19 @@ for label in labels:
     # a job that is named is wanted, whatever hardware it says it is for: wifid's asks for a node "wlan" in the
     # device tree, which the loader's tree does not have yet
     job.pop('_LimitLoadToDeviceTree', None)
+    # BLUETOOTH=1 (build.sh): bluetoothd's transport is the kernel's H4 socket (renoir's bt=1), and BlueTool is ours
+    if label == 'com.apple.bluetoothd' and os.environ.get('BLUETOOTH') == '1':
+        job.setdefault('EnvironmentVariables', {}).update(
+            BT_HCI_TRANSPORT='H4:POSIX:com.hakios.bluetooth,115200', BT_BAUDRATE='115200')
+    if label == 'com.apple.BlueTool' and os.environ.get('BLUETOOTH') == '1':
+        # a label of its own: launchd panics on a com.apple.* job whose program is not Apple's ("unexpected exec
+        # of non-platform binary: /redwood/bin/bluetool: com.apple.BlueTool", renoir 2026-10-31)
+        job['Label'] = 'com.hakios.bluetool'
+        job.pop('Program', None)
+        for key in ('POSIXSpawnType', 'EnablePressuredExit', 'ThrottleInterval'):
+            job.pop(key, None)
+        job['ProcessType'] = 'Interactive'
+        job['ProgramArguments'] = ['/redwood/bin/bluetool']
     if 'all' in oslog or label in oslog:
         job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
     with open(f'{dest}/{label}.plist', 'wb') as f:

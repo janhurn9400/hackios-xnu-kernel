@@ -60,3 +60,24 @@ ath11k), Bluetooth last.
   iOS's waveform on the amplitude register (0..0xff). At the run's end the motor is stopped and the
   block put back as found; a PMIC fault stops it for the run.
 - Full run: `... board=renoir gpu=1 touchscreen=1 haptic=5` with `system.apfs` and `root-gl.apfs`.
+
+## Bluetooth works in iOS (2026-10-31, session 8)
+
+Ported from the Xiaomi Mi 10 fork (JopangJovan/hackios-xnu-kernel-umi: `umi_bluetooth.c`, `hakios.bluetooth.cpp`,
+`inject_bluetooth.c`, `umi_bluetool.c`) to the QCA6490: kernel part at the end of `bsd/dev/hakios.wifi.c` (next to the
+radio's PCIe code, using its RPMh supplies), the registry service in `iokit/Kernel/hakios.wlan.cpp`, userland
+`src/inject_bluetooth.c` (bluetoothd, iOS 16.5 20F66 addresses, checked by UUID) and `src/bluetool.c` (BlueTool's
+stand-in), `BLUETOOTH=1` in `userland/build.sh` / `mkjobs.py`.
+- Hardware: UART QUP0 SE7 `0x99c000` (pins 68-71, function 1), its clock SE7 CBCR `0x1785c`, RCG `0x17860`, vote bit 17
+  of `0x52008`; reset/BT_EN gpio 65; the radio's five supplies (smpc2, smpb10/11/12, ldoc11) as Wi-Fi votes them.
+- Firmware from MagicOS's `/vendor/bt_firmware/image` (root): `hpbtfw20.tlv`, `hpnv20.bin` (Android's HAL: board ID 0,
+  so the default NVM), in `fw-bluetooth/` (git-ignored), put into `fw/` of the small image by `build.sh`.
+- `bt_probe=4`: `the ROM answers: HCI 0x9, manufacturer 29, LMP subversion 0x17f3` (product 0x13, ROM 0x200, SoC
+  0x400c0200). `bt_probe=5`: patch 813 segments, NVM 26, `the firmware runs: HCI 0xb` (5.2), LE passive scan 33 reports in
+  3 s. `bt=1`: the H4 socket `com.hakios.bluetooth`; bluetoothd (`BT_HCI_TRANSPORT=H4:POSIX:com.hakios.bluetooth,115200`)
+  initialises it, `Update Dynamic Store with state On value 1`, LE scan and inquiry; **devices show up in Settings ->
+  Bluetooth** (the user). Only Apple's vendor command 0xfd48 is refused.
+- BlueTool's job must not keep its `com.apple.BlueTool` label: launchd panicked (`unexpected exec of non-platform binary:
+  /redwood/bin/bluetool: com.apple.BlueTool`); it is `com.hakios.bluetool` now (as in the Mi 10 fork).
+- The firmware download takes ~1 min at 115200 baud; bluetoothd exits until the endpoint is up and launchd restarts it.
+- Run: the everyday run plus `bt=1`, kernel `vm-kernel/mach.development.bcm2837.bt`, images `*-bt.apfs`.
