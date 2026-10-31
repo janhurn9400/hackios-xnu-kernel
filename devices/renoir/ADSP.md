@@ -205,3 +205,10 @@ So the cable is good again ~20 s after the DSP's start; the loader's (UEFI's) US
 Next: let the loader restart its USB device once the port is back (~25 s after the DSP's start, not on every failed
 receive, which `813328a` did from the first second on), and log what UEFI sees of VBUS. MagicOS's dmesg has the FSA4480
 USB-C audio switch (I2C `i2c@a94000` 0x42, no GPIOs in the DT): not the DSP's to switch, so not the cause.
+- Tried (2026-10-31): the loader restarting its USB controller when the host has been silent 12 s (during a run) or
+  15 s (after one). It restarted, but nothing enumerated again; the Mac's log shows the same detach (09:43:30) and
+  re-attach (09:43:31) and then, at 09:44:00, the Mac's port turning its power off (`PowerModeOff`): no VBUS, no
+  device. Reverted. More likely: the DSP's charger firmware waits for the OS to start UCSI (Linux's `ucsi_glink` over
+  PMIC GLINK, the channel the battery manager already uses) and, when nobody does, resets the port after ~20 s and
+  leaves it unpowered. Next: a minimal UCSI client in `hakios.adsp.c` (PPM reset, notifications on, connector status),
+  as `drivers/usb/typec/ucsi/ucsi_glink.c` does.
