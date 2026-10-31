@@ -228,7 +228,10 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         'com.apple.voicemail.vmd')
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
-DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
+# BLUETOOTH=1 (build.sh): bluetoothd's helpers too (com.apple.BTServer.avrcp, .le, .map, .pbap, bluetoothuserd), which
+# bluetoothd looks up when AirPods connect
+ALLOWED = os.environ.get('ALLOW', '').split() + (['bluetooth', 'BTServer'] if os.environ.get('BLUETOOTH') == '1' else [])
+DENY = tuple(word for word in DENY if word not in ALLOWED)
 
 args = sys.argv[1:]
 rest = '--rest' in args

@@ -43,7 +43,8 @@ just before were lost). `vmx.sh` with `pkill -f xnu-build.sh` kills its own sess
 1. VIG0's QSEED3 lite scaler so direct scanout shows the whole picture (1125 x 2436 -> 1080 x 2400), then direct
    scanout at 60 Hz in the everyday run. 90/120 Hz content: only with an iPad Pro 2017 identity (iPadOS 16), a big step.
 2. Merge upstream `main` into `renoir` (the user's wish: after this display work; fetched as `upstream-new/main`).
-3. ~~Bluetooth~~ **works** (2026-10-31, `WIFI-BT-HAPTICS.md` last section): `bt=1` + `BLUETOOTH=1` images, devices show
+3. ~~Bluetooth~~ **works, with audio**: AirPods play over A2DP (UART at 3 Mbit/s, Apple's BTAudioHALPlugin in the image;
+   `WIFI-BT-HAPTICS.md` last section; open there: 2.4 GHz Wi-Fi stops with BT on, bluetoothd's stop crash). Earlier: `bt=1` + `BLUETOOTH=1` images, devices show
    up in Settings. Next there: pairing, then audio (A2DP) and the Mi 10's camera ladder (`cam=1..6`).
 4. Long term: Metal via AdrenoMetal + Turnip (UniXNU; their A650 driver for A6xx), the way to iOS 17+ (`UNIXNU.md`).
 5. Session 7's list: charger throttling, the touch driver's bad SPI reads.

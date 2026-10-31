@@ -501,6 +501,17 @@ for f in extensions.plist extensions.plist.sig; do
 	[ -f $IOS/rootfs/System/Library/xpc/$f ] && cp $IOS/rootfs/System/Library/xpc/$f root/xpc/
 done
 [ -d root/lib/HakiosAudio.driver ] && ln -s /redwood/lib/HakiosAudio.driver root/hal/HakiosAudio.driver
+# ... and with BLUETOOTH=1 Apple's Bluetooth audio plug-in beside it, the other end of bluetoothd's audio: without it
+# AirPods connect and their settings work, but bluetoothd says "[Server.Audio] Error, unable to sendMsg due to no
+# available xpc client connections" and iOS's sound stays on the speaker (renoir, 2026-10-31). From the iOS volume
+# (sysimage/rootfs.dmg, System/Library/Audio/Plug-Ins/HAL, which select-system.py leaves out) into ../fw-bluetooth:
+#   7z x rootfs.dmg 'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/*' -r
+if [ -n "$BLUETOOTH" ] && [ -d ../fw-bluetooth/BTAudioHALPlugin.driver ]; then
+	rm -rf root/lib/BTAudioHALPlugin.driver
+	cp -R ../fw-bluetooth/BTAudioHALPlugin.driver root/lib/
+	ln -s /redwood/lib/BTAudioHALPlugin.driver root/hal/BTAudioHALPlugin.driver
+	echo "  Apple's Bluetooth audio plug-in beside ours"
+fi
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (bsd/dev/hakios.image.c)
 python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1

@@ -5886,7 +5886,8 @@ hakios_wifi_init(void)
  *
  * Boot-args: bt=1 the endpoint for iOS; bt_probe=N a look only, 1 the registers, 2 with the clocks voted,
  * 3 a UART loopback, 4 the ROM's HCI, 5 the firmware and a short radio scan (and the radio off again).
- * bt_pins=F: the pins' function (1 by default, as the Mi 10's QUP pins).
+ * bt_pins=F: the pins' function (1 by default, as the Mi 10's QUP pins). bt_baud=0: the UART stays at 115200
+ * (by default it goes to 3 Mbit/s before the firmware, as Linux's, for A2DP's audio).
  */
 #include <kern/thread_call.h>
 #include <sys/kauth.h>
@@ -5988,9 +5989,9 @@ hakios_bt_qca_tlv_ack(const uint8_t *e, size_t n)
 	       (n == 6 && e[0] == 4 && e[1] == 0xff && e[2] == 3 && e[3] == 0 && e[4] == 4 && e[5] == 0);
 }
 
-/* the NVM's tag 17 (HCI transport) at 115200 baud: hastings keeps the baud rate in its byte 1; all records checked first */
+/* the NVM's tag 17 (HCI transport) at `baud' (QCA's index: 0 115200, 0x0e 3000000): hastings keeps it in its byte 1 */
 static inline int
-hakios_bt_nvm_prepare(uint8_t *data, size_t n)
+hakios_bt_nvm_prepare(uint8_t *data, size_t n, uint8_t baud)
 {
 	size_t hci = 0;
 
@@ -6019,7 +6020,7 @@ hakios_bt_nvm_prepare(uint8_t *data, size_t n)
 	if (!hci) {
 		return -1;
 	}
-	data[hci + 1] = 0;      /* QCA_BAUDRATE_115200 */
+	data[hci + 1] = baud;
 	return 0;
 }
 
@@ -6367,8 +6368,83 @@ bt_le32(const uint8_t *p)
 	return bt_le16(p) | (uint32_t)bt_le16(p + 2) << 16;
 }
 
+/*
+ * 3 Mbit/s instead of 115200 (boot-arg bt_baud=0: stay at 115200): A2DP's audio needs 250 to 350 kbit/s and the
+ * UART at 115200 carries about 90 (AirPods paired and their settings worked, no sound: 2026-10-31). As Linux's
+ * hci_qca.c qca_set_speed(): the controller is told (EDL 0xfc48, QCA_BAUDRATE_3000000 = 0x0e), then the host's side
+ * follows: SE7's source 48 MHz (GPLL0 even's 300 MHz, M/N 4/25) and the serial clock undivided, 16 samples a bit.
+ * Then HCI Read Local Version at the new speed says whether both are there; if not, both go back to 115200.
+ */
+#define BT_QCA_BAUD_3M          0x0e
+
+static bool
+bt_uart_rate(vm_offset_t gcc, vm_offset_t uart, bool fast)
+{
+	uint32_t m = fast ? 4 : 384, n = fast ? 25 : 15625, divider = fast ? 1 : 4;
+
+	bt_write(gcc, BT_RCG + 0x8, m);
+	bt_write(gcc, BT_RCG + 0xc, ~(n - m) & 0xffff);
+	bt_write(gcc, BT_RCG + 0x10, ~n & 0xffff);
+	bt_write(gcc, BT_RCG + 0x4, 0x2601);    /* dual-edge M/N, GPLL0 even, /1 */
+	bt_write(gcc, BT_RCG, 1);
+	for (unsigned i = 0; i < 10000; i++) {
+		if (!(bt_read(gcc, BT_RCG) & 1)) {
+			bt_write(uart, 0x48, divider << 4 | 1);
+			bt_write(uart, 0x4c, divider << 4 | 1);
+			return true;
+		}
+		delay(1);
+	}
+	return false;
+}
+
+static void
+bt_rx_flush(vm_offset_t uart)
+{
+	unsigned words = bt_read(uart, 0x804) & 0x1ffffff;
+
+	while (words--) {
+		(void)bt_read(uart, 0x780);
+	}
+	bt_write(uart, 0x648, 0xffffffff);
+	memset(&bt_rx_packet, 0, sizeof(bt_rx_packet));
+	bt_rx_head = bt_rx_tail = 0;
+}
+
+static bool
+bt_set_speed(vm_offset_t gcc, vm_offset_t uart)
+{
+	static const uint8_t baud = BT_QCA_BAUD_3M;
+	uint8_t event[BT_EVENT_MAX];
+	unsigned length = 0;
+	int error;
+
+	error = bt_hci_command(uart, 0xfc48, &baud, 1, false, event, &length);
+	if (error) {
+		bt_say("bt: the speed change could not be sent: %d\n", error);
+		return false;
+	}
+	delay(20000);                   /* the command out at the old speed, the controller switching */
+	if (!bt_uart_rate(gcc, uart, true)) {
+		bt_say("bt: the UART's 48 MHz did not take\n");
+		return false;
+	}
+	delay(100000);
+	bt_rx_flush(uart);
+	error = bt_hci_command(uart, 0x1001, NULL, 0, true, event, &length);
+	if (error || length != 15) {
+		bt_say("bt: no answer at 3 Mbit/s (%d): back to 115200\n", error);
+		(void)bt_uart_rate(gcc, uart, false);
+		delay(100000);
+		bt_rx_flush(uart);
+		return false;
+	}
+	bt_say("bt: the UART at 3 Mbit/s: the controller answers (HCI %#x)\n", event[7]);
+	return true;
+}
+
 static int
-bt_qca_firmware(vm_offset_t uart)
+bt_qca_firmware(vm_offset_t uart, bool fast)
 {
 	static const uint8_t version_request = 0x19, logging[] = { 0x14, 0 };
 	uint8_t event[BT_EVENT_MAX];
@@ -6413,11 +6489,12 @@ bt_qca_firmware(vm_offset_t uart)
 		return E2BIG;
 	}
 	memcpy(bt_nvm_work, nvm, (size_t)nvm_size);
-	if (hakios_bt_nvm_prepare(bt_nvm_work, (size_t)nvm_size)) {
+	if (hakios_bt_nvm_prepare(bt_nvm_work, (size_t)nvm_size, fast ? BT_QCA_BAUD_3M : 0)) {
 		bt_say("bt: hpnv20.bin is not a hastings NVM\n");
 		return EINVAL;
 	}
-	bt_say("bt: loading hpbtfw20.tlv (%llu bytes) and hpnv20.bin (%llu) at 115200 baud\n", patch_size, nvm_size);
+	bt_say("bt: loading hpbtfw20.tlv (%llu bytes) and hpnv20.bin (%llu) at %s\n", patch_size, nvm_size,
+	    fast ? "3 Mbit/s" : "115200 baud");
 	error = bt_qca_download(uart, patch, (size_t)patch_size, mode == 3);
 	if (error) {
 		return error;
@@ -6970,7 +7047,10 @@ bt_hci_probe(vm_offset_t gcc, vm_offset_t tlmm, vm_offset_t uart, bool firmware,
 		bt_say("bt: the ROM answers: HCI %#x, manufacturer %u, LMP subversion %#x\n", event[7], bt_le16(event + 11),
 		    bt_le16(event + 13));
 		if (firmware) {
-			error = bt_qca_firmware(uart);
+			uint32_t speed = 3000000;
+
+			(void)PE_parse_boot_argn("bt_baud", &speed, sizeof(speed));
+			error = bt_qca_firmware(uart, speed == 3000000 && bt_set_speed(gcc, uart));
 			if (!error && !runtime) {
 				error = bt_radio_scan(uart);
 			}
